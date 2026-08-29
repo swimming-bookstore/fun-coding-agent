@@ -55,7 +55,8 @@ P3 = "print a usage line too"
 COLS, ROWS = 100, 30
 XTERM_BORDER = 12
 COMPOSER_H = 3
-STATUS_H = 2
+# Status wraps to 3 rows while working (spinner + model/effort).
+STATUS_H = 3
 QUEUE_CTRLS = [
     ("send now", 8),
     ("edit", 4),
@@ -63,6 +64,7 @@ QUEUE_CTRLS = [
     ("move down", 9),
     ("cancel", 6),
 ]
+CTRL_W = {name: w for name, w in QUEUE_CTRLS}
 
 os.environ.setdefault("DISPLAY", ":0.0")
 os.environ.setdefault("XAUTHORITY", str(Path.home() / ".Xauthority"))
@@ -569,6 +571,67 @@ def overlay_pointer(frame: bytes, w: int, h: int, x: int, y: int) -> bytes:
     return bytes(out)
 
 
+RGB_ACCENT = (125, 207, 239)
+RGB_USER = (247, 168, 120)
+RGB_TOOL = (232, 196, 104)
+RGB_ERROR = (243, 139, 168)
+
+
+def rgb_at(frame: bytes, w: int, h: int, x: int, y: int) -> tuple[int, int, int] | None:
+    if not (0 <= x < w and 0 <= y < h):
+        return None
+    i = (y * w + x) * 4
+    return frame[i + 2], frame[i + 1], frame[i]
+
+
+def rgb_close(a: tuple[int, int, int] | None, b: tuple[int, int, int], tol: int = 42) -> bool:
+    return bool(a) and all(abs(a[i] - b[i]) <= tol for i in range(3))
+
+
+def cell_has_color(
+    frame: bytes,
+    win_w: int,
+    win_h: int,
+    cw: float,
+    ch: float,
+    col: int,
+    row: int,
+    color: tuple[int, int, int],
+) -> bool:
+    x0 = int(XTERM_BORDER + col * cw)
+    y0 = int(XTERM_BORDER + row * ch)
+    x1 = max(x0 + 1, int(XTERM_BORDER + (col + 1) * cw))
+    y1 = max(y0 + 1, int(XTERM_BORDER + (row + 1) * ch))
+    for y in range(y0 + 2, y1 - 1, 3):
+        for x in range(x0 + 1, x1 - 1, 2):
+            if rgb_close(rgb_at(frame, win_w, win_h, x, y), color):
+                return True
+    return False
+
+
+def find_queue_rows(
+    frame: bytes, win_w: int, win_h: int, cw: float, ch: float, cols: dict[str, int]
+) -> list[int]:
+    rows: list[int] = []
+    for row in range(8, ROWS - 3):
+        send = any(
+            cell_has_color(frame, win_w, win_h, cw, ch, cols["send now"] + i, row, RGB_ACCENT)
+            for i in range(CTRL_W["send now"])
+        )
+        edit = any(
+            cell_has_color(frame, win_w, win_h, cw, ch, cols["edit"] + i, row, RGB_USER)
+            for i in range(CTRL_W["edit"])
+        )
+        cancel = any(
+            cell_has_color(frame, win_w, win_h, cw, ch, cols["cancel"] + i, row, RGB_ERROR)
+            for i in range(CTRL_W["cancel"])
+        )
+        if send and edit and cancel:
+            rows.append(row)
+    return rows
+
+
+
 def queue_layout(n_items: int) -> tuple[int, dict[str, int]]:
     queue_h = min(n_items, 4) + 2
     queue_y = ROWS - STATUS_H - COMPOSER_H - queue_h
@@ -832,22 +895,35 @@ def main() -> None:
         file=sys.stderr,
     )
 
-    def hover(name: str, item: int) -> tuple[int, int, int, int]:
-        col = ctrls[name] + 1
-        row = item0 + item
+    def hover(name: str, item: int, rows: list[int]) -> tuple[int, int, int, int]:
+        col = ctrls[name] + max(CTRL_W[name] // 2, 0)
+        row = rows[item] if item < len(rows) else item0 + item
         pix = cell_xy(cw, ch, col, row)
         x11.XWarpPointer(dpy, 0, wid, 0, 0, 0, 0, pix[0], pix[1])
         x11.XFlush(dpy)
         return pix[0], pix[1], col, row
 
-    def click(name: str, item: int) -> None:
-        px, py, col, row = hover(name, item)
+    def click(name: str, item: int, rows: list[int]) -> None:
+        px, py, col, row = hover(name, item, rows)
         inject(sgr_click(col, row))
-        print(f"inject {name} item {item} @ {col},{row}", file=sys.stderr)
+        print(f"inject {name} item {item} @ {col},{row} rows {rows}", file=sys.stderr)
+
+    seen_rows: list[int] = []
 
     try:
         for i in range(nframes):
             now = time.monotonic()
+            frame = grab_bgr(dpy, wid, w, h, redirected)
+            if frame is None:
+                if last is None:
+                    die("window capture failed")
+                frame = last
+            last = frame
+            qrows = find_queue_rows(frame, w, h, cw, ch, ctrls)
+            if qrows != seen_rows:
+                print(f"queue rows {qrows}", file=sys.stderr)
+                seen_rows = qrows
+
             if xterm.poll() is not None and step not in {"done", "quit"}:
                 step = "done"
 
@@ -872,75 +948,110 @@ def main() -> None:
                     step = "wait_work"
                     mark = now
             elif step == "wait_work":
-                if now - mark >= 0.45:
+                # Queue during the first model call, before tools drain idle prompts.
+                if now - mark >= 0.25:
                     step = "type2"
                     typed = 0
                     mark = now
             elif step == "type2":
                 if typed < len(P2):
-                    if now - mark >= 1 / 16:
+                    if now - mark >= 1 / 22:
                         type_char(dpy, wid, P2[typed])
                         typed += 1
                         mark = now
-                elif now - mark >= 0.25:
+                elif now - mark >= 0.18:
                     ensure_focus(dpy, wid)
                     tap(dpy, keycode(dpy, "Return"))
                     step = "type3"
                     typed = 0
                     mark = now
             elif step == "type3":
-                if now - mark < 0.35:
+                if now - mark < 0.18:
                     pass
                 elif typed < len(P3):
-                    if now - mark >= 1 / 16:
+                    if now - mark >= 1 / 22:
                         type_char(dpy, wid, P3[typed])
                         typed += 1
                         mark = now
-                elif now - mark >= 0.25:
+                elif now - mark >= 0.18:
                     ensure_focus(dpy, wid)
                     tap(dpy, keycode(dpy, "Return"))
                     step = "show_q"
                     mark = now
             elif step == "show_q":
-                if now - mark >= 0.9:
-                    if turn_done_after(entries, P1):
-                        print("first turn finished before queue clicks", file=sys.stderr)
+                if len(qrows) >= 2 and now - mark >= 0.35:
+                    print(f"queue clicks rows={qrows} ctrls {ctrls}", file=sys.stderr)
                     step = "hover_down"
                     mark = now
-            elif step == "hover_down":
-                px, py, _, _ = hover("move down", 0)
-                ptr = (px, py)
-                if now - mark >= 1.2:
-                    click("move down", 0)
-                    step = "after_down"
-                    mark = now
-            elif step == "after_down":
-                px, py, _, _ = hover("move down", 0)
-                ptr = (px, py)
-                if now - mark >= 1.3:
-                    step = "hover_up"
-                    mark = now
-            elif step == "hover_up":
-                px, py, _, _ = hover("move up", 1)
-                ptr = (px, py)
-                if now - mark >= 1.2:
-                    click("move up", 1)
-                    step = "after_up"
-                    mark = now
-            elif step == "after_up":
-                px, py, _, _ = hover("move up", 1)
-                ptr = (px, py)
-                if now - mark >= 1.3:
-                    step = "hover_steer"
-                    mark = now
-            elif step == "hover_steer":
-                px, py, _, _ = hover("send now", 0)
-                ptr = (px, py)
-                if now - mark >= 1.3:
-                    click("send now", 0)
+                elif now - mark >= 25:
+                    print(f"queue not visible in time rows={qrows}", file=sys.stderr)
                     step = "wait_end"
                     mark = now
-                    ptr = None
+            elif step == "hover_down":
+                if len(qrows) < 2:
+                    if now - mark >= 8:
+                        print(f"queue lost before clicks rows={qrows}", file=sys.stderr)
+                        ptr = None
+                        step = "wait_end"
+                        mark = now
+                else:
+                    px, py, _, _ = hover("move down", 0, qrows)
+                    ptr = (px, py)
+                    if now - mark >= 0.9:
+                        click("move down", 0, qrows)
+                        step = "after_down"
+                        mark = now
+            elif step == "after_down":
+                if len(qrows) < 2:
+                    if now - mark >= 8:
+                        ptr = None
+                        step = "wait_end"
+                        mark = now
+                else:
+                    px, py, _, _ = hover("move down", 0, qrows)
+                    ptr = (px, py)
+                    if now - mark >= 0.9:
+                        step = "hover_up"
+                        mark = now
+            elif step == "hover_up":
+                if len(qrows) < 2:
+                    if now - mark >= 8:
+                        ptr = None
+                        step = "wait_end"
+                        mark = now
+                else:
+                    px, py, _, _ = hover("move up", 1, qrows)
+                    ptr = (px, py)
+                    if now - mark >= 0.9:
+                        click("move up", 1, qrows)
+                        step = "after_up"
+                        mark = now
+            elif step == "after_up":
+                if len(qrows) < 2:
+                    if now - mark >= 8:
+                        ptr = None
+                        step = "wait_end"
+                        mark = now
+                else:
+                    px, py, _, _ = hover("move up", 1, qrows)
+                    ptr = (px, py)
+                    if now - mark >= 0.9:
+                        step = "hover_steer"
+                        mark = now
+            elif step == "hover_steer":
+                if not qrows:
+                    if now - mark >= 8:
+                        ptr = None
+                        step = "wait_end"
+                        mark = now
+                else:
+                    px, py, _, _ = hover("send now", 0, qrows)
+                    ptr = (px, py)
+                    if now - mark >= 0.9:
+                        click("send now", 0, qrows)
+                        step = "wait_end"
+                        mark = now
+                        ptr = None
             elif step == "wait_end":
                 done = (
                     turn_done_after(entries, P1)
@@ -959,12 +1070,6 @@ def main() -> None:
             elif step == "done" and now - mark >= 1.0:
                 break
 
-            frame = grab_bgr(dpy, wid, w, h, redirected)
-            if frame is None:
-                if last is None:
-                    die("window capture failed")
-                frame = last
-            last = frame
             shown = overlay_pointer(frame, w, h, *ptr) if ptr else frame
             ff.stdin.write(shown)
             target = t0 + (i + 1) / FPS

@@ -2,7 +2,6 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 use std::fs;
-use std::io::{BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -280,7 +279,7 @@ pub(crate) async fn execute_tool(
 fn tool_read() -> Tool {
     Tool {
         name: "read",
-        description: "Read a file. Absolute paths and paths outside the workspace are allowed. A directory lists names. Lines are numbered for display only — never copy those numbers into edit/write.",
+        description: "Read a file. Absolute paths and paths outside the workspace are allowed. A directory lists names. Lines are numbered for display only — never copy those numbers into edit/write. Binary files (including PNG) return type/size instead of failing UTF-8.",
         properties: &[
             Property {
                 name: "path",
@@ -317,20 +316,25 @@ fn read_execute(workspace: &Path, raw: &Value) -> Result<String> {
     if path.is_dir() {
         return list_dir(&path);
     }
-    let file = fs::File::open(&path).with_context(|| format!("read {}", path.display()))?;
+    let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+    if let Some(desc) = binary_read_summary(&path, &bytes) {
+        return Ok(desc);
+    }
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| anyhow!("{}: stream did not contain valid UTF-8", path.display()))?;
     let start = a.offset.unwrap_or(0) as usize;
     let want = a.limit.unwrap_or(500) as usize;
     let width = (start + want).max(1).to_string().len();
     let mut out = String::new();
     let mut seen = 0usize;
-    for (i, line) in BufReader::new(file).lines().enumerate() {
+    for (i, line) in text.split_inclusive('\n').enumerate() {
         if i < start {
             continue;
         }
         if seen >= want {
             break;
         }
-        let line = line.with_context(|| format!("read {}", path.display()))?;
+        let line = line.trim_end_matches(['\n', '\r']);
         let row = format!("{:>width$}\t{line}\n", i + 1, width = width);
         if out.len() + row.len() > MAX_READ_BYTES {
             out.push_str(&format!("... (truncated at 50KB; offset={i})\n"));
@@ -344,6 +348,44 @@ fn read_execute(workspace: &Path, raw: &Value) -> Result<String> {
     } else {
         Ok(out)
     }
+}
+
+fn binary_read_summary(path: &Path, bytes: &[u8]) -> Option<String> {
+    if let Some((w, h)) = png_size(bytes) {
+        return Some(format!(
+            "(binary image: PNG {w}x{h}, {} bytes)",
+            bytes.len()
+        ));
+    }
+    if bytes.starts_with(b"\xff\xd8\xff") {
+        return Some(format!("(binary image: JPEG, {} bytes)", bytes.len()));
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some(format!("(binary image: GIF, {} bytes)", bytes.len()));
+    }
+    if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        return Some(format!("(binary image: WebP, {} bytes)", bytes.len()));
+    }
+    if bytes.contains(&0) || std::str::from_utf8(bytes).is_err() {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        return Some(format!("(binary file: {name}, {} bytes)", bytes.len()));
+    }
+    None
+}
+
+fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 24 || !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return None;
+    }
+    if &bytes[12..16] != b"IHDR" {
+        return None;
+    }
+    let w = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
+    let h = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+    Some((w, h))
 }
 
 fn tool_write() -> Tool {
@@ -523,6 +565,25 @@ mod tests {
             .is_err()
         );
         let _ = fs::remove_dir_all(&outside);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_png_reports_size_instead_of_utf8_error() {
+        let root = workspace();
+        let mut png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR".to_vec();
+        png.extend_from_slice(&1u32.to_be_bytes());
+        png.extend_from_slice(&2u32.to_be_bytes());
+        png.extend_from_slice(&[8, 2, 0, 0, 0]);
+        png.extend_from_slice(&[0; 4]);
+        let path = root.join("t24.png");
+        assert!(fs::write(&path, &png).is_ok(), "write png");
+        let out = read_execute(&root, &json!({"path": "t24.png"}));
+        assert!(
+            out.as_ref()
+                .is_ok_and(|s| s.contains("PNG 1x2") && s.contains("bytes")),
+            "{out:?}"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
