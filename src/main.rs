@@ -15,6 +15,7 @@ use crossterm::event::{
 use grok::{login, logout, Grok};
 use session::{empty_args, list_sessions, Call, Entry, Session, Usage};
 use std::env;
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
@@ -397,21 +398,54 @@ fn flush_log(
     Ok(())
 }
 
-fn git_branch(workspace: &Path) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .current_dir(workspace)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+fn git_dir(start: &Path) -> Option<PathBuf> {
+    let mut dir = start.to_path_buf();
+    loop {
+        let git = dir.join(".git");
+        if git.is_dir() {
+            return Some(git);
+        }
+        if git.is_file() {
+            let text = fs::read_to_string(&git).ok()?;
+            let path = text.strip_prefix("gitdir:")?.trim();
+            if path.is_empty() {
+                return None;
+            }
+            let path = Path::new(path);
+            return Some(if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                dir.join(path)
+            });
+        }
+        if !dir.pop() {
+            return None;
+        }
     }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() || s == "HEAD" {
+}
+
+fn branch_from_head(head: &str) -> Option<String> {
+    let rest = head.trim().strip_prefix("ref: ")?;
+    let name = rest.strip_prefix("refs/heads/")?;
+    if name.is_empty() {
         None
     } else {
-        Some(s)
+        Some(name.to_string())
     }
+}
+
+fn git_branch(workspace: &Path) -> Option<String> {
+    let head = fs::read_to_string(git_dir(workspace)?.join("HEAD")).ok()?;
+    branch_from_head(&head)
+}
+
+fn sync_branch(ui: &mut Ui, status: &mut Status) -> Result<()> {
+    let branch = git_branch(&status.workspace);
+    if branch != status.branch {
+        status.branch = branch;
+        refresh_bar(ui, status)?;
+    }
+    Ok(())
 }
 
 fn short_path(path: &Path) -> String {
@@ -1010,6 +1044,7 @@ async fn run_tui(
         tokio::select! {
             _ = tick.tick() => {
                 flush_log(&mut ui, &mut status, &mut pending, &log_rx)?;
+                sync_branch(&mut ui, &mut status)?;
                 ui.tick()?;
             }
             ev = events.recv() => {
@@ -1083,6 +1118,7 @@ async fn run_turn(
             }
             _ = tick.tick() => {
                 flush_log(ui, status, pending, log_rx)?;
+                sync_branch(ui, status)?;
                 ui.tick()?;
             }
             ev = events.recv() => {
@@ -1323,5 +1359,20 @@ mod tests {
         pending.push(Pending::Steer(text));
         assert_eq!(idle_texts(&pending), vec!["a", "c"]);
         assert_eq!(steer_list(&pending), vec!["b"]);
+    }
+
+    #[test]
+    fn branch_from_head_reads_named_ref() {
+        assert_eq!(
+            branch_from_head("ref: refs/heads/master\n").as_deref(),
+            Some("master")
+        );
+        assert_eq!(
+            branch_from_head("ref: refs/heads/fix/demo-clicks-and-binary-read\n")
+                .as_deref(),
+            Some("fix/demo-clicks-and-binary-read")
+        );
+        assert_eq!(branch_from_head("948352c..."), None);
+        assert_eq!(branch_from_head("ref: refs/tags/v1"), None);
     }
 }
