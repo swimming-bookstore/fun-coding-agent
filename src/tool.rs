@@ -107,14 +107,6 @@ pub(crate) struct Tool {
 }
 
 fn resolve_path(workspace: &Path, path: &str) -> Result<PathBuf> {
-    resolve_path_inner(workspace, path, true)
-}
-
-fn resolve_read_path(workspace: &Path, path: &str) -> Result<PathBuf> {
-    resolve_path_inner(workspace, path, false)
-}
-
-fn resolve_path_inner(workspace: &Path, path: &str, stay_inside: bool) -> Result<PathBuf> {
     if path.is_empty() {
         bail!("empty path");
     }
@@ -125,38 +117,17 @@ fn resolve_path_inner(workspace: &Path, path: &str, stay_inside: bool) -> Result
     } else {
         clean(&root.join(requested))
     };
-    if stay_inside && !is_within(&root, &candidate) {
-        bail!("path escapes workspace: {path}");
-    }
     if let Ok(real) = candidate.canonicalize() {
-        if stay_inside && !is_within(&root, &real) {
-            bail!("path escapes workspace: {path}");
-        }
         return Ok(real);
     }
     if let Some(parent) = candidate.parent()
         && let Ok(real_parent) = parent.canonicalize()
     {
-        if stay_inside && !is_within(&root, &real_parent) {
-            bail!("path escapes workspace: {path}");
-        }
         if let Some(name) = candidate.file_name() {
             return Ok(real_parent.join(name));
         }
     }
     Ok(candidate)
-}
-
-fn is_within(root: &Path, path: &Path) -> bool {
-    let mut r = root.components();
-    let mut p = path.components();
-    loop {
-        match (r.next(), p.next()) {
-            (None, _) => return true,
-            (Some(a), Some(b)) if a == b => {}
-            _ => return false,
-        }
-    }
 }
 
 fn clean(path: &Path) -> PathBuf {
@@ -312,7 +283,7 @@ fn read_execute(workspace: &Path, raw: &Value) -> Result<String> {
         limit: Option<u32>,
     }
     let a: Args = Args::deserialize(raw).context("read args")?;
-    let path = resolve_read_path(workspace, &a.path)?;
+    let path = resolve_path(workspace, &a.path)?;
     if path.is_dir() {
         return list_dir(&path);
     }
@@ -391,7 +362,7 @@ fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
 fn tool_write() -> Tool {
     Tool {
         name: "write",
-        description: "Create or overwrite a file. Path must stay inside the workspace.",
+        description: "Create or overwrite a file. Absolute paths and paths outside the workspace are allowed.",
         properties: &[
             Property {
                 name: "path",
@@ -450,7 +421,7 @@ fn write_execute(workspace: &Path, raw: &Value) -> Result<String> {
 fn tool_edit() -> Tool {
     Tool {
         name: "edit",
-        description: "Replace `old` with `new`. `old` must appear exactly once. Path must stay inside the workspace.",
+        description: "Replace `old` with `new`. `old` must appear exactly once. Absolute paths and paths outside the workspace are allowed.",
         properties: &[
             Property {
                 name: "path",
@@ -521,7 +492,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_relative_and_reject_escape() {
+    fn resolve_relative_and_outside() {
         let root = workspace();
         assert!(
             fs::write(root.join("a.txt"), "ok").is_ok(),
@@ -529,8 +500,7 @@ mod tests {
         );
         let resolved = resolve_path(&root, "a.txt");
         assert!(resolved.as_ref().is_ok_and(|p| p.ends_with("a.txt")));
-        assert!(resolve_path(&root, "../secret").is_err());
-        assert!(resolve_read_path(&root, "../secret").is_ok());
+        assert!(resolve_path(&root, "../secret").is_ok());
         assert!(resolve_path(&root, "").is_err());
         let _ = fs::remove_dir_all(&root);
     }
@@ -557,12 +527,23 @@ mod tests {
             listing.as_ref().is_ok_and(|s| s.contains("secret.txt")),
             "{listing:?}"
         );
-        assert!(
-            write_execute(
-                &root,
-                &json!({"path": outside.join("nope.txt").to_string_lossy(), "content": "x"})
-            )
-            .is_err()
+        let wrote = write_execute(
+            &root,
+            &json!({"path": outside.join("nope.txt").to_string_lossy(), "content": "x"}),
+        );
+        assert!(wrote.is_ok(), "{wrote:?}");
+        let edited = edit_execute(
+            &root,
+            &json!({
+                "path": outside.join("secret.txt").to_string_lossy(),
+                "old": "peek",
+                "new": "seen"
+            }),
+        );
+        assert!(edited.is_ok(), "{edited:?}");
+        assert_eq!(
+            fs::read_to_string(outside.join("secret.txt")).unwrap(),
+            "seen"
         );
         let _ = fs::remove_dir_all(&outside);
         let _ = fs::remove_dir_all(&root);
