@@ -194,7 +194,7 @@ impl Agent {
             "You are Fun coding agent. Tools: read, write, edit, bash.\n\
              Read a file before editing it. Prefer edit for small changes.\n\
              Verify with tools before claiming done. Keep replies short.\n\
-             Paths are relative to this workspace unless absolute. read may use paths outside the workspace; write and edit must stay inside.\n\
+             Paths are relative to this workspace unless absolute. read, write, and edit may use paths outside the workspace.\n\
              workspace: {}",
             self.workspace.display()
         )
