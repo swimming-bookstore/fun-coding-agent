@@ -201,6 +201,7 @@ pub struct Ui {
     working: bool,
     spinner: usize,
     scroll: usize,
+    follow: bool,
     paused: bool,
     body_area: Rect,
     queue_area: Rect,
@@ -233,6 +234,7 @@ impl Ui {
             working: false,
             spinner: 0,
             scroll: 0,
+            follow: true,
             paused: false,
             body_area: Rect::new(0, 0, 0, 0),
             queue_area: Rect::new(0, 0, 0, 0),
@@ -256,7 +258,7 @@ impl Ui {
         self.paused = true;
         let result = f(self);
         self.paused = false;
-        self.scroll = 0;
+        self.follow_end();
         self.redraw()?;
         result
     }
@@ -373,20 +375,26 @@ impl Ui {
     }
 
     pub fn scroll_by(&mut self, delta: i32) -> Result<()> {
+        self.follow = false;
         if delta > 0 {
-            self.scroll = self.scroll.saturating_add(delta as usize);
+            self.body_start = self.body_start.saturating_sub(delta as usize);
         } else {
-            self.scroll = self.scroll.saturating_sub((-delta) as usize);
+            self.body_start = self.body_start.saturating_add((-delta) as usize);
         }
         self.redraw()
     }
 
     pub fn scroll_end(&mut self) -> Result<()> {
-        if self.scroll == 0 {
+        if self.follow && self.scroll == 0 {
             return Ok(());
         }
-        self.scroll = 0;
+        self.follow_end();
         self.redraw()
+    }
+
+    fn follow_end(&mut self) {
+        self.scroll = 0;
+        self.follow = true;
     }
 
     pub fn select_start(&mut self, x: u16, y: u16) -> Result<()> {
@@ -541,7 +549,7 @@ impl Ui {
     pub fn user(&mut self, text: &str) -> Result<()> {
         self.clear_think();
         self.flush_partial();
-        self.scroll = 0;
+        self.follow_end();
         self.items.push(Item::User(sanitize(text)));
         self.rows.clear();
         self.redraw()
@@ -671,6 +679,7 @@ impl Ui {
             self.item_rows = map;
             if self.wrap_w != width {
                 self.select = None;
+                self.follow = true;
             }
             self.wrap_w = width;
         }
@@ -706,8 +715,9 @@ impl Ui {
         let show_copied = self
             .copied_until
             .is_some_and(|at| Instant::now() < at);
+        let follow = self.follow;
         let mut used_scroll = 0usize;
-        let mut body_start = 0usize;
+        let mut body_start = self.body_start;
         let mut body_area = Rect::new(0, 0, 0, 0);
         let mut queue_area = Rect::new(0, 0, 0, 0);
 
@@ -745,7 +755,8 @@ impl Ui {
             }
             let parts = split(area, &constraints);
             body_area = parts[0];
-            (used_scroll, body_start) = body(buf, parts[0], rows, partial, working, scroll);
+            (used_scroll, body_start) =
+                body(buf, parts[0], rows, partial, working, follow, body_start);
             paint_select(buf, parts[0], select, body_start);
             let mut i = 1usize;
             if think_h > 0 {
@@ -786,6 +797,7 @@ impl Ui {
         self.queue_area = queue_area;
         self.scroll = used_scroll;
         self.body_start = body_start;
+        self.follow = used_scroll == 0;
         Ok(())
     }
 }
@@ -1586,13 +1598,20 @@ fn slice_line(line: &Line, origin_x: u16, x0: u16, x1: u16) -> String {
     out
 }
 
+fn body_window(len: usize, height: usize, follow: bool, start: usize) -> (usize, usize) {
+    let max_start = len.saturating_sub(height);
+    let start = if follow { max_start } else { start.min(max_start) };
+    (max_start.saturating_sub(start), start)
+}
+
 fn body(
     buf: &mut Buffer,
     area: Rect,
     rows: &[Line],
     partial: &str,
     working: bool,
-    scroll: usize,
+    follow: bool,
+    start: usize,
 ) -> (usize, usize) {
     if area.is_empty() {
         return (0, 0);
@@ -1600,9 +1619,7 @@ fn body(
     let width = area.width.saturating_sub(2).max(1) as usize;
     let wrapped = wrap_body(rows, partial, working, width);
     let h = area.height as usize;
-    let max_scroll = wrapped.len().saturating_sub(h);
-    let scroll = scroll.min(max_scroll);
-    let start = wrapped.len().saturating_sub(h + scroll);
+    let (scroll, start) = body_window(wrapped.len(), h, follow, start);
     let x = area.x.saturating_add(1);
     for (i, line) in wrapped[start..].iter().take(h).enumerate() {
         let y = area.y.saturating_add(i as u16);
@@ -2728,6 +2745,21 @@ mod tests {
         assert_eq!(chrome_heights(4, 2), (3, 1));
         assert_eq!(chrome_heights(8, 2), (3, 2));
         assert_eq!(chrome_heights(10, 3), (3, 3));
+    }
+
+    #[test]
+    fn body_window_follows_bottom() {
+        assert_eq!(body_window(20, 10, true, 0), (0, 10));
+        assert_eq!(body_window(20, 10, true, 3), (0, 10));
+        assert_eq!(body_window(5, 10, true, 3), (0, 0));
+    }
+
+    #[test]
+    fn body_window_pin_grows_hidden_count() {
+        assert_eq!(body_window(20, 10, false, 5), (5, 5));
+        assert_eq!(body_window(30, 10, false, 5), (15, 5));
+        assert_eq!(body_window(12, 10, false, 5), (0, 2));
+        assert_eq!(body_window(20, 10, false, 100), (0, 10));
     }
 
     #[test]
