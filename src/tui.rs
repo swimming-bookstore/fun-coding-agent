@@ -18,7 +18,7 @@
 
 
 use crate::agent::{tool_counts, tool_summary, ToolRun};
-use crate::config::{fill_action, Action, ActionColor, ActionWhen, Palette};
+use crate::config::{Action, ActionColor, ActionWhen, Palette};
 use crate::ui::{
     split, Block, Buffer, Color, Constraint, Rect, Style, Terminal,
 };
@@ -269,7 +269,7 @@ pub struct Ui {
 
 struct AskDialog {
     title: String,
-    prefix: String,
+    template: String,
     hint: String,
     placeholder: String,
     value: String,
@@ -525,13 +525,13 @@ impl Ui {
     pub fn open_ask(
         &mut self,
         title: impl Into<String>,
-        prefix: impl Into<String>,
+        template: impl Into<String>,
         hint: impl Into<String>,
         placeholder: impl Into<String>,
     ) -> Result<()> {
         self.ask = Some(AskDialog {
             title: title.into(),
-            prefix: prefix.into(),
+            template: template.into(),
             hint: hint.into(),
             placeholder: placeholder.into(),
             value: String::new(),
@@ -588,13 +588,13 @@ impl Ui {
         self.redraw()
     }
 
-    pub fn take_ask(&mut self) -> Option<String> {
+    pub fn take_ask(&mut self) -> Option<(String, String)> {
         let ask = self.ask.take()?;
         let value = ask.value.trim();
         if value.is_empty() {
             None
         } else {
-            Some(format!("{}{value}", ask.prefix))
+            Some((ask.template, value.to_string()))
         }
     }
 
@@ -1309,8 +1309,8 @@ fn action_items(home: Option<&str>, branch: Option<&str>) -> Vec<(String, Action
                 ActionWhen::Origin if !has_origin() => return None,
                 _ => {}
             }
-            fill_action(&spec.prompt, home, branch)?;
-            let label = fill_action(&spec.label, home, branch)?;
+            spec.filled_prompt(home, branch, None)?;
+            let label = spec.filled_label(home, branch)?;
             Some((label, ActionHit { index }, spec.color))
         })
         .collect()
@@ -3150,24 +3150,24 @@ mod tests {
     fn pull_master_sits_above_composer() {
         let area = Rect::new(0, 19, 80, 1);
         assert_eq!(
-            crate::config::fill_action("checkout and pull {home}", Some("master"), None).as_deref(),
+            crate::config::fill_action("checkout and pull {home}", Some("master"), None, None).as_deref(),
             Some("checkout and pull master")
         );
         assert_eq!(
-            fill_action(&Action::defaults()[0].label, Some("master"), None).as_deref(),
+            crate::config::fill_action(&Action::defaults()[0].label, Some("master"), None, None).as_deref(),
             Some("[ checkout and pull master ]")
         );
         assert_eq!(
-            fill_action(&Action::defaults()[0].label, Some("main"), None).as_deref(),
+            crate::config::fill_action(&Action::defaults()[0].label, Some("main"), None, None).as_deref(),
             Some("[ checkout and pull main ]")
         );
         assert_eq!(
-            fill_action(&Action::defaults()[1].label, Some("master"), Some("feat")).as_deref(),
+            Action::defaults()[1].filled_label(Some("master"), Some("feat")).as_deref(),
             Some("[ commit to feat and push ]")
         );
         assert_eq!(
-            fill_action(&Action::defaults()[1].label, Some("master"), Some("master")).as_deref(),
-            Some("[ commit to master and push ]")
+            Action::defaults()[1].filled_label(Some("master"), Some("master")).as_deref(),
+            Some("[ commit and push ]")
         );
         crate::tui::set_git(true);
         crate::tui::set_origin(true);
@@ -3201,7 +3201,7 @@ mod tests {
         assert_eq!(on_home.len(), 2);
         assert_eq!(
             on_home[1].0.width as usize,
-            width("[ commit to master and push ]")
+            width("[ commit and push ]")
         );
         crate::tui::set_origin(false);
         let no_origin = paint_action_bar(
