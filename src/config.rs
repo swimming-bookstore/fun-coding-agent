@@ -1,9 +1,17 @@
 //! Optional `~/.config/fun-coding-agent/config.json`.
 //! Override with `FUN_CODING_AGENT_CONFIG`.
-//! Invalid JSON keeps the default palette.
+//! Invalid JSON keeps the defaults.
+//!
+//! `{home}` is the trunk branch (`master` / `main` / `dev`).
+//! `{branch}` is the current checkout, or `{home}` before `git init`.
+//! Set `"home"` to choose which name to use when git has none yet.
+//! `"when": "git"` hides a chip until the workspace is a git repo.
+//! `"when": "origin"` also requires a remote named `origin`.
+//! `"ask"` opens a box for extra input (origin URL) instead of sending.
 //!
 //! ```json
 //! {
+//!   "home": "master",
 //!   "colors": {
 //!     "text": "#e2e6f1",
 //!     "muted": "#7a829a",
@@ -18,7 +26,21 @@
 //!     "queue": "#2a4056",
 //!     "think": "#948ca8",
 //!     "think_border": "#9a82c4"
-//!   }
+//!   },
+//!   "actions": [
+//!     {
+//!       "label": "[ checkout and pull {home} ]",
+//!       "prompt": "checkout and pull {home}",
+//!       "color": "ok",
+//!       "when": "git"
+//!     },
+//!     {
+//!       "label": "[ commit to {branch} and push ]",
+//!       "prompt": "commit to {branch} and push",
+//!       "color": "accent",
+//!       "ask": "init git on {home} if needed, add origin "
+//!     }
+//!   ]
 //! }
 //! ```
 
@@ -46,6 +68,93 @@ pub struct Palette {
     pub think_border: Color,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Action {
+    pub label: String,
+    pub prompt: String,
+    pub color: ActionColor,
+    pub when: ActionWhen,
+    pub ask: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ActionWhen {
+    #[default]
+    Always,
+    Git,
+    Origin,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ActionColor {
+    #[default]
+    Accent,
+    Ok,
+    User,
+    Agent,
+    Tool,
+    Muted,
+    Text,
+    Error,
+}
+
+impl Action {
+    pub fn defaults() -> Vec<Self> {
+        vec![
+            Self {
+                label: "[ checkout and pull {home} ]".into(),
+                prompt: "checkout and pull {home}".into(),
+                color: ActionColor::Ok,
+                when: ActionWhen::Git,
+                ask: None,
+            },
+            Self {
+                label: "[ commit to {branch} and push ]".into(),
+                prompt: "commit to {branch} and push".into(),
+                color: ActionColor::Accent,
+                when: ActionWhen::Always,
+                ask: Some("init git on {home} if needed, add origin ".into()),
+            },
+        ]
+    }
+}
+
+fn named(s: Option<&str>) -> Option<&str> {
+    s.map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// `{home}` is trunk. `{branch}` is the current checkout, or `{home}` before git exists.
+pub fn fill_action(s: &str, home: Option<&str>, branch: Option<&str>) -> Option<String> {
+    if s.trim().is_empty() {
+        return None;
+    }
+    let mut out = s.to_string();
+    if out.contains("{home}") {
+        out = out.replace("{home}", named(home)?);
+    }
+    if out.contains("{branch}") {
+        out = out.replace("{branch}", named(branch).or_else(|| named(home))?);
+    }
+    Some(out)
+}
+
+#[derive(Clone)]
+pub struct Config {
+    pub palette: Palette,
+    pub actions: Vec<Action>,
+    pub home: String,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            palette: Palette::default(),
+            actions: Action::defaults(),
+            home: "master".into(),
+        }
+    }
+}
+
 impl Default for Palette {
     fn default() -> Self {
         Self {
@@ -70,6 +179,17 @@ impl Default for Palette {
 struct File {
     #[serde(default)]
     colors: ColorFile,
+    actions: Option<Vec<ActionFile>>,
+    home: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+struct ActionFile {
+    label: Option<String>,
+    prompt: Option<String>,
+    color: Option<String>,
+    when: Option<String>,
+    ask: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -115,20 +235,79 @@ fn config_dir() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".config/fun-coding-agent"))
 }
 
-pub fn load() -> Palette {
+pub fn load() -> Config {
     config_path()
         .and_then(|p| load_from(&p))
         .unwrap_or_default()
 }
 
-fn load_from(path: &Path) -> Result<Palette> {
+fn load_from(path: &Path) -> Result<Config> {
     if !path.exists() {
-        return Ok(Palette::default());
+        return Ok(Config::default());
     }
     let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let file: File = serde_json::from_str(&raw)
         .with_context(|| format!("parse {}", path.display()))?;
-    file.colors.into_palette()
+    Ok(Config {
+        palette: file.colors.into_palette()?,
+        actions: match file.actions {
+            None => Action::defaults(),
+            Some(items) => items
+                .into_iter()
+                .filter_map(|item| item.into_action())
+                .collect(),
+        },
+        home: parse_home(file.home),
+    })
+}
+
+impl ActionFile {
+    fn into_action(self) -> Option<Action> {
+        let label = self.label?.trim().to_string();
+        let prompt = self.prompt?.trim().to_string();
+        if label.is_empty() || prompt.is_empty() {
+            return None;
+        }
+        Some(Action {
+            label,
+            prompt,
+            color: parse_action_color(self.color.as_deref()),
+            when: parse_action_when(self.when.as_deref()),
+            ask: self
+                .ask
+                .map(|s| s.trim_start().to_string())
+                .filter(|s| !s.trim().is_empty()),
+        })
+    }
+}
+
+fn parse_home(value: Option<String>) -> String {
+    match value.as_deref().map(str::trim).unwrap_or("") {
+        "main" => "main".into(),
+        "dev" => "dev".into(),
+        _ => "master".into(),
+    }
+}
+
+fn parse_action_when(name: Option<&str>) -> ActionWhen {
+    match name.map(str::trim).unwrap_or("") {
+        "origin" => ActionWhen::Origin,
+        "git" => ActionWhen::Git,
+        _ => ActionWhen::Always,
+    }
+}
+
+fn parse_action_color(name: Option<&str>) -> ActionColor {
+    match name.map(str::trim).unwrap_or("") {
+        "ok" => ActionColor::Ok,
+        "user" => ActionColor::User,
+        "agent" => ActionColor::Agent,
+        "tool" => ActionColor::Tool,
+        "muted" => ActionColor::Muted,
+        "text" => ActionColor::Text,
+        "error" => ActionColor::Error,
+        _ => ActionColor::Accent,
+    }
 }
 
 impl ColorFile {
@@ -260,13 +439,75 @@ mod tests {
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("config.json");
         assert!(fs::write(&path, "{not json").is_ok(), "write bad config");
-        let pal = load_from(&path).unwrap_or_else(|_| Palette::default());
-        assert_eq!(rgb_of(pal.user), Some((247, 168, 120)));
+        let cfg = load_from(&path).unwrap_or_default();
+        assert_eq!(rgb_of(cfg.palette.user), Some((247, 168, 120)));
         let _ = fs::remove_dir_all(&dir);
-        let pal = load_from(Path::new("/no/such/config.json"));
-        assert!(pal.is_ok(), "missing file");
-        if let Ok(pal) = pal {
-            assert_eq!(rgb_of(pal.user), Some((247, 168, 120)));
+        let cfg = load_from(Path::new("/no/such/config.json"));
+        assert!(cfg.is_ok(), "missing file");
+        if let Ok(cfg) = cfg {
+            assert_eq!(rgb_of(cfg.palette.user), Some((247, 168, 120)));
+            assert_eq!(cfg.actions, Action::defaults());
+            assert_eq!(cfg.home, "master");
         }
+    }
+
+    #[test]
+    fn actions_from_file() {
+        let file = serde_json::from_value::<File>(json!({
+            "home": "main",
+            "actions": [
+                { "label": "[ checkout and pull {home} ]", "prompt": "checkout and pull {home}", "color": "ok", "when": "git" },
+                { "label": "  ", "prompt": "skip" },
+                { "label": "[ custom ]", "prompt": "do the thing", "color": "user", "ask": "add origin " }
+            ]
+        }))
+        .expect("parse");
+        assert_eq!(parse_home(file.home.clone()), "main");
+        let actions: Vec<Action> = file
+            .actions
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(ActionFile::into_action)
+            .collect();
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].color, ActionColor::Ok);
+        assert_eq!(actions[0].when, ActionWhen::Git);
+        assert_eq!(actions[1].label, "[ custom ]");
+        assert_eq!(actions[1].color, ActionColor::User);
+        assert_eq!(actions[1].when, ActionWhen::Always);
+        assert_eq!(actions[1].ask.as_deref(), Some("add origin "));
+        assert_eq!(
+            fill_action("checkout and pull {home}", Some("master"), None).as_deref(),
+            Some("checkout and pull master")
+        );
+        assert_eq!(fill_action("checkout and pull {home}", None, None), None);
+        assert_eq!(
+            fill_action("[ commit to {home} and push ]", Some("dev"), None).as_deref(),
+            Some("[ commit to dev and push ]")
+        );
+        assert_eq!(
+            fill_action("commit to {branch} and push", Some("master"), Some("master")).as_deref(),
+            Some("commit to master and push")
+        );
+        assert_eq!(
+            fill_action(
+                "[ commit to {branch} and push ]",
+                Some("master"),
+                Some("feat")
+            )
+            .as_deref(),
+            Some("[ commit to feat and push ]")
+        );
+        assert_eq!(
+            fill_action("commit to {branch} and push", Some("master"), None).as_deref(),
+            Some("commit to master and push")
+        );
+        assert_eq!(fill_action("commit to {branch} and push", None, None), None);
+        assert_eq!(
+            fill_action("checkout and pull {home}", Some("master"), Some("feat")).as_deref(),
+            Some("checkout and pull master")
+        );
+        assert_eq!(parse_home(Some("dev".into())), "dev");
+        assert_eq!(parse_home(Some("trunk".into())), "master");
     }
 }

@@ -57,6 +57,8 @@ XTERM_BORDER = 12
 COMPOSER_H = 3
 # Status wraps to 3 rows while working (spinner + model/effort).
 STATUS_H = 3
+# Commit chip stays visible without origin; it fills the composer instead of sending.
+ACTION_H = 1
 QUEUE_CTRLS = [
     ("send now", 8),
     ("edit", 4),
@@ -613,7 +615,7 @@ def find_queue_rows(
     frame: bytes, win_w: int, win_h: int, cw: float, ch: float, cols: dict[str, int]
 ) -> list[int]:
     rows: list[int] = []
-    for row in range(8, ROWS - 3):
+    for row in range(8, ROWS - STATUS_H - COMPOSER_H - ACTION_H):
         send = any(
             cell_has_color(frame, win_w, win_h, cw, ch, cols["send now"] + i, row, RGB_ACCENT)
             for i in range(CTRL_W["send now"])
@@ -634,7 +636,7 @@ def find_queue_rows(
 
 def queue_layout(n_items: int) -> tuple[int, dict[str, int]]:
     queue_h = min(n_items, 4) + 2
-    queue_y = ROWS - STATUS_H - COMPOSER_H - queue_h
+    queue_y = ROWS - STATUS_H - COMPOSER_H - ACTION_H - queue_h
     item0 = queue_y + 1
     inner_x = 2
     inner_w = COLS - 4
