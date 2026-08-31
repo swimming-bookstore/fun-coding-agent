@@ -122,10 +122,9 @@ fn resolve_path(workspace: &Path, path: &str) -> Result<PathBuf> {
     }
     if let Some(parent) = candidate.parent()
         && let Ok(real_parent) = parent.canonicalize()
+        && let Some(name) = candidate.file_name()
     {
-        if let Some(name) = candidate.file_name() {
-            return Ok(real_parent.join(name));
-        }
+        return Ok(real_parent.join(name));
     }
     Ok(candidate)
 }
@@ -151,7 +150,7 @@ fn clean(path: &Path) -> PathBuf {
 fn tool_bash() -> Tool {
     Tool {
         name: "bash",
-        description: "Run a shell command in the workspace. Combined stdout+stderr, capped at 20KB. The command itself is not sandboxed.",
+        description: "Run a shell command in the workspace. Combined stdout+stderr, capped at 20KB. The command itself is not sandboxed. No TTY — sudo/password prompts cannot use the terminal and will fail instead of hanging.",
         properties: &[Property {
             name: "cmd",
             r#type: "string",
@@ -176,20 +175,60 @@ fn format_bash_output(stdout: &[u8], stderr: &[u8], status: std::process::ExitSt
     }
 }
 
+fn bash_command(workspace: &Path, cmd: &str) -> tokio::process::Command {
+    let mut child = tokio::process::Command::new("sh");
+    child
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(workspace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // Keep password helpers from talking to the TUI.
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("SSH_ASKPASS_REQUIRE", "never")
+        .env_remove("GIT_ASKPASS")
+        .env_remove("SSH_ASKPASS")
+        .env_remove("SUDO_ASKPASS")
+        .kill_on_drop(true);
+    detach_from_tty(&mut child);
+    child
+}
+
+fn detach_from_tty(cmd: &mut tokio::process::Command) {
+    #[cfg(unix)]
+    {
+        // SAFETY: only setsid() so the child has no controlling terminal.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = cmd;
+}
+
+fn kill_bash(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(id) = child.id() {
+        // setsid() makes the child the process-group leader (pgid == pid).
+        let _ = unsafe { libc::kill(-(id as i32), libc::SIGKILL) };
+    }
+    let _ = child.start_kill();
+}
+
 async fn bash_execute_async(workspace: &Path, raw: &Value, abort: &Abort) -> Result<String> {
     #[derive(Deserialize)]
     struct Args {
         cmd: String,
     }
     let a: Args = Args::deserialize(raw).context("bash args")?;
-    let mut child = tokio::process::Command::new("sh")
-        .arg("-c")
-        .arg(&a.cmd)
-        .current_dir(workspace)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
+    let mut child = bash_command(workspace, &a.cmd)
         .spawn()
         .context("spawn bash")?;
     let mut stdout = child.stdout.take().context("bash stdout")?;
@@ -207,7 +246,7 @@ async fn bash_execute_async(workspace: &Path, raw: &Value, abort: &Abort) -> Res
     let status = tokio::select! {
         status = child.wait() => status.context("wait bash")?,
         _ = abort.wait() => {
-            let _ = child.start_kill();
+            kill_bash(&mut child);
             let _ = child.wait().await;
             return Err(aborted());
         }
@@ -597,5 +636,23 @@ mod tests {
     fn clean_drops_dotdot_inside_root() {
         let p = clean(Path::new("/ws/a/../b/./c"));
         assert_eq!(p, PathBuf::from("/ws/b/c"));
+    }
+
+    #[tokio::test]
+    async fn bash_runs_and_has_no_controlling_tty() {
+        let root = workspace();
+        let abort = Abort::new();
+        let hi = bash_execute_async(&root, &json!({"cmd": "echo hi"}), &abort).await;
+        assert!(hi.as_ref().is_ok_and(|s| s.contains("hi")), "{hi:?}");
+        // sudo/ssh password prompts open /dev/tty; without a controlling
+        // terminal that fails instead of writing into the TUI composer.
+        let tty = bash_execute_async(
+            &root,
+            &json!({"cmd": "stty -a </dev/tty >/dev/null 2>&1 && echo HAS_TTY || echo NO_TTY"}),
+            &abort,
+        )
+        .await;
+        let _ = fs::remove_dir_all(&root);
+        assert!(tty.as_ref().is_ok_and(|s| s.contains("NO_TTY")), "{tty:?}");
     }
 }

@@ -6,6 +6,7 @@
 //!   interrupt stop-now prompts (one-line strip)
 //!   steer     after-this-step prompts (one-line strip)
 //!   queue     idle prompts for after this turn (boxed)
+//!   actions   pull / commit chips above the composer
 //!   composer
 //!   status    tokens / model / keys
 //!
@@ -17,7 +18,7 @@
 
 
 use crate::agent::{tool_counts, tool_summary, ToolRun};
-use crate::config::Palette;
+use crate::config::{fill_action, Action, ActionColor, ActionWhen, Palette};
 use crate::ui::{
     split, Block, Buffer, Color, Constraint, Rect, Style, Terminal,
 };
@@ -35,6 +36,10 @@ const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧
 
 thread_local! {
     static PALETTE: Cell<Palette> = Cell::new(Palette::default());
+    static ACTIONS: std::cell::RefCell<Vec<Action>> = std::cell::RefCell::new(Action::defaults());
+    static GIT: Cell<bool> = const { Cell::new(false) };
+    static ORIGIN: Cell<bool> = const { Cell::new(false) };
+    static HOME: std::cell::RefCell<String> = std::cell::RefCell::new(String::from("master"));
 }
 
 fn pal() -> Palette {
@@ -43,6 +48,42 @@ fn pal() -> Palette {
 
 pub fn set_palette(p: Palette) {
     PALETTE.with(|c| c.set(p));
+}
+
+pub fn set_actions(actions: Vec<Action>) {
+    ACTIONS.with(|c| *c.borrow_mut() = actions);
+}
+
+pub fn configured_action(index: usize) -> Option<Action> {
+    ACTIONS.with(|c| c.borrow().get(index).cloned())
+}
+
+pub fn set_git(present: bool) {
+    GIT.with(|c| c.set(present));
+}
+
+pub fn set_origin(present: bool) {
+    ORIGIN.with(|c| c.set(present));
+}
+
+pub fn set_home(home: String) {
+    HOME.with(|c| *c.borrow_mut() = home);
+}
+
+pub fn configured_home() -> String {
+    HOME.with(|c| c.borrow().clone())
+}
+
+pub fn has_origin() -> bool {
+    ORIGIN.with(Cell::get)
+}
+
+fn git_present() -> bool {
+    GIT.with(Cell::get)
+}
+
+fn actions() -> Vec<Action> {
+    ACTIONS.with(|c| c.borrow().clone())
 }
 
 fn col(c: Color) -> Style {
@@ -89,6 +130,7 @@ fn think_col() -> Style {
 pub struct Bar {
     pub workspace: String,
     pub branch: Option<String>,
+    pub pull: Option<String>,
     pub input: String,
     pub output: String,
     pub reasoning: String,
@@ -112,6 +154,11 @@ pub enum QueueHit {
     Edit(usize),
     Drop(usize),
     Drag(usize),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActionHit {
+    pub index: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -205,6 +252,7 @@ pub struct Ui {
     paused: bool,
     body_area: Rect,
     queue_area: Rect,
+    actions: Vec<(Rect, ActionHit)>,
     queue_drag: Option<usize>,
     queue_flash: Option<(usize, Instant)>,
     queue_edit: Option<usize>,
@@ -216,6 +264,16 @@ pub struct Ui {
     interrupts: Vec<String>,
     steers: Vec<String>,
     copied_until: Option<Instant>,
+    ask: Option<AskDialog>,
+}
+
+struct AskDialog {
+    title: String,
+    prefix: String,
+    hint: String,
+    placeholder: String,
+    value: String,
+    cursor: usize,
 }
 
 impl Ui {
@@ -238,6 +296,7 @@ impl Ui {
             paused: false,
             body_area: Rect::new(0, 0, 0, 0),
             queue_area: Rect::new(0, 0, 0, 0),
+            actions: Vec::new(),
             queue_drag: None,
             queue_flash: None,
             queue_edit: None,
@@ -249,6 +308,7 @@ impl Ui {
             interrupts: Vec::new(),
             steers: Vec::new(),
             copied_until: None,
+            ask: None,
         };
         ui.redraw()?;
         Ok(ui)
@@ -458,6 +518,86 @@ impl Ui {
         self.select.is_some() && !self.queue_pointer
     }
 
+    pub fn asking(&self) -> bool {
+        self.ask.is_some()
+    }
+
+    pub fn open_ask(
+        &mut self,
+        title: impl Into<String>,
+        prefix: impl Into<String>,
+        hint: impl Into<String>,
+        placeholder: impl Into<String>,
+    ) -> Result<()> {
+        self.ask = Some(AskDialog {
+            title: title.into(),
+            prefix: prefix.into(),
+            hint: hint.into(),
+            placeholder: placeholder.into(),
+            value: String::new(),
+            cursor: 0,
+        });
+        self.redraw()
+    }
+
+    pub fn ask_insert(&mut self, ch: char) -> Result<()> {
+        if let Some(ask) = &mut self.ask {
+            ask.value.insert(ask.cursor, ch);
+            ask.cursor += ch.len_utf8();
+        }
+        self.redraw()
+    }
+
+    pub fn ask_backspace(&mut self) -> Result<()> {
+        if let Some(ask) = &mut self.ask
+            && ask.cursor > 0
+        {
+            let from = prev_char(ask.value.as_str(), ask.cursor);
+            ask.value.replace_range(from..ask.cursor, "");
+            ask.cursor = from;
+        }
+        self.redraw()
+    }
+
+    pub fn ask_delete(&mut self) -> Result<()> {
+        if let Some(ask) = &mut self.ask
+            && ask.cursor < ask.value.len()
+        {
+            let to = next_char(ask.value.as_str(), ask.cursor);
+            ask.value.replace_range(ask.cursor..to, "");
+        }
+        self.redraw()
+    }
+
+    pub fn ask_left(&mut self) -> Result<()> {
+        if let Some(ask) = &mut self.ask {
+            ask.cursor = prev_char(ask.value.as_str(), ask.cursor);
+        }
+        self.redraw()
+    }
+
+    pub fn ask_right(&mut self) -> Result<()> {
+        if let Some(ask) = &mut self.ask {
+            ask.cursor = next_char(ask.value.as_str(), ask.cursor);
+        }
+        self.redraw()
+    }
+
+    pub fn close_ask(&mut self) -> Result<()> {
+        self.ask = None;
+        self.redraw()
+    }
+
+    pub fn take_ask(&mut self) -> Option<String> {
+        let ask = self.ask.take()?;
+        let value = ask.value.trim();
+        if value.is_empty() {
+            None
+        } else {
+            Some(format!("{}{value}", ask.prefix))
+        }
+    }
+
     pub fn flash_copied(&mut self) -> Result<()> {
         self.copied_until = Some(Instant::now() + COPY_FLASH);
         self.redraw()
@@ -491,6 +631,13 @@ impl Ui {
 
     pub fn queue_hit(&self, x: u16, y: u16) -> Option<QueueHit> {
         queue_hit(self.queue_area, &self.queue, x, y)
+    }
+
+    pub fn action_hit(&self, x: u16, y: u16) -> Option<ActionHit> {
+        self.actions
+            .iter()
+            .find(|(r, _)| r.contains(x, y))
+            .map(|(_, hit)| *hit)
     }
 
     pub fn begin_queue_drag(&mut self, index: usize) {
@@ -716,10 +863,12 @@ impl Ui {
             .copied_until
             .is_some_and(|at| Instant::now() < at);
         let follow = self.follow;
+        let ask = self.ask.as_ref();
         let mut used_scroll = 0usize;
         let mut body_start = self.body_start;
         let mut body_area = Rect::new(0, 0, 0, 0);
         let mut queue_area = Rect::new(0, 0, 0, 0);
+        let mut actions = Vec::new();
 
         self.term.draw_with_cursor(|buf, area| {
             let status_wanted = status_rows(bar, working, spinner, scroll, area.width)
@@ -734,6 +883,13 @@ impl Ui {
             let steer_h = if steers.is_empty() || room == 0 { 0 } else { 1 };
             room = room.saturating_sub(steer_h);
             let queue_h = queue_height(queue, room);
+            room = room.saturating_sub(queue_h);
+            let action_h = action_bar_height(
+                area.width,
+                bar.pull.as_deref(),
+                bar.branch.as_deref(),
+                room,
+            );
             let mut constraints = vec![Constraint::Fill];
             if think_h > 0 {
                 constraints.push(Constraint::Length(think_h));
@@ -746,6 +902,9 @@ impl Ui {
             }
             if queue_h > 0 {
                 constraints.push(Constraint::Length(queue_h));
+            }
+            if action_h > 0 {
+                constraints.push(Constraint::Length(action_h));
             }
             if composer_h > 0 {
                 constraints.push(Constraint::Length(composer_h));
@@ -776,6 +935,15 @@ impl Ui {
                 queue_panel(buf, parts[i], queue, queue_hl, queue_edit.zip(queue_edit_text));
                 i += 1;
             }
+            if action_h > 0 {
+                actions = paint_action_bar(
+                    buf,
+                    parts[i],
+                    bar.pull.as_deref(),
+                    bar.branch.as_deref(),
+                );
+                i += 1;
+            }
             let mut composer_area = Rect::new(0, 0, 0, 0);
             let cursor_pos = if composer_h > 0 {
                 composer_area = parts[i];
@@ -791,10 +959,14 @@ impl Ui {
             if show_copied {
                 paint_copied(buf, area, composer_area);
             }
+            if let Some(ask) = ask {
+                return paint_ask(buf, area, ask);
+            }
             cursor_pos
         })?;
         self.body_area = body_area;
         self.queue_area = queue_area;
+        self.actions = actions;
         self.scroll = used_scroll;
         self.body_start = body_start;
         self.follow = used_scroll == 0;
@@ -1013,6 +1185,109 @@ fn status(
     }
 }
 
+fn prev_char(s: &str, mut i: usize) -> usize {
+    if i == 0 {
+        return 0;
+    }
+    i -= 1;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn next_char(s: &str, mut i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    i += 1;
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
+fn fill_rect(buf: &mut Buffer, area: Rect, style: Style) {
+    let mut y = area.top();
+    while y < area.bottom() {
+        let mut x = area.left();
+        while x < area.right() {
+            buf.put(x, y, ' ', style);
+            x = x.saturating_add(1);
+        }
+        y = y.saturating_add(1);
+    }
+}
+
+fn paint_ask(buf: &mut Buffer, screen: Rect, ask: &AskDialog) -> (u16, u16) {
+    if screen.is_empty() {
+        return (screen.x, screen.y);
+    }
+    fill_rect(buf, screen, Style::new());
+    let title = if ask.title.trim().is_empty() {
+        "git origin URL"
+    } else {
+        ask.title.trim()
+    };
+    let hint = if ask.hint.trim().is_empty() {
+        "Enter send · Esc cancel"
+    } else {
+        ask.hint.trim()
+    };
+    let inner_w = (width(title) + 8)
+        .max(width(hint) + 2)
+        .max(width(&ask.placeholder) + 2)
+        .max(44)
+        .min(screen.width.saturating_sub(4) as usize)
+        .max(16);
+    let w = (inner_w as u16).saturating_add(4).min(screen.width).max(10);
+    let h = 8u16.min(screen.height).max(5);
+    let x = screen.x.saturating_add(screen.width.saturating_sub(w) / 2);
+    let y = screen.y.saturating_add(screen.height.saturating_sub(h) / 2);
+    let box_area = Rect::new(x, y, w, h);
+    fill_rect(buf, box_area, Style::new());
+    Block::new()
+        .border(accent())
+        .title(title, accent().bold())
+        .render(buf, box_area);
+    let inner = Block::inner(box_area);
+    if inner.is_empty() {
+        return (box_area.x.saturating_add(1), box_area.y.saturating_add(1));
+    }
+    let field_y = inner.y.saturating_add(1).min(inner.bottom().saturating_sub(1));
+    let field = Rect::new(
+        inner.x.saturating_add(1),
+        field_y,
+        inner.width.saturating_sub(2),
+        1,
+    );
+    let max = field.width.saturating_sub(1).max(1) as usize;
+    let cursor = if ask.value.is_empty() && !ask.placeholder.is_empty() {
+        buf.write(
+            field,
+            field.x,
+            field.y,
+            &clip_width(&ask.placeholder, max),
+            muted().italic(),
+        );
+        (field.x, field.y)
+    } else {
+        let (shown, cur) = visible_input(&ask.value, ask.cursor, max);
+        buf.write(field, field.x, field.y, &shown, col(pal().text));
+        (field.x.saturating_add(cur as u16), field.y)
+    };
+    if inner.height > 3 {
+        buf.write(
+            inner,
+            inner.x.saturating_add(1),
+            inner.bottom().saturating_sub(1),
+            hint,
+            muted(),
+        );
+    }
+    cursor
+}
+
 fn order_sel(
     start: (u16, usize),
     end: (u16, usize),
@@ -1022,6 +1297,89 @@ fn order_sel(
     } else {
         (end, start)
     }
+}
+
+fn action_items(home: Option<&str>, branch: Option<&str>) -> Vec<(String, ActionHit, ActionColor)> {
+    actions()
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, spec)| {
+            match spec.when {
+                ActionWhen::Git if !git_present() => return None,
+                ActionWhen::Origin if !has_origin() => return None,
+                _ => {}
+            }
+            fill_action(&spec.prompt, home, branch)?;
+            let label = fill_action(&spec.label, home, branch)?;
+            Some((label, ActionHit { index }, spec.color))
+        })
+        .collect()
+}
+
+fn action_style(color: ActionColor) -> Style {
+    match color {
+        ActionColor::Ok => ok_col().bold(),
+        ActionColor::User => user_col().bold(),
+        ActionColor::Agent => agent_col().bold(),
+        ActionColor::Tool => tool_col().bold(),
+        ActionColor::Muted => muted().bold(),
+        ActionColor::Text => col(pal().text).bold(),
+        ActionColor::Error => err_col().bold(),
+        ActionColor::Accent => accent().bold(),
+    }
+}
+
+fn action_bar_height(width: u16, home: Option<&str>, branch: Option<&str>, room: u16) -> u16 {
+    if room == 0 || width < 8 || action_items(home, branch).is_empty() {
+        0
+    } else {
+        1
+    }
+}
+
+fn paint_action_bar(
+    buf: &mut Buffer,
+    area: Rect,
+    home: Option<&str>,
+    branch: Option<&str>,
+) -> Vec<(Rect, ActionHit)> {
+    if area.is_empty() {
+        return Vec::new();
+    }
+    let items = action_items(home, branch);
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let y = area.y;
+    let gap = 1u16;
+    let mut chips: Vec<(String, ActionHit, ActionColor, u16)> = Vec::new();
+    let mut total = 0u16;
+    for (label, hit, color) in items {
+        let w = (width(&label) as u16).min(area.width).max(1);
+        if total > 0 {
+            total = total.saturating_add(gap);
+        }
+        if total.saturating_add(w) > area.width {
+            break;
+        }
+        total = total.saturating_add(w);
+        chips.push((label, hit, color, w));
+    }
+    if chips.is_empty() {
+        return Vec::new();
+    }
+    let mut x = area.right().saturating_sub(total).max(area.x);
+    let mut out = Vec::new();
+    for (i, (label, hit, color, w)) in chips.into_iter().enumerate() {
+        if i > 0 {
+            x = x.saturating_add(gap);
+        }
+        let toast = Rect::new(x, y, w, 1);
+        buf.write(area, x, y, &label, action_style(color));
+        out.push((toast, hit));
+        x = x.saturating_add(w);
+    }
+    out
 }
 
 fn paint_copied(buf: &mut Buffer, screen: Rect, composer: Rect) {
@@ -2721,6 +3079,7 @@ mod tests {
         Bar {
             workspace: "~/fun-coding-agent".into(),
             branch: Some("main".into()),
+            pull: Some("main".into()),
             input: "12.3k".into(),
             output: "4.5k".into(),
             reasoning: "8.1k".into(),
@@ -2778,12 +3137,88 @@ mod tests {
             }
             let joined = lines.join(" ");
             assert!(joined.contains("~/fun-coding-agent"), "{joined}");
+            assert!(!joined.contains("pull master"), "{joined}");
             assert!(joined.contains("grok-4.6"), "{joined}");
             assert!(joined.contains("medium"), "{joined}");
             let last = lines.last().map(String::as_str).unwrap_or("");
             assert!(last.contains("grok-4.6"), "last {last:?}");
             assert!(last.contains("medium"), "last {last:?}");
         }
+    }
+
+    #[test]
+    fn pull_master_sits_above_composer() {
+        let area = Rect::new(0, 19, 80, 1);
+        assert_eq!(
+            crate::config::fill_action("checkout and pull {home}", Some("master"), None).as_deref(),
+            Some("checkout and pull master")
+        );
+        assert_eq!(
+            fill_action(&Action::defaults()[0].label, Some("master"), None).as_deref(),
+            Some("[ checkout and pull master ]")
+        );
+        assert_eq!(
+            fill_action(&Action::defaults()[0].label, Some("main"), None).as_deref(),
+            Some("[ checkout and pull main ]")
+        );
+        assert_eq!(
+            fill_action(&Action::defaults()[1].label, Some("master"), Some("feat")).as_deref(),
+            Some("[ commit to feat and push ]")
+        );
+        assert_eq!(
+            fill_action(&Action::defaults()[1].label, Some("master"), Some("master")).as_deref(),
+            Some("[ commit to master and push ]")
+        );
+        crate::tui::set_git(true);
+        crate::tui::set_origin(true);
+        assert_eq!(action_bar_height(80, Some("master"), Some("feat"), 4), 1);
+        assert_eq!(action_bar_height(80, Some("master"), Some("feat"), 0), 0);
+        let hits = paint_action_bar(
+            &mut Buffer::new(80, 24),
+            area,
+            Some("master"),
+            Some("feat"),
+        );
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].1, ActionHit { index: 0 });
+        assert_eq!(hits[1].1, ActionHit { index: 1 });
+        let pull = hits[0].0;
+        let push = hits[1].0;
+        assert_eq!(pull.height, 1);
+        assert_eq!(push.height, 1);
+        assert_eq!(pull.y, area.y);
+        assert_eq!(push.y, area.y);
+        assert!(push.x >= pull.right());
+        assert_eq!(push.right(), area.right());
+        assert_eq!(pull.width as usize, width("[ checkout and pull master ]"));
+        assert_eq!(push.width as usize, width("[ commit to feat and push ]"));
+        let on_home = paint_action_bar(
+            &mut Buffer::new(80, 24),
+            area,
+            Some("master"),
+            Some("master"),
+        );
+        assert_eq!(on_home.len(), 2);
+        assert_eq!(
+            on_home[1].0.width as usize,
+            width("[ commit to master and push ]")
+        );
+        crate::tui::set_origin(false);
+        let no_origin = paint_action_bar(
+            &mut Buffer::new(80, 24),
+            area,
+            Some("master"),
+            Some("feat"),
+        );
+        assert_eq!(no_origin.len(), 2);
+        crate::tui::set_git(false);
+        let no_git = paint_action_bar(&mut Buffer::new(80, 24), area, Some("master"), None);
+        assert_eq!(no_git.len(), 1);
+        assert_eq!(no_git[0].1, ActionHit { index: 1 });
+        assert_eq!(
+            no_git[0].0.width as usize,
+            width("[ commit to master and push ]")
+        );
     }
 
     #[test]

@@ -20,7 +20,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tool::get_tools;
 use tui::{Bar, QueueHit, Queued, Ui};
 
@@ -42,6 +42,8 @@ enum KeyAction {
     QueueEdit(usize),
     QueueDrop(usize),
     QueueMove { from: usize, to: usize },
+    Action(usize),
+    AskSubmit,
 }
 
 struct LineEdit {
@@ -152,6 +154,9 @@ impl LineEdit {
 }
 
 fn on_event(ui: &mut Ui, edit: &mut LineEdit, ev: CEvent) -> KeyAction {
+    if ui.asking() {
+        return on_ask(ui, ev);
+    }
     if let CEvent::Paste(s) = ev {
         for c in s.chars() {
             if c == '\n' || c == '\r' {
@@ -168,36 +173,90 @@ fn on_event(ui: &mut Ui, edit: &mut LineEdit, ev: CEvent) -> KeyAction {
     on_key(edit, ev)
 }
 
+fn on_ask(ui: &mut Ui, ev: CEvent) -> KeyAction {
+    if let CEvent::Paste(s) = ev {
+        for c in s.chars() {
+            if !c.is_control() {
+                let _ = ui.ask_insert(c);
+            }
+        }
+        return KeyAction::Skip;
+    }
+    let CEvent::Key(key) = ev else {
+        return KeyAction::Skip;
+    };
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c' | 'C'))
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
+    {
+        return KeyAction::Quit;
+    }
+    if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
+        return KeyAction::Skip;
+    }
+    match key.code {
+        KeyCode::Esc => {
+            let _ = ui.close_ask();
+            KeyAction::Skip
+        }
+        KeyCode::Enter | KeyCode::Char('\n') => KeyAction::AskSubmit,
+        KeyCode::Backspace => {
+            let _ = ui.ask_backspace();
+            KeyAction::Skip
+        }
+        KeyCode::Delete => {
+            let _ = ui.ask_delete();
+            KeyAction::Skip
+        }
+        KeyCode::Left => {
+            let _ = ui.ask_left();
+            KeyAction::Skip
+        }
+        KeyCode::Right => {
+            let _ = ui.ask_right();
+            KeyAction::Skip
+        }
+        KeyCode::Char(c) if !c.is_control() => {
+            let _ = ui.ask_insert(c);
+            KeyAction::Skip
+        }
+        _ => KeyAction::Skip,
+    }
+}
+
 fn on_mouse(ui: &mut Ui, mouse: crossterm::event::MouseEvent) -> KeyAction {
     match mouse.kind {
         MouseEventKind::ScrollUp => KeyAction::Scroll(3),
         MouseEventKind::ScrollDown => KeyAction::Scroll(-3),
-        MouseEventKind::Down(MouseButton::Left) => match ui.queue_hit(mouse.column, mouse.row) {
-            Some(QueueHit::Steer(i)) => {
-                ui.capture_queue_pointer();
-                KeyAction::QueueSteer(i)
-            }
-            Some(QueueHit::Up(i)) => {
-                ui.capture_queue_pointer();
-                KeyAction::QueueUp(i)
-            }
-            Some(QueueHit::Down(i)) => {
-                ui.capture_queue_pointer();
-                KeyAction::QueueDown(i)
-            }
-            Some(QueueHit::Edit(i)) => {
-                ui.capture_queue_pointer();
-                KeyAction::QueueEdit(i)
-            }
-            Some(QueueHit::Drop(i)) => {
-                ui.capture_queue_pointer();
-                KeyAction::QueueDrop(i)
-            }
-            Some(QueueHit::Drag(i)) => {
-                ui.begin_queue_drag(i);
-                KeyAction::Skip
-            }
-            None => KeyAction::ClickTools(mouse.column, mouse.row),
+        MouseEventKind::Down(MouseButton::Left) => match ui.action_hit(mouse.column, mouse.row) {
+            Some(hit) => KeyAction::Action(hit.index),
+            None => match ui.queue_hit(mouse.column, mouse.row) {
+                Some(QueueHit::Steer(i)) => {
+                    ui.capture_queue_pointer();
+                    KeyAction::QueueSteer(i)
+                }
+                Some(QueueHit::Up(i)) => {
+                    ui.capture_queue_pointer();
+                    KeyAction::QueueUp(i)
+                }
+                Some(QueueHit::Down(i)) => {
+                    ui.capture_queue_pointer();
+                    KeyAction::QueueDown(i)
+                }
+                Some(QueueHit::Edit(i)) => {
+                    ui.capture_queue_pointer();
+                    KeyAction::QueueEdit(i)
+                }
+                Some(QueueHit::Drop(i)) => {
+                    ui.capture_queue_pointer();
+                    KeyAction::QueueDrop(i)
+                }
+                Some(QueueHit::Drag(i)) => {
+                    ui.begin_queue_drag(i);
+                    KeyAction::Skip
+                }
+                None => KeyAction::ClickTools(mouse.column, mouse.row),
+            },
         },
         MouseEventKind::Drag(_) => {
             if let Some(from) = ui.queue_drag_index() {
@@ -439,13 +498,135 @@ fn git_branch(workspace: &Path) -> Option<String> {
     branch_from_head(&head)
 }
 
+fn branch_from_symref(text: &str) -> Option<String> {
+    let rest = text.trim().strip_prefix("ref: ")?;
+    let name = rest.rsplit('/').next()?;
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+fn git_ref_exists(git: &Path, rel: &str) -> bool {
+    git.join(rel).is_file()
+}
+
+fn git_has_origin(git: &Path) -> bool {
+    git.join("refs/remotes/origin").is_dir()
+        || git.join("refs/remotes/origin/HEAD").is_file()
+        || fs::read_to_string(git.join("config"))
+            .ok()
+            .is_some_and(|text| {
+                text.lines().any(|line| {
+                    let line = line.trim();
+                    line.eq_ignore_ascii_case("[remote \"origin\"]")
+                })
+            })
+}
+
+fn git_origin_head(git: &Path) -> Option<String> {
+    let text = fs::read_to_string(git.join("refs/remotes/origin/HEAD")).ok()?;
+    branch_from_symref(&text)
+}
+
+fn pick_home_branch(
+    locals: &[&str],
+    origin_head: Option<&str>,
+    preferred: &str,
+) -> String {
+    if locals.contains(&preferred) {
+        return preferred.to_string();
+    }
+    for name in ["master", "main", "dev"] {
+        if name != preferred && locals.contains(&name) {
+            return name.to_string();
+        }
+    }
+    origin_head
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| preferred.to_string())
+}
+
+fn git_home_branch(workspace: &Path) -> Option<String> {
+    let git = git_dir(workspace)?;
+    let preferred = preferred_home();
+    let locals: Vec<&str> = ["master", "main", "dev"]
+        .into_iter()
+        .filter(|name| git_ref_exists(&git, &format!("refs/heads/{name}")))
+        .collect();
+    Some(pick_home_branch(
+        &locals,
+        git_origin_head(&git).as_deref(),
+        &preferred,
+    ))
+}
+
+fn preferred_home() -> String {
+    tui::configured_home()
+}
+
+fn resolve_home(workspace: &Path) -> String {
+    git_home_branch(workspace).unwrap_or_else(preferred_home)
+}
+
 fn sync_branch(ui: &mut Ui, status: &mut Status) -> Result<()> {
+    let now = Instant::now();
+    if status
+        .git_at
+        .is_some_and(|at| now.duration_since(at) < Duration::from_secs(1))
+    {
+        return Ok(());
+    }
+    status.git_at = Some(now);
     let branch = git_branch(&status.workspace);
-    if branch != status.branch {
+    let pull = Some(resolve_home(&status.workspace));
+    let git = git_dir(&status.workspace);
+    tui::set_git(git.is_some());
+    tui::set_origin(git.as_ref().is_some_and(|p| git_has_origin(p)));
+    if branch != status.branch || pull != status.pull {
         status.branch = branch;
+        status.pull = pull;
         refresh_bar(ui, status)?;
     }
     Ok(())
+}
+
+fn action_prompt(action: &KeyAction, status: &Status) -> Option<String> {
+    match *action {
+        KeyAction::Action(i) => {
+            let spec = tui::configured_action(i)?;
+            if spec.ask.is_some() && !tui::has_origin() {
+                return None;
+            }
+            crate::config::fill_action(
+                &spec.prompt,
+                status.pull.as_deref(),
+                status.branch.as_deref(),
+            )
+        }
+        _ => None,
+    }
+}
+
+fn action_ask(action: &KeyAction, status: &Status) -> Option<String> {
+    match *action {
+        KeyAction::Action(i) => {
+            let spec = tui::configured_action(i)?;
+            let ask = spec.ask.as_deref()?;
+            if tui::has_origin() {
+                return None;
+            }
+            crate::config::fill_action(ask, status.pull.as_deref(), status.branch.as_deref())
+        }
+        _ => None,
+    }
+}
+
+fn action_title(_action: &KeyAction, _status: &Status) -> String {
+    "git origin URL".into()
 }
 
 fn short_path(path: &Path) -> String {
@@ -506,6 +687,8 @@ struct Status {
     model: String,
     effort: String,
     branch: Option<String>,
+    pull: Option<String>,
+    git_at: Option<Instant>,
     usage: Usage,
 }
 
@@ -805,6 +988,7 @@ fn refresh_bar(ui: &mut Ui, status: &Status) -> Result<()> {
     ui.set_bar(Bar {
         workspace: short_path(&status.workspace),
         branch: status.branch.clone(),
+        pull: status.pull.clone(),
         input: fmt_compact(inn),
         output: fmt_compact(out),
         reasoning: fmt_compact(reasoning),
@@ -959,7 +1143,9 @@ fn copy_system_once(text: &str) -> Result<()> {
 fn apply_ui(ui: &mut Ui, edit: &LineEdit, action: KeyAction) -> Result<KeyAction> {
     match action {
         KeyAction::Skip => {
-            ui.set_input(&edit.input, edit.cursor)?;
+            if !ui.asking() {
+                ui.set_input(&edit.input, edit.cursor)?;
+            }
             Ok(KeyAction::Skip)
         }
         KeyAction::Scroll(n) => {
@@ -1021,8 +1207,16 @@ async fn run_tui(
         model: agent.model.clone(),
         effort: agent.effort.clone(),
         branch: git_branch(&agent.workspace),
+        pull: Some(resolve_home(&agent.workspace)),
+        git_at: Some(Instant::now()),
         usage: agent.session.usage,
     };
+    tui::set_git(git_dir(&agent.workspace).is_some());
+    tui::set_origin(
+        git_dir(&agent.workspace)
+            .as_ref()
+            .is_some_and(|p| git_has_origin(p)),
+    );
     refresh_bar(&mut ui, &status)?;
     ui.batch(|ui| {
         if !agent.session.entries.is_empty() {
@@ -1059,8 +1253,51 @@ async fn run_tui(
                 match apply_ui(&mut ui, &edit, action)? {
                     KeyAction::Quit => return Ok(()),
                     KeyAction::Abort => return Ok(()),
-                    KeyAction::Confirm | KeyAction::Interrupt => {
-                        let Some(text) = take_composer(&mut edit) else {
+                    KeyAction::AskSubmit => {
+                        let Some(text) = ui.take_ask() else {
+                            ui.close_ask()?;
+                            continue;
+                        };
+                        ui.close_ask()?;
+                        take_idle_slot(&mut pending, edit.queue_slot.take());
+                        ui.set_queue_edit(None);
+                        sync_queue(&mut ui, &pending)?;
+                        ui.set_working(true)?;
+                        paint(&mut ui, &LogLine::User(text.clone()))?;
+                        if run_turn(
+                            &tx,
+                            &log_rx,
+                            &mut ui,
+                            &mut edit,
+                            &mut status,
+                            &mut pending,
+                            &mut events,
+                            &mut tick,
+                            prompt(agent, text),
+                        )
+                        .await?
+                        {
+                            return Ok(());
+                        }
+                        refresh_bar(&mut ui, &status)?;
+                        ui.set_working(false)?;
+                        ui.set_input(&edit.input, edit.cursor)?;
+                    }
+                    action @ (KeyAction::Action(_)
+                    | KeyAction::Confirm
+                    | KeyAction::Interrupt) => {
+                        if let Some(draft) = action_ask(&action, &status) {
+                            ui.open_ask(
+                                action_title(&action, &status),
+                                draft,
+                                "paste git@… or https://… then Enter",
+                                "git@github.com:org/repo.git",
+                            )?;
+                            continue;
+                        }
+                        let Some(text) = action_prompt(&action, &status)
+                            .or_else(|| take_composer(&mut edit))
+                        else {
                             continue;
                         };
                         take_idle_slot(&mut pending, edit.queue_slot.take());
@@ -1134,6 +1371,28 @@ async fn run_turn(
                     KeyAction::Quit => {
                         tx.abort();
                         return Ok(true);
+                    }
+                    KeyAction::AskSubmit => {
+                        if let Some(text) = ui.take_ask() {
+                            ui.close_ask()?;
+                            enqueue(tx, pending, text, &mut None);
+                            sync_queue(ui, pending)?;
+                        } else {
+                            ui.close_ask()?;
+                        }
+                    }
+                    action @ KeyAction::Action(_) => {
+                        if let Some(draft) = action_ask(&action, status) {
+                            ui.open_ask(
+                                action_title(&action, status),
+                                draft,
+                                "paste git@… or https://… then Enter",
+                                "git@github.com:org/repo.git",
+                            )?;
+                        } else if let Some(text) = action_prompt(&action, status) {
+                            enqueue(tx, pending, text, &mut None);
+                            sync_queue(ui, pending)?;
+                        }
                     }
                     KeyAction::Abort => {
                         take_idle_slot(pending, edit.queue_slot.take());
@@ -1242,7 +1501,10 @@ fn open_session(cli: &Cli, workspace: &Path) -> Result<Session> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    tui::set_palette(config::load());
+    let cfg = config::load();
+    tui::set_palette(cfg.palette);
+    tui::set_actions(cfg.actions);
+    tui::set_home(cfg.home);
     match &cli.command {
         Some(Command::Login) => return login().await,
         Some(Command::Logout) => return logout().await,
@@ -1374,5 +1636,65 @@ mod tests {
         );
         assert_eq!(branch_from_head("948352c..."), None);
         assert_eq!(branch_from_head("ref: refs/tags/v1"), None);
+        assert_eq!(
+            branch_from_symref("ref: refs/remotes/origin/main\n").as_deref(),
+            Some("main")
+        );
+        assert_eq!(
+            pick_home_branch(&["main", "master"], Some("main"), "master"),
+            "master"
+        );
+        assert_eq!(
+            pick_home_branch(&["main"], Some("main"), "master"),
+            "main"
+        );
+        assert_eq!(
+            pick_home_branch(&["dev"], Some("main"), "master"),
+            "dev"
+        );
+        assert_eq!(
+            pick_home_branch(&[], Some("main"), "master"),
+            "main"
+        );
+        assert_eq!(pick_home_branch(&[], None, "dev"), "dev");
+    }
+
+    #[test]
+    fn commit_chip_uses_current_branch() {
+        tui::set_actions(crate::config::Action::defaults());
+        tui::set_origin(true);
+        let on_home = Status {
+            workspace: PathBuf::from("."),
+            model: String::new(),
+            effort: String::new(),
+            branch: Some("master".into()),
+            pull: Some("master".into()),
+            git_at: None,
+            usage: Usage::default(),
+        };
+        assert_eq!(
+            action_prompt(&KeyAction::Action(1), &on_home).as_deref(),
+            Some("commit to master and push")
+        );
+        let other = Status {
+            branch: Some("feat".into()),
+            ..on_home
+        };
+        assert_eq!(
+            action_prompt(&KeyAction::Action(1), &other).as_deref(),
+            Some("commit to feat and push")
+        );
+        assert_eq!(
+            action_prompt(&KeyAction::Action(0), &other).as_deref(),
+            Some("checkout and pull master")
+        );
+        let no_git = Status {
+            branch: None,
+            ..other
+        };
+        assert_eq!(
+            action_prompt(&KeyAction::Action(1), &no_git).as_deref(),
+            Some("commit to master and push")
+        );
     }
 }
