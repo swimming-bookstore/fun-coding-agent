@@ -601,25 +601,20 @@ fn action_prompt(action: &KeyAction, status: &Status) -> Option<String> {
             if spec.ask.is_some() && !tui::has_origin() {
                 return None;
             }
-            crate::config::fill_action(
-                &spec.prompt,
-                status.pull.as_deref(),
-                status.branch.as_deref(),
-            )
+            spec.filled_prompt(status.pull.as_deref(), status.branch.as_deref(), None)
         }
         _ => None,
     }
 }
 
-fn action_ask(action: &KeyAction, status: &Status) -> Option<String> {
+fn action_ask(action: &KeyAction, _status: &Status) -> Option<String> {
     match *action {
         KeyAction::Action(i) => {
             let spec = tui::configured_action(i)?;
-            let ask = spec.ask.as_deref()?;
             if tui::has_origin() {
                 return None;
             }
-            crate::config::fill_action(ask, status.pull.as_deref(), status.branch.as_deref())
+            spec.ask.clone()
         }
         _ => None,
     }
@@ -1254,11 +1249,19 @@ async fn run_tui(
                     KeyAction::Quit => return Ok(()),
                     KeyAction::Abort => return Ok(()),
                     KeyAction::AskSubmit => {
-                        let Some(text) = ui.take_ask() else {
+                        let Some((template, origin)) = ui.take_ask() else {
                             ui.close_ask()?;
                             continue;
                         };
                         ui.close_ask()?;
+                        let Some(text) = crate::config::fill_action(
+                            &template,
+                            status.pull.as_deref(),
+                            status.branch.as_deref(),
+                            Some(&origin),
+                        ) else {
+                            continue;
+                        };
                         take_idle_slot(&mut pending, edit.queue_slot.take());
                         ui.set_queue_edit(None);
                         sync_queue(&mut ui, &pending)?;
@@ -1373,10 +1376,17 @@ async fn run_turn(
                         return Ok(true);
                     }
                     KeyAction::AskSubmit => {
-                        if let Some(text) = ui.take_ask() {
+                        if let Some((template, origin)) = ui.take_ask() {
                             ui.close_ask()?;
-                            enqueue(tx, pending, text, &mut None);
-                            sync_queue(ui, pending)?;
+                            if let Some(text) = crate::config::fill_action(
+                                &template,
+                                status.pull.as_deref(),
+                                status.branch.as_deref(),
+                                Some(&origin),
+                            ) {
+                                enqueue(tx, pending, text, &mut None);
+                                sync_queue(ui, pending)?;
+                            }
                         } else {
                             ui.close_ask()?;
                         }
@@ -1674,7 +1684,7 @@ mod tests {
         };
         assert_eq!(
             action_prompt(&KeyAction::Action(1), &on_home).as_deref(),
-            Some("commit to master and push")
+            Some("commit and push")
         );
         let other = Status {
             branch: Some("feat".into()),
@@ -1692,9 +1702,25 @@ mod tests {
             branch: None,
             ..other
         };
+        tui::set_origin(false);
+        assert_eq!(action_prompt(&KeyAction::Action(1), &no_git), None);
         assert_eq!(
-            action_prompt(&KeyAction::Action(1), &no_git).as_deref(),
-            Some("commit to master and push")
+            action_ask(&KeyAction::Action(1), &no_git).as_deref(),
+            Some(
+                "init git on {home} if needed, add origin {origin}, then commit and push"
+            )
+        );
+        assert_eq!(
+            crate::config::fill_action(
+                action_ask(&KeyAction::Action(1), &no_git).as_deref().unwrap(),
+                no_git.pull.as_deref(),
+                no_git.branch.as_deref(),
+                Some("git@github.com:swimming-bookstore/connect-agent.git"),
+            )
+            .as_deref(),
+            Some(
+                "init git on master if needed, add origin git@github.com:swimming-bookstore/connect-agent.git, then commit and push"
+            )
         );
     }
 }

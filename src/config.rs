@@ -7,7 +7,8 @@
 //! Set `"home"` to choose which name to use when git has none yet.
 //! `"when": "git"` hides a chip until the workspace is a git repo.
 //! `"when": "origin"` also requires a remote named `origin`.
-//! `"ask"` opens a box for extra input (origin URL) instead of sending.
+//! `"ask"` is a prompt template. `{origin}` is filled from the URL box.
+//! `"label_home"` / `"prompt_home"` are used on trunk.
 //!
 //! ```json
 //! {
@@ -36,9 +37,11 @@
 //!     },
 //!     {
 //!       "label": "[ commit to {branch} and push ]",
+//!       "label_home": "[ commit and push ]",
 //!       "prompt": "commit to {branch} and push",
+//!       "prompt_home": "commit and push",
 //!       "color": "accent",
-//!       "ask": "init git on {home} if needed, add origin "
+//!       "ask": "init git on {home} if needed, add origin {origin}, then commit and push"
 //!     }
 //!   ]
 //! }
@@ -71,7 +74,9 @@ pub struct Palette {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Action {
     pub label: String,
+    pub label_home: Option<String>,
     pub prompt: String,
+    pub prompt_home: Option<String>,
     pub color: ActionColor,
     pub when: ActionWhen,
     pub ask: Option<String>,
@@ -103,17 +108,24 @@ impl Action {
         vec![
             Self {
                 label: "[ checkout and pull {home} ]".into(),
+                label_home: None,
                 prompt: "checkout and pull {home}".into(),
+                prompt_home: None,
                 color: ActionColor::Ok,
                 when: ActionWhen::Git,
                 ask: None,
             },
             Self {
                 label: "[ commit to {branch} and push ]".into(),
+                label_home: Some("[ commit and push ]".into()),
                 prompt: "commit to {branch} and push".into(),
+                prompt_home: Some("commit and push".into()),
                 color: ActionColor::Accent,
                 when: ActionWhen::Always,
-                ask: Some("init git on {home} if needed, add origin ".into()),
+                ask: Some(
+                    "init git on {home} if needed, add origin {origin}, then commit and push"
+                        .into(),
+                ),
             },
         ]
     }
@@ -123,17 +135,73 @@ fn named(s: Option<&str>) -> Option<&str> {
     s.map(str::trim).filter(|s| !s.is_empty())
 }
 
-/// `{home}` is trunk. `{branch}` is the current checkout, or `{home}` before git exists.
-pub fn fill_action(s: &str, home: Option<&str>, branch: Option<&str>) -> Option<String> {
+pub fn on_home(home: Option<&str>, branch: Option<&str>) -> bool {
+    match (named(home), named(branch)) {
+        (Some(home), Some(branch)) => home == branch,
+        _ => false,
+    }
+}
+
+fn pick<'a>(home_s: Option<&'a str>, other: &'a str, home: Option<&str>, branch: Option<&str>) -> &'a str {
+    if on_home(home, branch) {
+        home_s.unwrap_or(other)
+    } else {
+        other
+    }
+}
+
+impl Action {
+    pub fn filled_label(&self, home: Option<&str>, branch: Option<&str>) -> Option<String> {
+        fill_action(
+            pick(self.label_home.as_deref(), &self.label, home, branch),
+            home,
+            branch,
+            None,
+        )
+    }
+
+    pub fn filled_prompt(
+        &self,
+        home: Option<&str>,
+        branch: Option<&str>,
+        origin: Option<&str>,
+    ) -> Option<String> {
+        fill_action(
+            pick(self.prompt_home.as_deref(), &self.prompt, home, branch),
+            home,
+            branch,
+            origin,
+        )
+    }
+}
+
+/// `{home}` / `{branch}` / `{origin}` are names. Grammar lives in the template.
+pub fn fill_action(
+    s: &str,
+    home: Option<&str>,
+    branch: Option<&str>,
+    origin: Option<&str>,
+) -> Option<String> {
     if s.trim().is_empty() {
         return None;
     }
+    let home = named(home);
+    let branch = named(branch);
+    let origin = named(origin);
     let mut out = s.to_string();
     if out.contains("{home}") {
-        out = out.replace("{home}", named(home)?);
+        out = out.replace("{home}", home?);
     }
     if out.contains("{branch}") {
-        out = out.replace("{branch}", named(branch).or_else(|| named(home))?);
+        out = out.replace("{branch}", branch.or(home)?);
+    }
+    if out.contains("{origin}") {
+        out = out.replace("{origin}", origin?);
+    } else if let Some(origin) = origin {
+        if !out.ends_with(char::is_whitespace) {
+            out.push(' ');
+        }
+        out.push_str(origin);
     }
     Some(out)
 }
@@ -186,7 +254,9 @@ struct File {
 #[derive(Default, Deserialize)]
 struct ActionFile {
     label: Option<String>,
+    label_home: Option<String>,
     prompt: Option<String>,
+    prompt_home: Option<String>,
     color: Option<String>,
     when: Option<String>,
     ask: Option<String>,
@@ -270,15 +340,18 @@ impl ActionFile {
         }
         Some(Action {
             label,
+            label_home: trim_opt(self.label_home),
             prompt,
+            prompt_home: trim_opt(self.prompt_home),
             color: parse_action_color(self.color.as_deref()),
             when: parse_action_when(self.when.as_deref()),
-            ask: self
-                .ask
-                .map(|s| s.trim_start().to_string())
-                .filter(|s| !s.trim().is_empty()),
+            ask: trim_opt(self.ask),
         })
     }
+}
+
+fn trim_opt(s: Option<String>) -> Option<String> {
+    s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
 fn parse_home(value: Option<String>) -> String {
@@ -475,37 +548,72 @@ mod tests {
         assert_eq!(actions[1].label, "[ custom ]");
         assert_eq!(actions[1].color, ActionColor::User);
         assert_eq!(actions[1].when, ActionWhen::Always);
-        assert_eq!(actions[1].ask.as_deref(), Some("add origin "));
+        assert_eq!(actions[1].ask.as_deref(), Some("add origin"));
+        let commit = Action::defaults()[1].clone();
         assert_eq!(
-            fill_action("checkout and pull {home}", Some("master"), None).as_deref(),
+            fill_action("checkout and pull {home}", Some("master"), None, None).as_deref(),
             Some("checkout and pull master")
         );
-        assert_eq!(fill_action("checkout and pull {home}", None, None), None);
+        assert_eq!(fill_action("checkout and pull {home}", None, None, None), None);
         assert_eq!(
-            fill_action("[ commit to {home} and push ]", Some("dev"), None).as_deref(),
+            fill_action("[ commit to {home} and push ]", Some("dev"), None, None).as_deref(),
             Some("[ commit to dev and push ]")
         );
         assert_eq!(
-            fill_action("commit to {branch} and push", Some("master"), Some("master")).as_deref(),
-            Some("commit to master and push")
+            commit.filled_prompt(Some("master"), Some("master"), None).as_deref(),
+            Some("commit and push")
         );
         assert_eq!(
-            fill_action(
-                "[ commit to {branch} and push ]",
-                Some("master"),
-                Some("feat")
-            )
-            .as_deref(),
+            commit.filled_label(Some("master"), Some("feat")).as_deref(),
             Some("[ commit to feat and push ]")
         );
         assert_eq!(
-            fill_action("commit to {branch} and push", Some("master"), None).as_deref(),
+            commit.filled_prompt(Some("master"), None, None).as_deref(),
             Some("commit to master and push")
         );
-        assert_eq!(fill_action("commit to {branch} and push", None, None), None);
+        assert_eq!(commit.filled_prompt(None, None, None), None);
         assert_eq!(
-            fill_action("checkout and pull {home}", Some("master"), Some("feat")).as_deref(),
+            fill_action(
+                "checkout and pull {home}",
+                Some("master"),
+                Some("feat"),
+                None
+            )
+            .as_deref(),
             Some("checkout and pull master")
+        );
+        assert_eq!(
+            fill_action(
+                commit.ask.as_deref().unwrap(),
+                Some("master"),
+                None,
+                Some("git@github.com:org/repo.git"),
+            )
+            .as_deref(),
+            Some(
+                "init git on master if needed, add origin git@github.com:org/repo.git, then commit and push"
+            )
+        );
+        assert_eq!(
+            fill_action(
+                commit.ask.as_deref().unwrap(),
+                Some("master"),
+                Some("master"),
+                Some("git@github.com:org/repo.git"),
+            )
+            .as_deref(),
+            Some(
+                "init git on master if needed, add origin git@github.com:org/repo.git, then commit and push"
+            )
+        );
+        assert_eq!(
+            fill_action(
+                commit.ask.as_deref().unwrap(),
+                Some("master"),
+                None,
+                None,
+            ),
+            None
         );
         assert_eq!(parse_home(Some("dev".into())), "dev");
         assert_eq!(parse_home(Some("trunk".into())), "master");
