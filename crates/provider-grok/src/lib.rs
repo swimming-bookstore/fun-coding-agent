@@ -42,7 +42,7 @@ fn env_path(name: &str) -> Option<PathBuf> {
     Some(expand_tilde(path))
 }
 
-fn expand_tilde(path: &str) -> PathBuf {
+pub fn expand_tilde(path: &str) -> PathBuf {
     if path == "~" {
         if let Ok(home) = std::env::var("HOME") {
             if !home.is_empty() {

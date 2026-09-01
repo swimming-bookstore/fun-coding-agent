@@ -346,24 +346,7 @@ fn parse_auth(value: Option<String>) -> Option<PathBuf> {
     if s.is_empty() {
         return None;
     }
-    Some(expand_tilde(&s))
-}
-
-fn expand_tilde(path: &str) -> PathBuf {
-    if path == "~" {
-        if let Ok(home) = env::var("HOME") {
-            if !home.is_empty() {
-                return PathBuf::from(home);
-            }
-        }
-    } else if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = env::var("HOME") {
-            if !home.is_empty() {
-                return PathBuf::from(home).join(rest);
-            }
-        }
-    }
-    PathBuf::from(path)
+    Some(provider_grok::expand_tilde(&s))
 }
 
 impl ActionFile {
