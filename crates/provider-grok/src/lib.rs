@@ -1,4 +1,7 @@
-//! xAI Grok OAuth device flow. Tokens in `$XDG_DATA_HOME/fun/auth.json`.
+//! xAI Grok OAuth device flow.
+//!
+//! Tokens default to `$XDG_DATA_HOME/fun/auth.json`.
+//! Override with `PROVIDER_GROK_AUTH` or [`set_auth_path`].
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::de::DeserializeOwned;
@@ -20,6 +23,40 @@ const OAUTH_TIMEOUT: Duration = Duration::from_secs(30);
 fn auth_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+static AUTH_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Use a token file other than `$XDG_DATA_HOME/fun/auth.json`.
+/// First call wins. `PROVIDER_GROK_AUTH` still overrides this.
+pub fn set_auth_path(path: impl Into<PathBuf>) {
+    let _ = AUTH_PATH.set(path.into());
+}
+
+fn env_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var(name).ok()?;
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    Some(expand_tilde(path))
+}
+
+pub fn expand_tilde(path: &str) -> PathBuf {
+    if path == "~" {
+        if let Ok(home) = std::env::var("HOME") {
+            if !home.is_empty() {
+                return PathBuf::from(home);
+            }
+        }
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            if !home.is_empty() {
+                return PathBuf::from(home).join(rest);
+            }
+        }
+    }
+    PathBuf::from(path)
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -92,7 +129,17 @@ pub fn data_dir() -> Result<PathBuf> {
 }
 
 pub fn auth_path() -> Result<PathBuf> {
+    if let Some(path) = env_path("PROVIDER_GROK_AUTH") {
+        return Ok(path);
+    }
+    if let Some(path) = AUTH_PATH.get() {
+        return Ok(path.clone());
+    }
     Ok(data_dir()?.join("auth.json"))
+}
+
+fn auth_lock_path() -> Result<PathBuf> {
+    Ok(auth_path()?.with_extension("lock"))
 }
 
 pub fn has_tokens() -> bool {
@@ -248,7 +295,7 @@ fn lock_auth_file() -> Result<Option<std::fs::File>> {
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
-        let path = data_dir()?.join("auth.lock");
+        let path = auth_lock_path()?;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).context("auth dir")?;
         }
@@ -505,5 +552,15 @@ mod tests {
         let left = t.expires.saturating_sub(now_ms());
         assert!(left < 3600 * 1000);
         assert!(left > 50 * 60 * 1000);
+    }
+
+    #[test]
+    fn tilde_and_lock_follow_auth_file() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/tester".into());
+        assert_eq!(expand_tilde("~/tokens/x.json"), PathBuf::from(home).join("tokens/x.json"));
+        assert_eq!(
+            PathBuf::from("/tmp/shared/auth.json").with_extension("lock"),
+            PathBuf::from("/tmp/shared/auth.lock")
+        );
     }
 }

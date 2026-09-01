@@ -1,6 +1,7 @@
 //! Optional `~/.config/fun/config.json`.
 //! Override with `FUN_CODING_AGENT_CONFIG`.
 //! Invalid JSON keeps the defaults.
+//! `"auth"` is the grok token file (default `$XDG_DATA_HOME/fun/auth.json`).
 //!
 //! `{home}` is the trunk branch (`master` / `main` / `dev`).
 //! `{branch}` is the current checkout, or `{home}` before `git init`.
@@ -12,6 +13,7 @@
 //!
 //! ```json
 //! {
+//!   "auth": "~/.local/share/fun/auth.json",
 //!   "home": "master",
 //!   "colors": {
 //!     "text": "#e2e6f1",
@@ -211,6 +213,7 @@ pub struct Config {
     pub palette: Palette,
     pub actions: Vec<Action>,
     pub home: String,
+    pub auth: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -219,6 +222,7 @@ impl Default for Config {
             palette: Palette::default(),
             actions: Action::defaults(),
             home: "master".into(),
+            auth: None,
         }
     }
 }
@@ -249,6 +253,7 @@ struct File {
     colors: ColorFile,
     actions: Option<Vec<ActionFile>>,
     home: Option<String>,
+    auth: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -332,7 +337,16 @@ fn load_from(path: &Path) -> Result<Config> {
                 .collect(),
         },
         home: parse_home(file.home),
+        auth: parse_auth(file.auth),
     })
+}
+
+fn parse_auth(value: Option<String>) -> Option<PathBuf> {
+    let s = value?.trim().to_string();
+    if s.is_empty() {
+        return None;
+    }
+    Some(provider_grok::expand_tilde(&s))
 }
 
 impl ActionFile {
@@ -525,6 +539,16 @@ mod tests {
             assert_eq!(rgb_of(cfg.palette.user), Some((247, 168, 120)));
             assert_eq!(cfg.actions, Action::defaults());
             assert_eq!(cfg.home, "master");
+            assert!(cfg.auth.is_none());
+        }
+        let file = serde_json::from_value::<File>(json!({
+            "auth": "  ~/shared/auth.json  "
+        }))
+        .expect("parse auth");
+        let auth = parse_auth(file.auth);
+        assert!(auth.is_some());
+        if let (Ok(home), Some(path)) = (env::var("HOME"), auth) {
+            assert_eq!(path, PathBuf::from(home).join("shared/auth.json"));
         }
     }
 

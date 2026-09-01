@@ -1565,6 +1565,9 @@ async fn main() -> Result<()> {
     tui::set_palette(cfg.palette);
     tui::set_actions(cfg.actions);
     tui::set_home(cfg.home);
+    if let Some(path) = cfg.auth {
+        provider_grok::set_auth_path(path);
+    }
     match &cli.command {
         Some(Command::Login) => return login().await,
         Some(Command::Logout) => return logout().await,
