@@ -508,13 +508,68 @@ fn branch_from_symref(text: &str) -> Option<String> {
     }
 }
 
+fn git_packed_refs(git: &Path) -> Option<String> {
+    fs::read_to_string(git.join("packed-refs")).ok()
+}
+
+fn packed_ref_exists(packed: &str, rel: &str) -> bool {
+    let want = format!(" {rel}");
+    packed.lines().any(|line| {
+        let line = line.trim();
+        !line.is_empty() && !line.starts_with('#') && !line.starts_with('^') && line.ends_with(&want)
+    })
+}
+
+fn packed_peel(packed: &str, rel: &str) -> Option<String> {
+    let suffix = format!(" {rel}");
+    let mut lines = packed.lines();
+    while let Some(line) = lines.next() {
+        let line = line.trim();
+        if line.starts_with('#') || line.starts_with('^') || !line.ends_with(&suffix) {
+            continue;
+        }
+        if let Some(next) = lines.next() {
+            let next = next.trim();
+            if let Some(target) = next.strip_prefix('^') {
+                return Some(target.trim().to_string());
+            }
+        }
+        return None;
+    }
+    None
+}
+
+fn git_origin_head(git: &Path) -> Option<String> {
+    if let Ok(text) = fs::read_to_string(git.join("refs/remotes/origin/HEAD"))
+        && let Some(name) = branch_from_symref(&text)
+    {
+        return Some(name);
+    }
+    let packed = git_packed_refs(git)?;
+    if let Some(target) = packed_peel(&packed, "refs/remotes/origin/HEAD") {
+        return branch_from_symref(&format!("ref: {target}"))
+            .or_else(|| target.rsplit('/').next().map(str::to_string));
+    }
+    None
+}
+
 fn git_ref_exists(git: &Path, rel: &str) -> bool {
-    git.join(rel).is_file()
+    if git.join(rel).is_file() {
+        return true;
+    }
+    git_packed_refs(git).is_some_and(|text| packed_ref_exists(&text, rel))
 }
 
 fn git_has_origin(git: &Path) -> bool {
     git.join("refs/remotes/origin").is_dir()
         || git.join("refs/remotes/origin/HEAD").is_file()
+        || git_packed_refs(git).is_some_and(|text| {
+            packed_ref_exists(&text, "refs/remotes/origin/HEAD")
+                || text.lines().any(|line| {
+                    let line = line.trim();
+                    !line.starts_with('#') && line.contains(" refs/remotes/origin/")
+                })
+        })
         || fs::read_to_string(git.join("config"))
             .ok()
             .is_some_and(|text| {
@@ -523,11 +578,6 @@ fn git_has_origin(git: &Path) -> bool {
                     line.eq_ignore_ascii_case("[remote \"origin\"]")
                 })
             })
-}
-
-fn git_origin_head(git: &Path) -> Option<String> {
-    let text = fs::read_to_string(git.join("refs/remotes/origin/HEAD")).ok()?;
-    branch_from_symref(&text)
 }
 
 fn pick_home_branch(
@@ -1667,6 +1717,16 @@ mod tests {
             "main"
         );
         assert_eq!(pick_home_branch(&[], None, "dev"), "dev");
+        let packed = "# pack-refs with: peeled fully-peeled sorted\n\
+                      1111111111111111111111111111111111111111 refs/heads/master\n\
+                      2222222222222222222222222222222222222222 refs/remotes/origin/HEAD\n\
+                      ^refs/remotes/origin/master\n";
+        assert!(packed_ref_exists(packed, "refs/heads/master"));
+        assert!(!packed_ref_exists(packed, "refs/heads/main"));
+        assert_eq!(
+            packed_peel(packed, "refs/remotes/origin/HEAD").as_deref(),
+            Some("refs/remotes/origin/master")
+        );
     }
 
     #[test]

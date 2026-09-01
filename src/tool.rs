@@ -31,7 +31,15 @@ pub(crate) fn is_abort(e: &anyhow::Error) -> bool {
 
 const MAX_READ_BYTES: usize = 50 * 1024;
 const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_BASH_TIMEOUT: Duration = Duration::from_secs(600);
 const MAX_BASH_BYTES: usize = 20_000;
+
+fn bash_timeout(seconds: Option<u64>) -> Duration {
+    match seconds {
+        Some(s) if s > 0 => Duration::from_secs(s).min(MAX_BASH_TIMEOUT),
+        _ => TOOL_TIMEOUT,
+    }
+}
 
 pub(crate) fn clip_utf8(s: &str, max: usize) -> &str {
     if s.len() <= max {
@@ -103,7 +111,7 @@ pub(crate) struct Tool {
     pub name: &'static str,
     pub description: &'static str,
     pub properties: &'static [Property],
-    pub execute: Option<fn(&Path, &Value) -> Result<String>>,
+    pub execute: Option<fn(&Path, &Value, &Abort) -> Result<String>>,
 }
 
 fn resolve_path(workspace: &Path, path: &str) -> Result<PathBuf> {
@@ -150,13 +158,21 @@ fn clean(path: &Path) -> PathBuf {
 fn tool_bash() -> Tool {
     Tool {
         name: "bash",
-        description: "Run a shell command in the workspace. Combined stdout+stderr, capped at 20KB. The command itself is not sandboxed. No TTY — sudo/password prompts cannot use the terminal and will fail instead of hanging.",
-        properties: &[Property {
-            name: "cmd",
-            r#type: "string",
-            description: "Shell command",
-            required: true,
-        }],
+        description: "Run a shell command in the workspace. Combined stdout+stderr, capped at 20KB. Times out after 30s. The command itself is not sandboxed. No TTY — sudo/password prompts cannot use the terminal and will fail instead of hanging.",
+        properties: &[
+            Property {
+                name: "cmd",
+                r#type: "string",
+                description: "Shell command",
+                required: true,
+            },
+            Property {
+                name: "timeout",
+                r#type: "integer",
+                description: "Seconds before kill (default 30, max 600)",
+                required: false,
+            },
+        ],
         execute: None,
     }
 }
@@ -226,8 +242,10 @@ async fn bash_execute_async(workspace: &Path, raw: &Value, abort: &Abort) -> Res
     #[derive(Deserialize)]
     struct Args {
         cmd: String,
+        timeout: Option<u64>,
     }
     let a: Args = Args::deserialize(raw).context("bash args")?;
+    let timeout = bash_timeout(a.timeout);
     let mut child = bash_command(workspace, &a.cmd)
         .spawn()
         .context("spawn bash")?;
@@ -250,6 +268,11 @@ async fn bash_execute_async(workspace: &Path, raw: &Value, abort: &Abort) -> Res
             let _ = child.wait().await;
             return Err(aborted());
         }
+        _ = tokio::time::sleep(timeout) => {
+            kill_bash(&mut child);
+            let _ = child.wait().await;
+            bail!("bash timed out after {}s", timeout.as_secs());
+        }
     };
     let stdout = out_task.await.context("bash stdout task")?.context("read bash stdout")?;
     let stderr = err_task.await.context("bash stderr task")?.context("read bash stderr")?;
@@ -260,7 +283,7 @@ pub(crate) async fn execute_tool(
     tool: &Tool,
     workspace: &Path,
     args: &Value,
-    abort: &Abort,
+    abort: &Arc<Abort>,
 ) -> Result<String> {
     if abort.is_set() {
         return Err(aborted());
@@ -273,8 +296,10 @@ pub(crate) async fn execute_tool(
     };
     let workspace = workspace.to_path_buf();
     let args = args.clone();
-    // spawn_blocking cannot be cancelled; we stop waiting on abort/timeout.
-    let handle = tokio::task::spawn_blocking(move || exec(&workspace, &args));
+    let abort_flag = abort.clone();
+    // spawn_blocking cannot be cancelled; the tool itself checks abort
+    // before writing so an Esc mid-read does not still land on disk.
+    let handle = tokio::task::spawn_blocking(move || exec(&workspace, &args, &abort_flag));
     tokio::select! {
         r = handle => match r {
             Ok(Ok(s)) => Ok(s),
@@ -314,7 +339,10 @@ fn tool_read() -> Tool {
     }
 }
 
-fn read_execute(workspace: &Path, raw: &Value) -> Result<String> {
+fn read_execute(workspace: &Path, raw: &Value, abort: &Abort) -> Result<String> {
+    if abort.is_set() {
+        return Err(aborted());
+    }
     #[derive(Deserialize)]
     struct Args {
         path: String,
@@ -438,7 +466,10 @@ fn list_dir(path: &Path) -> Result<String> {
     }
 }
 
-fn write_execute(workspace: &Path, raw: &Value) -> Result<String> {
+fn write_execute(workspace: &Path, raw: &Value, abort: &Abort) -> Result<String> {
+    if abort.is_set() {
+        return Err(aborted());
+    }
     #[derive(Deserialize)]
     struct Args {
         path: String,
@@ -485,7 +516,10 @@ fn tool_edit() -> Tool {
     }
 }
 
-fn edit_execute(workspace: &Path, raw: &Value) -> Result<String> {
+fn edit_execute(workspace: &Path, raw: &Value, abort: &Abort) -> Result<String> {
+    if abort.is_set() {
+        return Err(aborted());
+    }
     #[derive(Deserialize)]
     struct Args {
         path: String,
@@ -501,6 +535,9 @@ fn edit_execute(workspace: &Path, raw: &Value) -> Result<String> {
     let n = text.matches(&a.old).count();
     if n != 1 {
         bail!("`old` must appear exactly once (found {n})");
+    }
+    if abort.is_set() {
+        return Err(aborted());
     }
     fs::write(&path, text.replacen(&a.old, &a.new, 1))
         .with_context(|| format!("write {}", path.display()))?;
@@ -556,11 +593,13 @@ mod tests {
         let out = read_execute(
             &root,
             &json!({"path": outside.join("secret.txt").to_string_lossy()}),
+            &Abort::new(),
         );
         assert!(out.as_ref().is_ok_and(|s| s.contains("peek")), "{out:?}");
         let listing = read_execute(
             &root,
             &json!({"path": outside.to_string_lossy()}),
+            &Abort::new(),
         );
         assert!(
             listing.as_ref().is_ok_and(|s| s.contains("secret.txt")),
@@ -569,6 +608,7 @@ mod tests {
         let wrote = write_execute(
             &root,
             &json!({"path": outside.join("nope.txt").to_string_lossy(), "content": "x"}),
+            &Abort::new(),
         );
         assert!(wrote.is_ok(), "{wrote:?}");
         let edited = edit_execute(
@@ -578,6 +618,7 @@ mod tests {
                 "old": "peek",
                 "new": "seen"
             }),
+            &Abort::new(),
         );
         assert!(edited.is_ok(), "{edited:?}");
         assert_eq!(
@@ -598,7 +639,7 @@ mod tests {
         png.extend_from_slice(&[0; 4]);
         let path = root.join("t24.png");
         assert!(fs::write(&path, &png).is_ok(), "write png");
-        let out = read_execute(&root, &json!({"path": "t24.png"}));
+        let out = read_execute(&root, &json!({"path": "t24.png"}), &Abort::new());
         assert!(
             out.as_ref()
                 .is_ok_and(|s| s.contains("PNG 1x2") && s.contains("bytes")),
@@ -611,22 +652,24 @@ mod tests {
     fn write_edit_read_roundtrip() {
         let root = workspace();
         assert!(
-            write_execute(&root, &json!({"path": "n.txt", "content": "hello world"})).is_ok(),
+            write_execute(&root, &json!({"path": "n.txt", "content": "hello world"}), &Abort::new()).is_ok(),
             "write"
         );
         assert!(
             edit_execute(
                 &root,
                 &json!({"path": "n.txt", "old": "world", "new": "there"}),
+                &Abort::new(),
             )
             .is_ok(),
             "edit"
         );
-        let out = read_execute(&root, &json!({"path": "n.txt"}));
+        let out = read_execute(&root, &json!({"path": "n.txt"}), &Abort::new());
         assert!(out.as_ref().is_ok_and(|s| s.contains("hello there")));
         assert!(edit_execute(
             &root,
-            &json!({"path": "n.txt", "old": "missing", "new": "x"})
+            &json!({"path": "n.txt", "old": "missing", "new": "x"}),
+            &Abort::new(),
         )
         .is_err());
         let _ = fs::remove_dir_all(&root);
@@ -654,5 +697,46 @@ mod tests {
         .await;
         let _ = fs::remove_dir_all(&root);
         assert!(tty.as_ref().is_ok_and(|s| s.contains("NO_TTY")), "{tty:?}");
+    }
+
+    #[tokio::test]
+    async fn bash_times_out() {
+        let root = workspace();
+        let abort = Abort::new();
+        let started = std::time::Instant::now();
+        let out = bash_execute_async(
+            &root,
+            &json!({"cmd": "sleep 8", "timeout": 1}),
+            &abort,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        let _ = fs::remove_dir_all(&root);
+        assert!(out.is_err(), "{out:?}");
+        assert!(
+            out.as_ref().is_err_and(|e| format!("{e:#}").contains("timed out")),
+            "{out:?}"
+        );
+        assert!(elapsed < Duration::from_secs(4), "{elapsed:?}");
+    }
+
+    #[test]
+    fn bash_timeout_clamps() {
+        assert_eq!(bash_timeout(None), Duration::from_secs(30));
+        assert_eq!(bash_timeout(Some(0)), Duration::from_secs(30));
+        assert_eq!(bash_timeout(Some(90)), Duration::from_secs(90));
+        assert_eq!(bash_timeout(Some(10_000)), Duration::from_secs(600));
+    }
+
+    #[test]
+    fn abort_skips_write() {
+        let root = workspace();
+        let abort = Abort::new();
+        abort.abort();
+        let path = root.join("nope.txt");
+        let out = write_execute(&root, &json!({"path": "nope.txt", "content": "x"}), &abort);
+        assert!(is_abort(out.as_ref().unwrap_err()));
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(&root);
     }
 }

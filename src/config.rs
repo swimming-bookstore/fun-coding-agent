@@ -1,4 +1,4 @@
-//! Optional `~/.config/fun-coding-agent/config.json`.
+//! Optional `~/.config/fun/config.json`.
 //! Override with `FUN_CODING_AGENT_CONFIG`.
 //! Invalid JSON keeps the defaults.
 //!
@@ -293,16 +293,20 @@ fn config_path() -> Result<PathBuf> {
 }
 
 fn config_dir() -> Result<PathBuf> {
+    Ok(xdg_config_home()?.join("fun"))
+}
+
+fn xdg_config_home() -> Result<PathBuf> {
     if let Ok(dir) = env::var("XDG_CONFIG_HOME")
         && !dir.is_empty()
     {
-        return Ok(PathBuf::from(dir).join("fun-coding-agent"));
+        return Ok(PathBuf::from(dir));
     }
     let home = env::var("HOME").context("HOME is not set")?;
     if home.is_empty() {
         bail!("HOME is not set");
     }
-    Ok(PathBuf::from(home).join(".config/fun-coding-agent"))
+    Ok(PathBuf::from(home).join(".config"))
 }
 
 pub fn load() -> Config {

@@ -51,16 +51,20 @@ fn now_ms() -> u64 {
 }
 
 fn data_dir() -> Result<PathBuf> {
+    Ok(xdg_data_home()?.join("fun"))
+}
+
+fn xdg_data_home() -> Result<PathBuf> {
     if let Ok(dir) = env::var("XDG_DATA_HOME")
         && !dir.is_empty()
     {
-        return Ok(PathBuf::from(dir).join("fun-coding-agent"));
+        return Ok(PathBuf::from(dir));
     }
     let home = env::var("HOME").context("HOME is not set")?;
     if home.is_empty() {
         bail!("HOME is not set");
     }
-    Ok(PathBuf::from(home).join(".local/share/fun-coding-agent"))
+    Ok(PathBuf::from(home).join(".local/share"))
 }
 
 fn path_digest(cwd: &str) -> String {
@@ -84,9 +88,8 @@ fn sessions_dir(workspace: &Path) -> Result<PathBuf> {
             }
         })
         .collect();
-    Ok(data_dir()?
-        .join("sessions")
-        .join(format!("--{safe}-{}--", path_digest(&cwd))))
+    let name = format!("--{safe}-{}--", path_digest(&cwd));
+    Ok(data_dir()?.join("sessions").join(name))
 }
 
 fn jsonl_files(dir: &Path) -> Vec<PathBuf> {

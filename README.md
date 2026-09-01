@@ -8,5 +8,6 @@ cargo run --bin fun
 fun "fix the tests"
 ```
 
-Config: `~/.config/fun-coding-agent/config.json`  
-Sessions: `~/.local/share/fun-coding-agent/sessions/`
+Config: `~/.config/fun/config.json`  
+Auth: `~/.local/share/fun/auth.json`  
+Sessions: `~/.local/share/fun/sessions/`

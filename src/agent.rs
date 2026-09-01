@@ -193,8 +193,8 @@ impl Agent {
         format!(
             "You are Fun coding agent. Tools: read, write, edit, bash.\n\
              Read a file before editing it. Prefer edit for small changes.\n\
-             Verify with tools before claiming done. Keep replies short.\n\
              Paths are relative to this workspace unless absolute. read, write, and edit may use paths outside the workspace.\n\
+             bash times out after 30s; pass timeout (seconds, max 600) for longer commands. Verify with tools before claiming done. Keep replies short.\n\
              workspace: {}",
             self.workspace.display()
         )

@@ -670,8 +670,8 @@ def inject(data: bytes) -> None:
 def sessions_root() -> Path:
     xdg = os.environ.get("XDG_DATA_HOME")
     if xdg:
-        return Path(xdg) / "fun-coding-agent" / "sessions"
-    return Path.home() / ".local/share/fun-coding-agent/sessions"
+        return Path(xdg) / "fun" / "sessions"
+    return Path.home() / ".local/share/fun/sessions"
 
 
 def newest_session(since: float) -> Path | None:
@@ -747,7 +747,7 @@ def main() -> None:
     if not shutil.which("xterm"):
         die("xterm not found")
 
-    auth = Path.home() / ".local/share/fun-coding-agent/auth.json"
+    auth = Path.home() / ".local/share/fun/auth.json"
     if not auth.exists():
         die("not logged in — run `fun login` once, then re-record")
 
