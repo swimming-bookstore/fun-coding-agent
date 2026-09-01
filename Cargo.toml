@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "crates/provider-grok"]
+resolver = "3"
+
 [package]
 name = "fun-coding-agent"
 version = "0.1.0"
@@ -14,7 +18,7 @@ anyhow = "1"
 arboard = { version = "3", default-features = false }
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
-provider-grok = { path = "../provider-grok" }
+provider-grok = { path = "crates/provider-grok" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

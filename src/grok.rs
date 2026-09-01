@@ -9,6 +9,14 @@ use std::time::Duration;
 
 const STREAM_IDLE: Duration = Duration::from_secs(90);
 
+fn auth_err(e: anyhow::Error) -> anyhow::Error {
+    if provider_grok::is_not_logged_in(&e) {
+        e.context("not logged in — `fun login`")
+    } else {
+        e
+    }
+}
+
 fn env_or(name: &str, default: &str) -> String {
     env::var(name).unwrap_or_else(|_| default.into())
 }
@@ -221,9 +229,7 @@ pub(crate) struct Grok {
 
 impl Grok {
     pub async fn from_env() -> Result<(Self, String)> {
-        provider_grok::bearer()
-            .await
-            .context("not logged in — `fun login`")?;
+        provider_grok::bearer().await.map_err(auth_err)?;
         let base_url = env_or("FUN_CODING_AGENT_BASE_URL", "https://api.x.ai/v1");
         let model = env_or("FUN_CODING_AGENT_MODEL", "grok-4.6");
         let effort = reasoning_effort();
@@ -314,13 +320,11 @@ impl Grok {
                 effort: &self.effort,
             }),
         };
-        let token = provider_grok::bearer()
-            .await
-            .context("not logged in — `fun login`")?;
+        let mut token = provider_grok::bearer().await.map_err(auth_err)?;
         let send = self
             .http
             .post(&url)
-            .bearer_auth(token)
+            .bearer_auth(&token)
             .header("Accept", "text/event-stream")
             .header("Accept-Encoding", "identity")
             .json(&body)
@@ -329,6 +333,31 @@ impl Grok {
             r = send => r.context("grok request")?,
             _ = abort.wait() => return Err(aborted()),
         };
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            let refreshed = provider_grok::force_refresh(Some(&token))
+                .await
+                .map_err(auth_err)?;
+            if refreshed == token {
+                bail!(
+                    "grok {}: {}",
+                    resp.status(),
+                    resp.text().await.unwrap_or_default()
+                );
+            }
+            token = refreshed;
+            let retry = self
+                .http
+                .post(&url)
+                .bearer_auth(&token)
+                .header("Accept", "text/event-stream")
+                .header("Accept-Encoding", "identity")
+                .json(&body)
+                .send();
+            resp = tokio::select! {
+                r = retry => r.context("grok request")?,
+                _ = abort.wait() => return Err(aborted()),
+            };
+        }
         let status = resp.status();
         if !status.is_success() {
             bail!("grok {}: {}", status, resp.text().await.unwrap_or_default());
