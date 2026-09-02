@@ -1934,7 +1934,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_chip_uses_current_branch() {
+    fn commit_chip_opens_new_branch() {
         tui::set_actions(crate::config::Action::defaults());
         tui::set_origin(true);
         let on_home = Status {
@@ -1948,7 +1948,7 @@ mod tests {
         };
         assert_eq!(
             action_prompt(&KeyAction::Action(1), &on_home).as_deref(),
-            Some("commit and push")
+            Some("commit and push a new branch")
         );
         let other = Status {
             branch: Some("feat".into()),

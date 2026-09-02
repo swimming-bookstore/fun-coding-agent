@@ -41,7 +41,7 @@
 //!       "label": "[ commit to {branch} and push ]",
 //!       "label_home": "[ commit and push ]",
 //!       "prompt": "commit to {branch} and push",
-//!       "prompt_home": "commit and push",
+//!       "prompt_home": "commit and push a new branch",
 //!       "color": "accent",
 //!       "ask": "init git on {home} if needed, add origin {origin}, then commit and push"
 //!     }
@@ -121,7 +121,7 @@ impl Action {
                 label: "[ commit to {branch} and push ]".into(),
                 label_home: Some("[ commit and push ]".into()),
                 prompt: "commit to {branch} and push".into(),
-                prompt_home: Some("commit and push".into()),
+                prompt_home: Some("commit and push a new branch".into()),
                 color: ActionColor::Accent,
                 when: ActionWhen::Always,
                 ask: Some(
@@ -589,7 +589,7 @@ mod tests {
         );
         assert_eq!(
             commit.filled_prompt(Some("master"), Some("master"), None).as_deref(),
-            Some("commit and push")
+            Some("commit and push a new branch")
         );
         assert_eq!(
             commit.filled_label(Some("master"), Some("feat")).as_deref(),
