@@ -309,10 +309,12 @@ fn lock_auth_file() -> Result<Option<std::fs::File>> {
         if rc != 0 {
             return Err(std::io::Error::last_os_error()).context("auth lock");
         }
-        return Ok(Some(file));
+        Ok(Some(file))
     }
     #[cfg(not(unix))]
-    Ok(None)
+    {
+        Ok(None)
+    }
 }
 
 async fn lock_auth() -> Result<AuthGuard> {

@@ -161,6 +161,12 @@ pub struct ActionHit {
     pub index: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ComposerAtom {
+    Char(char),
+    Chip { index: usize, label: String },
+}
+
 #[derive(Clone, Copy)]
 enum QueueCtrl {
     Steer,
@@ -242,7 +248,7 @@ pub struct Ui {
     partial: String,
     think: String,
     think_hide_at: Option<Instant>,
-    input: String,
+    atoms: Vec<ComposerAtom>,
     cursor: usize,
     bar: Bar,
     working: bool,
@@ -252,6 +258,8 @@ pub struct Ui {
     paused: bool,
     body_area: Rect,
     queue_area: Rect,
+    composer_area: Rect,
+    chip_hits: Vec<(Rect, usize)>,
     actions: Vec<(Rect, ActionHit)>,
     queue_drag: Option<usize>,
     queue_flash: Option<(usize, Instant)>,
@@ -286,7 +294,7 @@ impl Ui {
             partial: String::new(),
             think: String::new(),
             think_hide_at: None,
-            input: String::new(),
+            atoms: Vec::new(),
             cursor: 0,
             bar: Bar::default(),
             working: false,
@@ -296,6 +304,8 @@ impl Ui {
             paused: false,
             body_area: Rect::new(0, 0, 0, 0),
             queue_area: Rect::new(0, 0, 0, 0),
+            composer_area: Rect::new(0, 0, 0, 0),
+            chip_hits: Vec::new(),
             actions: Vec::new(),
             queue_drag: None,
             queue_flash: None,
@@ -336,18 +346,21 @@ impl Ui {
         self.redraw()
     }
 
-    pub fn set_input(&mut self, input: impl Into<String>, cursor: usize) -> Result<()> {
-        let input = input.into();
-        let mut cursor = cursor.min(input.len());
-        while cursor > 0 && !input.is_char_boundary(cursor) {
-            cursor -= 1;
-        }
-        if input == self.input && cursor == self.cursor {
+    pub fn set_composer(&mut self, atoms: Vec<ComposerAtom>, cursor: usize) -> Result<()> {
+        let cursor = cursor.min(atoms.len());
+        if atoms == self.atoms && cursor == self.cursor {
             return Ok(());
         }
-        self.input = input;
+        self.atoms = atoms;
         self.cursor = cursor;
         self.redraw()
+    }
+
+    pub fn chip_hit(&self, x: u16, y: u16) -> Option<usize> {
+        self.chip_hits
+            .iter()
+            .find(|(r, _)| r.contains(x, y))
+            .map(|(_, i)| *i)
     }
 
     pub fn set_queue(&mut self, queue: Vec<Queued>) -> Result<()> {
@@ -841,7 +854,7 @@ impl Ui {
         let rows = &self.rows;
         let partial = &self.partial;
         let think = &self.think;
-        let input = &self.input;
+        let atoms = &self.atoms;
         let cursor = self.cursor;
         let bar = &self.bar;
         let working = self.working;
@@ -850,7 +863,16 @@ impl Ui {
         let select = self.select;
         let queue = &self.queue;
         let queue_edit = self.queue_edit;
-        let queue_edit_text = queue_edit.map(|_| self.input.as_str());
+        let queue_edit_owned = queue_edit.map(|_| {
+            atoms
+                .iter()
+                .map(|atom| match atom {
+                    ComposerAtom::Char(c) => c.to_string(),
+                    ComposerAtom::Chip { label, .. } => format!("[{label}]"),
+                })
+                .collect::<String>()
+        });
+        let queue_edit_text = queue_edit_owned.as_deref();
         let queue_hl = queue_edit
             .or_else(|| {
                 self.queue_flash
@@ -868,13 +890,17 @@ impl Ui {
         let mut body_start = self.body_start;
         let mut body_area = Rect::new(0, 0, 0, 0);
         let mut queue_area = Rect::new(0, 0, 0, 0);
+        let mut composer_area = Rect::new(0, 0, 0, 0);
+        let mut chip_hits = Vec::new();
         let mut actions = Vec::new();
 
         self.term.draw_with_cursor(|buf, area| {
             let status_wanted = status_rows(bar, working, spinner, scroll, area.width)
                 .len()
                 .clamp(1, 4) as u16;
-            let (composer_h, status_h) = chrome_heights(area.height, status_wanted);
+            let composer_wanted = composer_wanted_height(atoms, area.width);
+            let (composer_h, status_h) =
+                chrome_heights(area.height, status_wanted, composer_wanted);
             let mut room = area.height.saturating_sub(composer_h.saturating_add(status_h));
             let think_h = think_height(think, area.width, room);
             room = room.saturating_sub(think_h);
@@ -944,10 +970,10 @@ impl Ui {
                 );
                 i += 1;
             }
-            let mut composer_area = Rect::new(0, 0, 0, 0);
             let cursor_pos = if composer_h > 0 {
                 composer_area = parts[i];
-                let pos = composer(buf, parts[i], input, cursor, working);
+                let (pos, hits) = composer(buf, parts[i], atoms, cursor, working);
+                chip_hits = hits;
                 i += 1;
                 pos
             } else {
@@ -966,6 +992,8 @@ impl Ui {
         })?;
         self.body_area = body_area;
         self.queue_area = queue_area;
+        self.composer_area = composer_area;
+        self.chip_hits = chip_hits;
         self.actions = actions;
         self.scroll = used_scroll;
         self.body_start = body_start;
@@ -974,7 +1002,9 @@ impl Ui {
     }
 }
 
-fn chrome_heights(total: u16, status_wanted: u16) -> (u16, u16) {
+const COMPOSER_MAX: u16 = 12;
+
+fn chrome_heights(total: u16, status_wanted: u16, composer_wanted: u16) -> (u16, u16) {
     if total == 0 {
         return (0, 0);
     }
@@ -985,7 +1015,22 @@ fn chrome_heights(total: u16, status_wanted: u16) -> (u16, u16) {
         return (total.saturating_sub(1).min(3), 1);
     }
     let status_h = status_wanted.min(total.saturating_sub(3)).max(1);
-    (3, status_h)
+    let rest = total.saturating_sub(status_h);
+    let cap = rest.saturating_sub(1).clamp(3, COMPOSER_MAX);
+    let composer_h = composer_wanted.clamp(3, cap);
+    (composer_h, status_h)
+}
+
+fn composer_text_width(area_width: u16) -> usize {
+    area_width.saturating_sub(6).max(1) as usize
+}
+
+fn composer_wanted_height(atoms: &[ComposerAtom], width: u16) -> u16 {
+    let lines = composer_view(atoms, 0, composer_text_width(width))
+        .lines
+        .len()
+        .max(1) as u16;
+    lines.saturating_add(2).max(3)
 }
 
 fn status_rows(
@@ -1992,26 +2037,159 @@ fn body(
     (scroll, start)
 }
 
-fn composer(buf: &mut Buffer, area: Rect, input: &str, cursor: usize, working: bool) -> (u16, u16) {
+struct ComposerPiece {
+    text: String,
+    style: Style,
+    chip: Option<usize>,
+}
+
+struct ComposerLine {
+    pieces: Vec<ComposerPiece>,
+    width: usize,
+}
+
+struct ComposerView {
+    lines: Vec<ComposerLine>,
+    cursor_line: usize,
+    cursor_col: usize,
+}
+
+fn chip_text(label: &str, max: usize) -> String {
+    let max = max.max(5);
+    let budget = max.saturating_sub(4);
+    format!("[{} ×]", clip_width(label, budget))
+}
+
+fn composer_view(atoms: &[ComposerAtom], cursor: usize, max: usize) -> ComposerView {
+    let max = max.max(1);
+    let cursor = cursor.min(atoms.len());
+    let mut lines = vec![ComposerLine {
+        pieces: Vec::new(),
+        width: 0,
+    }];
+    let mut cursor_line = 0usize;
+    let mut cursor_col = 0usize;
+
+    let newline = |lines: &mut Vec<ComposerLine>| {
+        lines.push(ComposerLine {
+            pieces: Vec::new(),
+            width: 0,
+        });
+    };
+    let mark = |lines: &[ComposerLine], cursor_line: &mut usize, cursor_col: &mut usize| {
+        *cursor_line = lines.len().saturating_sub(1);
+        *cursor_col = lines.last().map(|l| l.width).unwrap_or(0);
+    };
+
+    if cursor == 0 {
+        cursor_line = 0;
+        cursor_col = 0;
+    }
+
+    for (i, atom) in atoms.iter().enumerate() {
+        if cursor == i {
+            mark(&lines, &mut cursor_line, &mut cursor_col);
+        }
+        match atom {
+            ComposerAtom::Char('\n') => newline(&mut lines),
+            ComposerAtom::Char(c) => {
+                let cw = c.width().unwrap_or(0);
+                if cw == 0 {
+                    continue;
+                }
+                if lines.last().is_some_and(|l| l.width + cw > max && l.width > 0) {
+                    newline(&mut lines);
+                }
+                let line = lines.last_mut().expect("composer line");
+                let ch = c.to_string();
+                if let Some(last) = line.pieces.last_mut()
+                    && last.chip.is_none()
+                    && last.style == Style::new()
+                {
+                    last.text.push(*c);
+                } else {
+                    line.pieces.push(ComposerPiece {
+                        text: ch,
+                        style: Style::new(),
+                        chip: None,
+                    });
+                }
+                line.width += cw;
+            }
+            ComposerAtom::Chip { index, label } => {
+                let text = chip_text(label, max);
+                let tw = width(&text).min(max).max(1);
+                if lines.last().is_some_and(|l| l.width + tw > max && l.width > 0) {
+                    newline(&mut lines);
+                }
+                let line = lines.last_mut().expect("composer line");
+                line.pieces.push(ComposerPiece {
+                    text,
+                    style: col(pal().text).bg(pal().queue),
+                    chip: Some(*index),
+                });
+                line.width += tw;
+            }
+        }
+    }
+    if cursor == atoms.len() {
+        mark(&lines, &mut cursor_line, &mut cursor_col);
+    }
+    ComposerView {
+        lines,
+        cursor_line,
+        cursor_col,
+    }
+}
+
+fn composer(
+    buf: &mut Buffer,
+    area: Rect,
+    atoms: &[ComposerAtom],
+    cursor: usize,
+    working: bool,
+) -> ((u16, u16), Vec<(Rect, usize)>) {
     let border = if working { tool_col() } else { muted() };
     Block::new().border(border).render(buf, area);
     let inner = Block::inner(area);
     if inner.is_empty() {
-        return (area.x.saturating_add(1), area.y.saturating_add(1));
+        return (
+            (area.x.saturating_add(1), area.y.saturating_add(1)),
+            Vec::new(),
+        );
     }
-    let y = inner.y;
-    let mut x = inner.x.saturating_add(1);
-    x = buf.write(inner, x, y, "› ", accent().bold());
-    let max = inner
-        .width
-        .saturating_sub(4)
-        .max(1) as usize;
-    let (shown, cur_col) = visible_input(input, cursor, max);
-    buf.write(inner, x, y, &shown, Style::new());
-    (
-        x.saturating_add(cur_col as u16),
-        y,
-    )
+    let max = inner.width.saturating_sub(4).max(1) as usize;
+    let view = composer_view(atoms, cursor, max);
+    let h = inner.height.max(1) as usize;
+    let start = (view.cursor_line + 1).saturating_sub(h);
+    let mut hits = Vec::new();
+    for (i, line) in view.lines.iter().enumerate().skip(start).take(h) {
+        let y = inner.y.saturating_add((i - start) as u16);
+        let mut x = inner.x.saturating_add(1);
+        if i == 0 {
+            x = buf.write(inner, x, y, "› ", accent().bold());
+        } else {
+            x = buf.write(inner, x, y, "  ", muted());
+        }
+        for piece in &line.pieces {
+            let start_x = x;
+            x = buf.write(inner, x, y, &piece.text, piece.style);
+            if let Some(index) = piece.chip {
+                let w = x.saturating_sub(start_x).max(1);
+                let close_w = 3u16.min(w);
+                let close_x = start_x.saturating_add(w.saturating_sub(close_w));
+                hits.push((Rect::new(close_x, y, close_w, 1), index));
+            }
+        }
+    }
+    let vis = view.cursor_line.saturating_sub(start).min(h.saturating_sub(1));
+    let y = inner.y.saturating_add(vis as u16);
+    let x = inner
+        .x
+        .saturating_add(1)
+        .saturating_add(2)
+        .saturating_add(view.cursor_col as u16);
+    ((x, y), hits)
 }
 
 fn wrap_lines(lines: &[Line], max: usize) -> Vec<Line> {
@@ -3100,10 +3278,79 @@ mod tests {
 
     #[test]
     fn chrome_keeps_status_visible() {
-        assert_eq!(chrome_heights(1, 2), (0, 1));
-        assert_eq!(chrome_heights(4, 2), (3, 1));
-        assert_eq!(chrome_heights(8, 2), (3, 2));
-        assert_eq!(chrome_heights(10, 3), (3, 3));
+        assert_eq!(chrome_heights(1, 2, 3), (0, 1));
+        assert_eq!(chrome_heights(4, 2, 3), (3, 1));
+        assert_eq!(chrome_heights(8, 2, 3), (3, 2));
+        assert_eq!(chrome_heights(10, 3, 3), (3, 3));
+        assert_eq!(chrome_heights(20, 2, 6), (6, 2));
+    }
+
+    #[test]
+    fn composer_keeps_pasted_newlines() {
+        let atoms: Vec<ComposerAtom> = "hello\nworld\n!"
+            .chars()
+            .map(ComposerAtom::Char)
+            .collect();
+        let view = composer_view(&atoms, 13, 40);
+        let lines: Vec<String> = view
+            .lines
+            .iter()
+            .map(|l| l.pieces.iter().map(|p| p.text.as_str()).collect())
+            .collect();
+        assert_eq!(lines, vec!["hello", "world", "!"]);
+        assert_eq!(view.cursor_line, 2);
+        assert_eq!(view.cursor_col, 1);
+        let after_nl: Vec<ComposerAtom> = "hello\n".chars().map(ComposerAtom::Char).collect();
+        let after = composer_view(&after_nl, 6, 40);
+        let after_lines: Vec<String> = after
+            .lines
+            .iter()
+            .map(|l| l.pieces.iter().map(|p| p.text.as_str()).collect())
+            .collect();
+        assert_eq!(after_lines, vec!["hello", ""]);
+        assert_eq!(after.cursor_line, 1);
+        let three: Vec<ComposerAtom> = "a\nb\nc".chars().map(ComposerAtom::Char).collect();
+        assert_eq!(composer_wanted_height(&three, 80), 5);
+        let mut buf = Buffer::new(20, 5);
+        let area = Rect::new(0, 0, 20, 5);
+        let two: Vec<ComposerAtom> = "one\ntwo".chars().map(ComposerAtom::Char).collect();
+        composer(&mut buf, area, &two, 7, false);
+        let row = |y: u16| {
+            (1..19)
+                .map(|x| buf.get(x, y).ch)
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
+        assert!(row(1).contains("› one"), "{}", row(1));
+        assert!(row(2).contains("two"), "{}", row(2));
+        assert!(!row(1).contains("one two"), "{}", row(1));
+    }
+
+    #[test]
+    fn composer_draws_paste_chip_inline() {
+        let atoms = vec![
+            ComposerAtom::Char('h'),
+            ComposerAtom::Char('i'),
+            ComposerAtom::Char(' '),
+            ComposerAtom::Chip {
+                index: 0,
+                label: "paste 12 lines".into(),
+            },
+        ];
+        let mut buf = Buffer::new(40, 3);
+        let area = Rect::new(0, 0, 40, 3);
+        let (cursor, hits) = composer(&mut buf, area, &atoms, 4, false);
+        let row = (1..39)
+            .map(|x| buf.get(x, 1).ch)
+            .collect::<String>()
+            .trim_end()
+            .to_string();
+        assert!(row.contains("› hi [paste 12 lines ×]"), "{row}");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].1, 0);
+        assert!(hits[0].0.contains(cursor.0.saturating_sub(2), cursor.1) || hits[0].0.y == 1);
+        assert_eq!(composer_wanted_height(&atoms, 80), 3);
     }
 
     #[test]

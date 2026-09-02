@@ -22,7 +22,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tool::get_tools;
-use tui::{Bar, QueueHit, Queued, Ui};
+use tui::{Bar, ComposerAtom, QueueHit, Queued, Ui};
 
 enum KeyAction {
     Skip,
@@ -42,12 +42,14 @@ enum KeyAction {
     QueueEdit(usize),
     QueueDrop(usize),
     QueueMove { from: usize, to: usize },
+    DropChip(usize),
     Action(usize),
     AskSubmit,
 }
 
 struct LineEdit {
-    input: String,
+    atoms: Vec<ComposerAtom>,
+    chips: Vec<String>,
     cursor: usize,
     history: Vec<String>,
     idx: usize,
@@ -55,42 +57,8 @@ struct LineEdit {
     queue_slot: Option<usize>,
 }
 
-fn prev_boundary(s: &str, mut i: usize) -> usize {
-    if i == 0 {
-        return 0;
-    }
-    i -= 1;
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
-}
-
-fn next_boundary(s: &str, mut i: usize) -> usize {
-    if i >= s.len() {
-        return s.len();
-    }
-    i += 1;
-    while i < s.len() && !s.is_char_boundary(i) {
-        i += 1;
-    }
-    i
-}
-
-fn word_left(s: &str, mut i: usize) -> usize {
-    i = prev_boundary(s, i.min(s.len()));
-    while i > 0 && s[i..].chars().next().is_some_and(char::is_whitespace) {
-        i = prev_boundary(s, i);
-    }
-    while i > 0 {
-        let prev = prev_boundary(s, i);
-        if s[prev..].chars().next().is_some_and(char::is_whitespace) {
-            break;
-        }
-        i = prev;
-    }
-    i
-}
+const PASTE_CHIP_CHARS: usize = 120;
+const PASTE_CHIP_LINES: usize = 3;
 
 impl LineEdit {
     fn from_session(session: &Session) -> Self {
@@ -104,7 +72,8 @@ impl LineEdit {
             .collect();
         let idx = history.len();
         Self {
-            input: String::new(),
+            atoms: Vec::new(),
+            chips: Vec::new(),
             cursor: 0,
             history,
             idx,
@@ -114,8 +83,9 @@ impl LineEdit {
     }
 
     fn set_input(&mut self, text: String) {
-        self.input = text;
-        self.cursor = self.input.len();
+        self.chips.clear();
+        self.atoms = text.chars().map(ComposerAtom::Char).collect();
+        self.cursor = self.atoms.len();
     }
 
     fn remember(&mut self, text: &str) {
@@ -125,32 +95,169 @@ impl LineEdit {
     }
 
     fn insert(&mut self, ch: char) {
-        self.input.insert(self.cursor, ch);
-        self.cursor += ch.len_utf8();
+        self.atoms.insert(self.cursor, ComposerAtom::Char(ch));
+        self.cursor += 1;
+    }
+
+    fn paste(&mut self, s: &str) {
+        let s = s.replace("\r\n", "\n").replace('\r', "\n");
+        let cleaned: String = s
+            .chars()
+            .filter(|c| *c == '\n' || !c.is_control())
+            .collect();
+        if cleaned.is_empty() {
+            return;
+        }
+        if is_large_paste(&cleaned) {
+            let index = self.chips.len();
+            self.chips.push(cleaned.clone());
+            self.atoms.insert(
+                self.cursor,
+                ComposerAtom::Chip {
+                    index,
+                    label: paste_chip_label(&cleaned),
+                },
+            );
+            self.cursor += 1;
+            return;
+        }
+        for c in cleaned.chars() {
+            self.insert(c);
+        }
     }
 
     fn backspace(&mut self) {
         if self.cursor == 0 {
             return;
         }
-        let from = prev_boundary(&self.input, self.cursor);
-        self.input.replace_range(from..self.cursor, "");
-        self.cursor = from;
+        self.cursor -= 1;
+        self.remove_at(self.cursor);
     }
 
     fn delete(&mut self) {
-        if self.cursor >= self.input.len() {
+        if self.cursor >= self.atoms.len() {
             return;
         }
-        let to = next_boundary(&self.input, self.cursor);
-        self.input.replace_range(self.cursor..to, "");
+        self.remove_at(self.cursor);
     }
 
     fn kill_word(&mut self) {
-        let from = word_left(&self.input, self.cursor);
-        self.input.replace_range(from..self.cursor, "");
-        self.cursor = from;
+        let from = word_left_atoms(&self.atoms, self.cursor);
+        while self.cursor > from {
+            self.backspace();
+        }
     }
+
+    fn drop_chip(&mut self, index: usize) {
+        let removed_before = self
+            .atoms
+            .iter()
+            .take(self.cursor)
+            .filter(|atom| matches!(atom, ComposerAtom::Chip { index: n, .. } if *n == index))
+            .count();
+        self.atoms.retain(|atom| match atom {
+            ComposerAtom::Chip { index: n, .. } => *n != index,
+            _ => true,
+        });
+        self.chips = remaining_chips(&self.atoms, &self.chips);
+        reindex_chips(&mut self.atoms);
+        self.cursor = self.cursor.saturating_sub(removed_before).min(self.atoms.len());
+    }
+
+    fn remove_at(&mut self, i: usize) {
+        match self.atoms.get(i) {
+            Some(ComposerAtom::Chip { index, .. }) => self.drop_chip(*index),
+            Some(ComposerAtom::Char(_)) => {
+                self.atoms.remove(i);
+            }
+            None => {}
+        }
+    }
+
+    fn text(&self) -> String {
+        let mut out = String::new();
+        for atom in &self.atoms {
+            match atom {
+                ComposerAtom::Char(c) => out.push(*c),
+                ComposerAtom::Chip { index, .. } => {
+                    if let Some(body) = self.chips.get(*index) {
+                        if !out.is_empty() && !out.ends_with('\n') && !body.starts_with('\n') {
+                            out.push('\n');
+                        }
+                        out.push_str(body);
+                        if !body.ends_with('\n') {
+                            out.push('\n');
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[cfg(test)]
+    fn preview(&self) -> String {
+        let mut out = String::new();
+        for atom in &self.atoms {
+            match atom {
+                ComposerAtom::Char(c) => out.push(*c),
+                ComposerAtom::Chip { label, .. } => {
+                    if !out.is_empty() && !out.ends_with(' ') && !out.ends_with('\n') {
+                        out.push(' ');
+                    }
+                    out.push_str(label);
+                    out.push(' ');
+                }
+            }
+        }
+        out
+    }
+
+    fn is_empty(&self) -> bool {
+        self.atoms.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.atoms.clear();
+        self.chips.clear();
+        self.cursor = 0;
+    }
+}
+
+fn is_large_paste(s: &str) -> bool {
+    s.chars().count() >= PASTE_CHIP_CHARS || s.lines().count() > PASTE_CHIP_LINES
+}
+
+fn paste_chip_label(s: &str) -> String {
+    let lines = s.lines().count().max(1);
+    let chars = s.chars().count();
+    if lines > 1 {
+        format!("paste {lines} lines")
+    } else {
+        format!("paste {chars} chars")
+    }
+}
+
+fn word_left_atoms(atoms: &[ComposerAtom], mut i: usize) -> usize {
+    i = i.min(atoms.len());
+    if i == 0 {
+        return 0;
+    }
+    i -= 1;
+    if matches!(atoms[i], ComposerAtom::Chip { .. }) {
+        return i;
+    }
+    while i > 0 && matches!(atoms[i], ComposerAtom::Char(c) if c.is_whitespace()) {
+        i -= 1;
+    }
+    while i > 0 {
+        match atoms[i.saturating_sub(1)] {
+            ComposerAtom::Char(c) if c.is_whitespace() => break,
+            ComposerAtom::Chip { .. } => break,
+            _ => i -= 1,
+        }
+    }
+    i
 }
 
 fn on_event(ui: &mut Ui, edit: &mut LineEdit, ev: CEvent) -> KeyAction {
@@ -158,13 +265,7 @@ fn on_event(ui: &mut Ui, edit: &mut LineEdit, ev: CEvent) -> KeyAction {
         return on_ask(ui, ev);
     }
     if let CEvent::Paste(s) = ev {
-        for c in s.chars() {
-            if c == '\n' || c == '\r' {
-                edit.insert(' ');
-            } else if !c.is_control() {
-                edit.insert(c);
-            }
-        }
+        edit.paste(&s);
         return KeyAction::Skip;
     }
     if let CEvent::Mouse(mouse) = ev {
@@ -228,36 +329,41 @@ fn on_mouse(ui: &mut Ui, mouse: crossterm::event::MouseEvent) -> KeyAction {
     match mouse.kind {
         MouseEventKind::ScrollUp => KeyAction::Scroll(3),
         MouseEventKind::ScrollDown => KeyAction::Scroll(-3),
-        MouseEventKind::Down(MouseButton::Left) => match ui.action_hit(mouse.column, mouse.row) {
-            Some(hit) => KeyAction::Action(hit.index),
-            None => match ui.queue_hit(mouse.column, mouse.row) {
-                Some(QueueHit::Steer(i)) => {
-                    ui.capture_queue_pointer();
-                    KeyAction::QueueSteer(i)
-                }
-                Some(QueueHit::Up(i)) => {
-                    ui.capture_queue_pointer();
-                    KeyAction::QueueUp(i)
-                }
-                Some(QueueHit::Down(i)) => {
-                    ui.capture_queue_pointer();
-                    KeyAction::QueueDown(i)
-                }
-                Some(QueueHit::Edit(i)) => {
-                    ui.capture_queue_pointer();
-                    KeyAction::QueueEdit(i)
-                }
-                Some(QueueHit::Drop(i)) => {
-                    ui.capture_queue_pointer();
-                    KeyAction::QueueDrop(i)
-                }
-                Some(QueueHit::Drag(i)) => {
-                    ui.begin_queue_drag(i);
-                    KeyAction::Skip
-                }
-                None => KeyAction::ClickTools(mouse.column, mouse.row),
-            },
-        },
+        MouseEventKind::Down(MouseButton::Left) => {
+            if let Some(index) = ui.chip_hit(mouse.column, mouse.row) {
+                return KeyAction::DropChip(index);
+            }
+            match ui.action_hit(mouse.column, mouse.row) {
+                Some(hit) => KeyAction::Action(hit.index),
+                None => match ui.queue_hit(mouse.column, mouse.row) {
+                    Some(QueueHit::Steer(i)) => {
+                        ui.capture_queue_pointer();
+                        KeyAction::QueueSteer(i)
+                    }
+                    Some(QueueHit::Up(i)) => {
+                        ui.capture_queue_pointer();
+                        KeyAction::QueueUp(i)
+                    }
+                    Some(QueueHit::Down(i)) => {
+                        ui.capture_queue_pointer();
+                        KeyAction::QueueDown(i)
+                    }
+                    Some(QueueHit::Edit(i)) => {
+                        ui.capture_queue_pointer();
+                        KeyAction::QueueEdit(i)
+                    }
+                    Some(QueueHit::Drop(i)) => {
+                        ui.capture_queue_pointer();
+                        KeyAction::QueueDrop(i)
+                    }
+                    Some(QueueHit::Drag(i)) => {
+                        ui.begin_queue_drag(i);
+                        KeyAction::Skip
+                    }
+                    None => KeyAction::ClickTools(mouse.column, mouse.row),
+                },
+            }
+        }
         MouseEventKind::Drag(_) => {
             if let Some(from) = ui.queue_drag_index() {
                 match ui.queue_hit(mouse.column, mouse.row) {
@@ -326,7 +432,9 @@ fn on_key(edit: &mut LineEdit, ev: CEvent) -> KeyAction {
                 return KeyAction::Skip;
             }
             KeyCode::Char('u') => {
-                edit.input.replace_range(..edit.cursor, "");
+                edit.atoms.drain(..edit.cursor);
+                edit.chips = remaining_chips(&edit.atoms, &edit.chips);
+                reindex_chips(&mut edit.atoms);
                 edit.cursor = 0;
                 return KeyAction::Skip;
             }
@@ -339,11 +447,15 @@ fn on_key(edit: &mut LineEdit, ev: CEvent) -> KeyAction {
         KeyCode::PageDown => KeyAction::Scroll(-8),
         KeyCode::End => KeyAction::ScrollEnd,
         KeyCode::Left => {
-            edit.cursor = prev_boundary(&edit.input, edit.cursor);
+            if edit.cursor > 0 {
+                edit.cursor -= 1;
+            }
             KeyAction::Skip
         }
         KeyCode::Right => {
-            edit.cursor = next_boundary(&edit.input, edit.cursor);
+            if edit.cursor < edit.atoms.len() {
+                edit.cursor += 1;
+            }
             KeyAction::Skip
         }
         KeyCode::Home => {
@@ -359,7 +471,7 @@ fn on_key(edit: &mut LineEdit, ev: CEvent) -> KeyAction {
                 return KeyAction::Skip;
             }
             if edit.idx == edit.history.len() {
-                edit.draft = edit.input.clone();
+                edit.draft = edit.text();
             }
             if edit.idx > 0 {
                 edit.idx -= 1;
@@ -803,12 +915,32 @@ fn sync_queue(ui: &mut Ui, pending: &[Pending]) -> Result<()> {
     ui.set_queue(idle_queue(pending))
 }
 
+fn remaining_chips(atoms: &[ComposerAtom], chips: &[String]) -> Vec<String> {
+    atoms
+        .iter()
+        .filter_map(|atom| match atom {
+            ComposerAtom::Chip { index, .. } => chips.get(*index).cloned(),
+            _ => None,
+        })
+        .collect()
+}
+
+fn reindex_chips(atoms: &mut [ComposerAtom]) {
+    let mut n = 0usize;
+    for atom in atoms {
+        if let ComposerAtom::Chip { index, .. } = atom {
+            *index = n;
+            n += 1;
+        }
+    }
+}
+
 fn take_composer(edit: &mut LineEdit) -> Option<String> {
-    let text = edit.input.trim().to_string();
+    let text = edit.text().trim().to_string();
     if text.is_empty() {
         return None;
     }
-    edit.set_input(String::new());
+    edit.clear();
     edit.remember(&text);
     Some(text)
 }
@@ -911,6 +1043,10 @@ fn move_idle(pending: &mut Vec<Pending>, from: usize, to: usize) -> bool {
     true
 }
 
+fn paint_composer(ui: &mut Ui, edit: &LineEdit) -> Result<()> {
+    ui.set_composer(edit.atoms.clone(), edit.cursor)
+}
+
 fn apply_queue(
     tx: &MailboxTx,
     ui: &mut Ui,
@@ -954,7 +1090,7 @@ fn apply_queue(
                 false
             } else if let Some(idx) = idle_index(pending, i) {
                 if let Some(slot) = edit.queue_slot.take() {
-                    let draft = edit.input.trim().to_string();
+                    let draft = edit.text().trim().to_string();
                     if !draft.is_empty() {
                         set_idle_text(pending, slot, draft);
                     }
@@ -997,7 +1133,7 @@ fn apply_queue(
             *action,
             KeyAction::QueueEdit(_) | KeyAction::QueueSteer(_) | KeyAction::QueueDrop(_)
         ) {
-            ui.set_input(&edit.input, edit.cursor)?;
+            paint_composer(ui, edit)?;
         }
         if let KeyAction::QueueMove { to, .. } = *action {
             ui.begin_queue_drag(to);
@@ -1189,7 +1325,7 @@ fn apply_ui(ui: &mut Ui, edit: &LineEdit, action: KeyAction) -> Result<KeyAction
     match action {
         KeyAction::Skip => {
             if !ui.asking() {
-                ui.set_input(&edit.input, edit.cursor)?;
+                paint_composer(ui, edit)?;
             }
             Ok(KeyAction::Skip)
         }
@@ -1222,6 +1358,12 @@ fn apply_ui(ui: &mut Ui, edit: &LineEdit, action: KeyAction) -> Result<KeyAction
             if let Some(text) = ui.selected_text() {
                 copy_text(&text);
                 ui.flash_copied()?;
+            }
+            Ok(KeyAction::Skip)
+        }
+        KeyAction::DropChip(_) => {
+            if !ui.asking() {
+                paint_composer(ui, edit)?;
             }
             Ok(KeyAction::Skip)
         }
@@ -1277,7 +1419,7 @@ async fn run_tui(
         replay(ui, &agent.session)
     })?;
     ui.set_working(false)?;
-    ui.set_input(&edit.input, edit.cursor)?;
+    paint_composer(&mut ui, &edit)?;
     let mut tick = tokio::time::interval(Duration::from_millis(80));
     loop {
         tokio::select! {
@@ -1292,6 +1434,9 @@ async fn run_tui(
                     continue;
                 }
                 let action = on_event(&mut ui, &mut edit, ev);
+                if let KeyAction::DropChip(i) = action {
+                    edit.drop_chip(i);
+                }
                 if apply_queue(&tx, &mut ui, &mut edit, &mut pending, &action)? {
                     continue;
                 }
@@ -1334,7 +1479,7 @@ async fn run_tui(
                         }
                         refresh_bar(&mut ui, &status)?;
                         ui.set_working(false)?;
-                        ui.set_input(&edit.input, edit.cursor)?;
+                        paint_composer(&mut ui, &edit)?;
                     }
                     action @ (KeyAction::Action(_)
                     | KeyAction::Confirm
@@ -1356,7 +1501,7 @@ async fn run_tui(
                         take_idle_slot(&mut pending, edit.queue_slot.take());
                         ui.set_queue_edit(None);
                         sync_queue(&mut ui, &pending)?;
-                        ui.set_input(&edit.input, edit.cursor)?;
+                        paint_composer(&mut ui, &edit)?;
                         ui.set_working(true)?;
                         paint(&mut ui, &LogLine::User(text.clone()))?;
                         if run_turn(
@@ -1376,7 +1521,7 @@ async fn run_tui(
                         }
                         refresh_bar(&mut ui, &status)?;
                         ui.set_working(false)?;
-                        ui.set_input(&edit.input, edit.cursor)?;
+                        paint_composer(&mut ui, &edit)?;
                     }
                     _ => {}
                 }
@@ -1417,6 +1562,9 @@ async fn run_turn(
                     continue;
                 }
                 let action = on_event(ui, edit, ev);
+                if let KeyAction::DropChip(i) = action {
+                    edit.drop_chip(i);
+                }
                 if apply_queue(tx, ui, edit, pending, &action)? {
                     continue;
                 }
@@ -1459,7 +1607,7 @@ async fn run_turn(
                         restore_pending(edit, pending);
                         ui.set_queue_edit(None);
                         sync_queue(ui, pending)?;
-                        ui.set_input(&edit.input, edit.cursor)?;
+                        paint_composer(ui, edit)?;
                         tx.abort();
                         (&mut fut).await?;
                         flush_log(ui, status, pending, log_rx)?;
@@ -1470,7 +1618,7 @@ async fn run_turn(
                             enqueue(tx, pending, text, &mut edit.queue_slot);
                             ui.set_queue_edit(None);
                             sync_queue(ui, pending)?;
-                            ui.set_input(&edit.input, edit.cursor)?;
+                            paint_composer(ui, edit)?;
                         }
                     }
                     KeyAction::Interrupt => {
@@ -1480,7 +1628,7 @@ async fn run_turn(
                             tx.interrupt(text);
                             ui.set_queue_edit(None);
                             sync_queue(ui, pending)?;
-                            ui.set_input(&edit.input, edit.cursor)?;
+                            paint_composer(ui, edit)?;
                         }
                     }
                     _ => {}
@@ -1500,10 +1648,10 @@ fn restore_pending(edit: &mut LineEdit, pending: &mut Vec<Pending>) {
         .map(|p| p.text().to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    if edit.input.is_empty() {
+    if edit.is_empty() {
         edit.set_input(restored);
     } else {
-        edit.set_input(format!("{}\n{restored}", edit.input));
+        edit.set_input(format!("{}\n{restored}", edit.text()));
     }
 }
 
@@ -1624,6 +1772,59 @@ mod tests {
             .iter()
             .map(|t| Pending::Idle((*t).into()))
             .collect()
+    }
+
+    #[test]
+    fn paste_keeps_newlines() {
+        let mut edit = LineEdit {
+            atoms: Vec::new(),
+            chips: Vec::new(),
+            cursor: 0,
+            history: Vec::new(),
+            idx: 0,
+            draft: String::new(),
+            queue_slot: None,
+        };
+        edit.paste("hello\r\nworld\n!");
+        assert_eq!(edit.text(), "hello\nworld\n!");
+        edit.paste("next");
+        assert_eq!(edit.text(), "hello\nworld\n!next");
+        edit.set_input(String::new());
+        edit.paste("one\ntwo");
+        assert_eq!(edit.text(), "one\ntwo");
+        let text = take_composer(&mut edit).unwrap();
+        assert_eq!(text, "one\ntwo");
+        assert!(edit.is_empty());
+    }
+
+    #[test]
+    fn large_paste_becomes_chip() {
+        let mut edit = LineEdit {
+            atoms: Vec::new(),
+            chips: Vec::new(),
+            cursor: 0,
+            history: Vec::new(),
+            idx: 0,
+            draft: String::new(),
+            queue_slot: None,
+        };
+        edit.paste("hi ");
+        edit.paste("line1\nline2\nline3\nline4");
+        assert_eq!(edit.chips.len(), 1);
+        assert!(matches!(
+            edit.atoms.last(),
+            Some(ComposerAtom::Chip { index: 0, .. })
+        ));
+        assert!(edit.preview().contains("paste 4 lines"));
+        assert_eq!(
+            edit.text(),
+            "hi \nline1\nline2\nline3\nline4\n"
+        );
+        edit.drop_chip(0);
+        assert!(edit.chips.is_empty());
+        assert_eq!(edit.text(), "hi ");
+        let sent = take_composer(&mut edit).unwrap();
+        assert_eq!(sent, "hi");
     }
 
     #[test]

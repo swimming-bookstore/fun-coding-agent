@@ -107,11 +107,13 @@ pub(crate) struct Property {
     pub required: bool,
 }
 
+type ToolFn = fn(&Path, &Value, &Abort) -> Result<String>;
+
 pub(crate) struct Tool {
     pub name: &'static str,
     pub description: &'static str,
     pub properties: &'static [Property],
-    pub execute: Option<fn(&Path, &Value, &Abort) -> Result<String>>,
+    pub execute: Option<ToolFn>,
 }
 
 fn resolve_path(workspace: &Path, path: &str) -> Result<PathBuf> {
