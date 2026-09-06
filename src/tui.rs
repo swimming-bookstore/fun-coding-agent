@@ -4,7 +4,7 @@
 //!   body      scrollback (user, agent, tools)
 //!   think     live reasoning (boxed)
 //!   interrupt stop-now prompts (one-line strip)
-//!   steer     after-this-step prompts (one-line strip)
+//!   steer     after-this-step prompts (boxed)
 //!   queue     idle prompts for after this turn (boxed)
 //!   actions   pull / commit chips above the composer
 //!   composer
@@ -17,8 +17,8 @@
 //!   click send now / edit / move up / move down / cancel  on a queued prompt
 
 
-use crate::agent::{tool_counts, tool_summary, ToolRun};
-use crate::config::{Action, ActionColor, ActionWhen, Palette};
+use fun_core::agent::{tool_counts, tool_summary, ToolRun};
+use fun_core::config::{Action, ActionColor, ActionWhen, Palette};
 use crate::ui::{
     split, Block, Buffer, Color, Constraint, Rect, Style, Terminal,
 };
@@ -86,44 +86,52 @@ fn actions() -> Vec<Action> {
     ACTIONS.with(|c| c.borrow().clone())
 }
 
+fn rgb_color(c: fun_core::config::Rgb) -> Color {
+    Color::Rgb { r: c.r, g: c.g, b: c.b }
+}
+
 fn col(c: Color) -> Style {
     Style::new().fg(c)
 }
 
+fn pal_col(c: fun_core::config::Rgb) -> Style {
+    col(rgb_color(c))
+}
+
 fn muted() -> Style {
-    col(pal().muted)
+    pal_col(pal().muted)
 }
 
 fn accent() -> Style {
-    col(pal().accent)
+    pal_col(pal().accent)
 }
 
 fn user_col() -> Style {
-    col(pal().user)
+    pal_col(pal().user)
 }
 
 fn agent_col() -> Style {
-    col(pal().agent)
+    pal_col(pal().agent)
 }
 
 fn tool_col() -> Style {
-    col(pal().tool)
+    pal_col(pal().tool)
 }
 
 fn err_col() -> Style {
-    col(pal().error)
+    pal_col(pal().error)
 }
 
 fn ok_col() -> Style {
-    col(pal().ok)
+    pal_col(pal().ok)
 }
 
 fn code_col() -> Style {
-    col(pal().code)
+    pal_col(pal().code)
 }
 
 fn think_col() -> Style {
-    col(pal().think).italic()
+    pal_col(pal().think).italic()
 }
 
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -780,12 +788,18 @@ impl Ui {
     pub fn delta(&mut self, text: &str) -> Result<()> {
         self.dismiss_think();
         self.partial.push_str(&sanitize(text));
+        if self.working {
+            return Ok(());
+        }
         self.redraw()
     }
 
     pub fn think(&mut self, text: &str) -> Result<()> {
         self.think_hide_at = None;
         self.think.push_str(&sanitize(text));
+        if self.working {
+            return Ok(());
+        }
         self.redraw()
     }
 
@@ -906,7 +920,7 @@ impl Ui {
             room = room.saturating_sub(think_h);
             let interrupt_h = if interrupts.is_empty() || room == 0 { 0 } else { 1 };
             room = room.saturating_sub(interrupt_h);
-            let steer_h = if steers.is_empty() || room == 0 { 0 } else { 1 };
+            let steer_h = notice_height(steers, room);
             room = room.saturating_sub(steer_h);
             let queue_h = queue_height(queue, room);
             room = room.saturating_sub(queue_h);
@@ -953,7 +967,7 @@ impl Ui {
                 i += 1;
             }
             if steer_h > 0 {
-                notice_strip(buf, parts[i], "send now", accent().bold(), steers);
+                notice_panel(buf, parts[i], "send now", accent(), accent().bold(), steers);
                 i += 1;
             }
             if queue_h > 0 {
@@ -1069,11 +1083,11 @@ fn status_rows(
     if let Some(branch) = &bar.branch {
         push_item(&mut ident, branch, user_col());
     }
-    let add_stat = |out: &mut Vec<(String, Style)>, label: &str, value: &str, color: Color| {
+    let add_stat = |out: &mut Vec<(String, Style)>, label: &str, value: &str, color: fun_core::config::Rgb| {
         if value.is_empty() {
             return;
         }
-        push_item(out, &format!("{label} {value}"), col(color));
+        push_item(out, &format!("{label} {value}"), pal_col(color));
     };
     add_stat(&mut stats, "input tokens", &bar.input, pal().text);
     add_stat(&mut stats, "output tokens", &bar.output, pal().ok);
@@ -1318,7 +1332,7 @@ fn paint_ask(buf: &mut Buffer, screen: Rect, ask: &AskDialog) -> (u16, u16) {
         (field.x, field.y)
     } else {
         let (shown, cur) = visible_input(&ask.value, ask.cursor, max);
-        buf.write(field, field.x, field.y, &shown, col(pal().text));
+        buf.write(field, field.x, field.y, &shown, pal_col(pal().text));
         (field.x.saturating_add(cur as u16), field.y)
     };
     if inner.height > 3 {
@@ -1368,7 +1382,7 @@ fn action_style(color: ActionColor) -> Style {
         ActionColor::Agent => agent_col().bold(),
         ActionColor::Tool => tool_col().bold(),
         ActionColor::Muted => muted().bold(),
-        ActionColor::Text => col(pal().text).bold(),
+        ActionColor::Text => pal_col(pal().text).bold(),
         ActionColor::Error => err_col().bold(),
         ActionColor::Accent => accent().bold(),
     }
@@ -1523,7 +1537,7 @@ fn paint_select(
                 true
             };
             if hit {
-                buf.put(x, y, cell.ch, cell.style.bg(pal().select));
+                buf.put(x, y, cell.ch, cell.style.bg(rgb_color(pal().select)));
             }
             x = x.saturating_add(w.max(1));
         }
@@ -1691,7 +1705,7 @@ fn think_panel(buf: &mut Buffer, area: Rect, think: &str) {
         return;
     }
     Block::new()
-        .border(col(pal().think_border))
+        .border(pal_col(pal().think_border))
         .title("thinking", think_col().bold())
         .render(buf, area);
     let inner = Block::inner(area);
@@ -1816,6 +1830,25 @@ fn notice_strip(buf: &mut Buffer, area: Rect, label: &str, label_style: Style, i
     let y = area.y;
     let mut x = area.x.saturating_add(1);
     x = buf.write(area, x, y, &format!("{label}  "), label_style);
+    write_notice_line(buf, area, x, y, items, label_style);
+}
+
+fn notice_height(items: &[String], room: u16) -> u16 {
+    if items.is_empty() || room < 3 {
+        0
+    } else {
+        3.min(room)
+    }
+}
+
+fn write_notice_line(
+    buf: &mut Buffer,
+    area: Rect,
+    x: u16,
+    y: u16,
+    items: &[String],
+    count_style: Style,
+) {
     let preview = items[0].replace('\n', " ");
     let n = items.len();
     let count = if n > 1 {
@@ -1829,13 +1862,44 @@ fn notice_strip(buf: &mut Buffer, area: Rect, label: &str, label_style: Style, i
         .saturating_sub(x)
         .saturating_sub(count_w as u16)
         .saturating_sub(1) as usize;
-    buf.write(area, x, y, &clip_width(&preview, max), col(pal().text));
+    buf.write(area, x, y, &clip_width(&preview, max), pal_col(pal().text));
     if !count.is_empty() {
         let cx = area.right().saturating_sub(count_w as u16).saturating_sub(1);
         if cx > x {
-            buf.write(area, cx, y, &count, label_style);
+            buf.write(area, cx, y, &count, count_style);
         }
     }
+}
+
+fn notice_panel(
+    buf: &mut Buffer,
+    area: Rect,
+    title: &str,
+    border: Style,
+    title_style: Style,
+    items: &[String],
+) {
+    if area.is_empty() || items.is_empty() {
+        return;
+    }
+    Block::new()
+        .border(border)
+        .title(title, title_style)
+        .render(buf, area);
+    let inner = Block::inner(area);
+    if inner.is_empty() {
+        return;
+    }
+    let inner = Rect {
+        x: inner.x.saturating_add(1),
+        y: inner.y,
+        width: inner.width.saturating_sub(2),
+        height: inner.height,
+    };
+    if inner.is_empty() {
+        return;
+    }
+    write_notice_line(buf, inner, inner.x, inner.y, items, title_style);
 }
 
 fn queue_panel(
@@ -1868,21 +1932,21 @@ fn queue_panel(
         if hot {
             let mut x = inner.x;
             while x < inner.right() {
-                buf.put(x, y, ' ', Style::new().bg(pal().queue));
+                buf.put(x, y, ' ', Style::new().bg(rgb_color(pal().queue)));
                 x = x.saturating_add(1);
             }
         }
         let num = if editing_here {
-            user_col().bold().bg(pal().queue)
+            user_col().bold().bg(rgb_color(pal().queue))
         } else if hot {
-            tool_col().bold().bg(pal().queue)
+            tool_col().bold().bg(rgb_color(pal().queue))
         } else {
             muted()
         };
         let text = if hot {
-            col(pal().text).bold().bg(pal().queue)
+            pal_col(pal().text).bold().bg(rgb_color(pal().queue))
         } else {
-            col(pal().text)
+            pal_col(pal().text)
         };
         let mut x = inner.x;
         x = buf.write(inner, x, y, &format!("{}. ", i + 1), num);
@@ -1899,7 +1963,7 @@ fn queue_panel(
         let later_style = if i + 1 == n { muted() } else { tool_col() };
         for (k, (label, kind)) in QUEUE_CTRLS.iter().enumerate() {
             let gap = if k == 0 { " " } else { "  " };
-            let gap_style = if hot { muted().bg(pal().queue) } else { muted() };
+            let gap_style = if hot { muted().bg(rgb_color(pal().queue)) } else { muted() };
             cx = buf.write(inner, cx, y, gap, gap_style);
             let style = match kind {
                 QueueCtrl::Steer => accent(),
@@ -1908,7 +1972,7 @@ fn queue_panel(
                 QueueCtrl::Edit => user_col(),
                 QueueCtrl::Remove => err_col(),
             };
-            let style = if hot { style.bold().bg(pal().queue) } else { style };
+            let style = if hot { style.bold().bg(rgb_color(pal().queue)) } else { style };
             cx = buf.write(inner, cx, y, label, style);
         }
     }
@@ -2100,7 +2164,9 @@ fn composer_view(atoms: &[ComposerAtom], cursor: usize, max: usize) -> ComposerV
                 if lines.last().is_some_and(|l| l.width + cw > max && l.width > 0) {
                     newline(&mut lines);
                 }
-                let line = lines.last_mut().expect("composer line");
+                let Some(line) = lines.last_mut() else {
+                    continue;
+                };
                 let ch = c.to_string();
                 if let Some(last) = line.pieces.last_mut()
                     && last.chip.is_none()
@@ -2122,10 +2188,12 @@ fn composer_view(atoms: &[ComposerAtom], cursor: usize, max: usize) -> ComposerV
                 if lines.last().is_some_and(|l| l.width + tw > max && l.width > 0) {
                     newline(&mut lines);
                 }
-                let line = lines.last_mut().expect("composer line");
+                let Some(line) = lines.last_mut() else {
+                    continue;
+                };
                 line.pieces.push(ComposerPiece {
                     text,
-                    style: col(pal().text).bg(pal().queue),
+                    style: pal_col(pal().text).bg(rgb_color(pal().queue)),
                     chip: Some(*index),
                 });
                 line.width += tw;
@@ -2663,7 +2731,7 @@ impl Md {
             if indent > 0 {
                 prefix.push(Span::new(" ".repeat(indent), Style::new()));
             }
-            prefix.push(Span::new(marker, col(pal().text)));
+            prefix.push(Span::new(marker, pal_col(pal().text)));
         } else if !self.lists.is_empty() {
             hang = self.indent() + 2;
             let pad = self.indent() + 2;
@@ -2748,9 +2816,9 @@ impl Md {
                 self.flush_line();
                 blank_after(&mut self.out);
                 let style = match level as u8 {
-                    1 => col(pal().text).bold().underline(),
+                    1 => pal_col(pal().text).bold().underline(),
                     2 => accent().bold(),
-                    _ => col(pal().text).bold(),
+                    _ => pal_col(pal().text).bold(),
                 };
                 self.push_style(style);
             }
@@ -3397,15 +3465,15 @@ mod tests {
     fn pull_master_sits_above_composer() {
         let area = Rect::new(0, 19, 80, 1);
         assert_eq!(
-            crate::config::fill_action("checkout and pull {home}", Some("master"), None, None).as_deref(),
+            fun_core::config::fill_action("checkout and pull {home}", Some("master"), None, None).as_deref(),
             Some("checkout and pull master")
         );
         assert_eq!(
-            crate::config::fill_action(&Action::defaults()[0].label, Some("master"), None, None).as_deref(),
+            fun_core::config::fill_action(&Action::defaults()[0].label, Some("master"), None, None).as_deref(),
             Some("[ checkout and pull master ]")
         );
         assert_eq!(
-            crate::config::fill_action(&Action::defaults()[0].label, Some("main"), None, None).as_deref(),
+            fun_core::config::fill_action(&Action::defaults()[0].label, Some("main"), None, None).as_deref(),
             Some("[ checkout and pull main ]")
         );
         assert_eq!(

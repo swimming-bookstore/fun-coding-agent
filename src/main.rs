@@ -1,27 +1,21 @@
-mod agent;
-mod config;
-mod grok;
-mod session;
-mod tool;
 mod tui;
 mod ui;
 
-use agent::{mailbox, print_log, prompt, tool_fail, tool_ok, Agent, LogLine, MailboxTx, ToolRun};
+use fun_core::agent::{mailbox, print_log, prompt, tool_fail, tool_ok, Agent, LogLine, MailboxTx, ToolRun};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use crossterm::event::{
     self, Event as CEvent, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
-use grok::{login, logout, Grok};
-use session::{empty_args, list_sessions, Call, Entry, Session, Usage};
+use fun_core::grok::{login, logout, Grok};
+use fun_core::session::{empty_args, list_sessions, Call, Entry, Session, Usage};
 use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tool::get_tools;
+use fun_core::tool::get_tools;
 use tui::{Bar, ComposerAtom, QueueHit, Queued, Ui};
 
 enum KeyAction {
@@ -1284,27 +1278,24 @@ fn copy_osc52(text: &str) {
     let _ = out.flush();
 }
 
-fn clipboard_slot() -> &'static Mutex<Option<arboard::Clipboard>> {
-    static CLIPBOARD: OnceLock<Mutex<Option<arboard::Clipboard>>> = OnceLock::new();
-    CLIPBOARD.get_or_init(|| Mutex::new(None))
+thread_local! {
+    static CLIPBOARD: std::cell::RefCell<Option<arboard::Clipboard>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn copy_system(text: &str) -> bool {
-    for _ in 0..2 {
-        if copy_system_once(text).is_ok() {
-            return true;
+    CLIPBOARD.with(|slot| {
+        for _ in 0..2 {
+            if copy_system_once(&mut slot.borrow_mut(), text).is_ok() {
+                return true;
+            }
+            *slot.borrow_mut() = None;
         }
-        if let Ok(mut slot) = clipboard_slot().lock() {
-            *slot = None;
-        }
-    }
-    false
+        false
+    })
 }
 
-fn copy_system_once(text: &str) -> Result<()> {
-    let mut slot = clipboard_slot()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+fn copy_system_once(slot: &mut Option<arboard::Clipboard>, text: &str) -> Result<()> {
     if slot.is_none() {
         *slot = Some(arboard::Clipboard::new()?);
     }
@@ -1449,7 +1440,7 @@ async fn run_tui(
                             continue;
                         };
                         ui.close_ask()?;
-                        let Some(text) = crate::config::fill_action(
+                        let Some(text) = fun_core::config::fill_action(
                             &template,
                             status.pull.as_deref(),
                             status.branch.as_deref(),
@@ -1576,7 +1567,7 @@ async fn run_turn(
                     KeyAction::AskSubmit => {
                         if let Some((template, origin)) = ui.take_ask() {
                             ui.close_ask()?;
-                            if let Some(text) = crate::config::fill_action(
+                            if let Some(text) = fun_core::config::fill_action(
                                 &template,
                                 status.pull.as_deref(),
                                 status.branch.as_deref(),
@@ -1709,7 +1700,7 @@ fn open_session(cli: &Cli, workspace: &Path) -> Result<Session> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let cfg = config::load();
+    let cfg = fun_core::config::load();
     tui::set_palette(cfg.palette);
     tui::set_actions(cfg.actions);
     tui::set_home(cfg.home);
@@ -1935,7 +1926,7 @@ mod tests {
 
     #[test]
     fn commit_chip_opens_new_branch() {
-        tui::set_actions(crate::config::Action::defaults());
+        tui::set_actions(fun_core::config::Action::defaults());
         tui::set_origin(true);
         let on_home = Status {
             workspace: PathBuf::from("."),
@@ -1975,7 +1966,7 @@ mod tests {
             )
         );
         assert_eq!(
-            crate::config::fill_action(
+            fun_core::config::fill_action(
                 action_ask(&KeyAction::Action(1), &no_git).as_deref().unwrap(),
                 no_git.pull.as_deref(),
                 no_git.branch.as_deref(),

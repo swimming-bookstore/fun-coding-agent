@@ -10,7 +10,6 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex;
 
 const XAI_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
 const XAI_SCOPE: &str = "openid profile email offline_access grok-cli:access api:access";
@@ -19,11 +18,6 @@ const XAI_TOKEN_URL: &str = "https://auth.x.ai/oauth2/token";
 const REFRESH_SKEW_MS: u64 = 5 * 60 * 1000;
 const MIN_TTL_MS: u64 = 30 * 1000;
 const OAUTH_TIMEOUT: Duration = Duration::from_secs(30);
-
-fn auth_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
 
 static AUTH_PATH: OnceLock<PathBuf> = OnceLock::new();
 
@@ -287,7 +281,6 @@ fn still_fresh(t: &OAuthTokens) -> bool {
 }
 
 struct AuthGuard {
-    _mem: tokio::sync::MutexGuard<'static, ()>,
     _file: Option<std::fs::File>,
 }
 
@@ -318,11 +311,10 @@ fn lock_auth_file() -> Result<Option<std::fs::File>> {
 }
 
 async fn lock_auth() -> Result<AuthGuard> {
-    let mem = auth_lock().lock().await;
     let file = tokio::task::spawn_blocking(lock_auth_file)
         .await
         .context("auth lock")??;
-    Ok(AuthGuard { _mem: mem, _file: file })
+    Ok(AuthGuard { _file: file })
 }
 
 async fn refresh_tokens(refresh: &str) -> Result<OAuthTokens> {

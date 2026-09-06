@@ -49,28 +49,34 @@
 //! }
 //! ```
 
-use crate::ui::Color;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Rgb {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
 #[derive(Clone, Copy)]
 pub struct Palette {
-    pub text: Color,
-    pub muted: Color,
-    pub accent: Color,
-    pub user: Color,
-    pub agent: Color,
-    pub tool: Color,
-    pub ok: Color,
-    pub error: Color,
-    pub code: Color,
-    pub select: Color,
-    pub queue: Color,
-    pub think: Color,
-    pub think_border: Color,
+    pub text: Rgb,
+    pub muted: Rgb,
+    pub accent: Rgb,
+    pub user: Rgb,
+    pub agent: Rgb,
+    pub tool: Rgb,
+    pub ok: Rgb,
+    pub error: Rgb,
+    pub code: Rgb,
+    pub select: Rgb,
+    pub queue: Rgb,
+    pub think: Rgb,
+    pub think_border: Rgb,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -284,8 +290,8 @@ struct ColorFile {
     think_border: Option<String>,
 }
 
-fn rgb(r: u8, g: u8, b: u8) -> Color {
-    Color::Rgb { r, g, b }
+fn rgb(r: u8, g: u8, b: u8) -> Rgb {
+    Rgb { r, g, b }
 }
 
 fn config_path() -> Result<PathBuf> {
@@ -421,14 +427,14 @@ impl ColorFile {
     }
 }
 
-fn overlay(slot: &mut Color, value: Option<String>, key: &str) -> Result<()> {
+fn overlay(slot: &mut Rgb, value: Option<String>, key: &str) -> Result<()> {
     if let Some(s) = value {
         *slot = parse_color(&s).with_context(|| format!("{key}: {s}"))?;
     }
     Ok(())
 }
 
-fn parse_color(s: &str) -> Result<Color> {
+fn parse_color(s: &str) -> Result<Rgb> {
     let s = s.trim();
     let hex = s.strip_prefix('#').unwrap_or(s);
     let n = hex.len();
@@ -467,11 +473,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn rgb_of(c: Color) -> Option<(u8, u8, u8)> {
-        match c {
-            Color::Rgb { r, g, b } => Some((r, g, b)),
-            _ => None,
-        }
+    fn rgb_of(c: Rgb) -> Option<(u8, u8, u8)> {
+        Some((c.r, c.g, c.b))
     }
 
     #[test]

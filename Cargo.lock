@@ -287,14 +287,26 @@ dependencies = [
  "arboard",
  "clap",
  "crossterm",
- "libc",
+ "fun-core",
  "provider-grok",
  "pulldown-cmark",
- "reqwest",
  "serde",
  "serde_json",
  "tokio",
  "unicode-width",
+]
+
+[[package]]
+name = "fun-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "provider-grok",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
  "uuid",
 ]
 

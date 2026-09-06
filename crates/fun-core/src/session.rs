@@ -7,29 +7,29 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub(crate) fn empty_args() -> Value {
+pub fn empty_args() -> Value {
     Value::Object(serde_json::Map::default())
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct Call {
+pub struct Call {
     pub id: String,
     pub name: String,
     #[serde(default = "empty_args")]
     pub args: Value,
 }
 
-#[derive(Serialize, Deserialize)]
-pub(crate) struct ToolResult {
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ToolResult {
     pub id: String,
     pub name: String,
     pub content: String,
     pub is_error: bool,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
-pub(crate) enum Entry {
+pub enum Entry {
     User { text: String },
     Assistant {
         text: String,
@@ -111,7 +111,7 @@ fn jsonl_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Usage {
+pub struct Usage {
     #[serde(default)]
     pub input_tokens: u64,
     #[serde(default)]
@@ -210,10 +210,25 @@ fn append_json(path: &Path, value: &impl Serialize) -> Result<()> {
         .with_context(|| format!("write session {}", path.display()))
 }
 
-pub(crate) struct Session {
+#[derive(Clone)]
+pub struct Session {
     pub entries: Vec<Entry>,
     pub path: PathBuf,
     pub usage: Usage,
+}
+
+#[derive(Clone)]
+pub struct SessionInfo {
+    pub path: PathBuf,
+    pub title: String,
+    pub n: usize,
+    pub workspace: PathBuf,
+}
+
+#[derive(Clone)]
+pub struct WorkspaceGroup {
+    pub workspace: PathBuf,
+    pub chats: Vec<SessionInfo>,
 }
 
 impl Session {
@@ -289,6 +304,124 @@ impl Session {
             .transpose()
     }
 
+    pub fn latest_file(workspace: &Path) -> Result<Option<PathBuf>> {
+        Ok(jsonl_files(&sessions_dir(workspace)?).pop())
+    }
+
+    pub fn summaries(workspace: &Path) -> Result<Vec<SessionInfo>> {
+        let mut out = Vec::new();
+        for path in jsonl_files(&sessions_dir(workspace)?).into_iter().rev() {
+            let mut title = String::new();
+            let mut n = 0usize;
+            if let Ok(text) = fs::read_to_string(&path) {
+                for line in text.lines() {
+                    if let Ok(e) = serde_json::from_str::<Entry>(line) {
+                        n += 1;
+                        if let Entry::User { text } = e {
+                            title = text.chars().take(72).collect();
+                        }
+                    }
+                }
+            }
+            if title.is_empty() {
+                title = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("session")
+                    .into();
+            }
+            out.push(SessionInfo {
+                path,
+                title,
+                n,
+                workspace: workspace.to_path_buf(),
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn all_groups() -> Result<Vec<WorkspaceGroup>> {
+        let root = data_dir()?.join("sessions");
+        let mut groups = Vec::new();
+        let Ok(rd) = fs::read_dir(&root) else {
+            return Ok(groups);
+        };
+        let mut dirs: Vec<_> = rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+        dirs.sort();
+        for dir in dirs {
+            let mut chats = Vec::new();
+            let mut workspace = PathBuf::new();
+            for path in jsonl_files(&dir).into_iter().rev() {
+                let mut title = String::new();
+                let mut n = 0usize;
+                if let Ok(text) = fs::read_to_string(&path) {
+                    for line in text.lines() {
+                        if workspace.as_os_str().is_empty() {
+                            if let Ok(h) = serde_json::from_str::<DiskHeader>(line)
+                                && (h.kind == "header" || h.kind.is_empty())
+                                && !h.cwd.is_empty()
+                            {
+                                workspace = PathBuf::from(&h.cwd);
+                            }
+                        }
+                        if let Ok(e) = serde_json::from_str::<Entry>(line) {
+                            n += 1;
+                            if let Entry::User { text } = e {
+                                title = text.chars().take(72).collect();
+                            }
+                        }
+                    }
+                }
+                if title.trim().is_empty() {
+                    title = "New chat".into();
+                }
+                chats.push(SessionInfo {
+                    path,
+                    title,
+                    n,
+                    workspace: workspace.clone(),
+                });
+            }
+            if workspace.as_os_str().is_empty() {
+                workspace = PathBuf::from(dir.file_name().unwrap_or_default());
+            }
+            if !chats.is_empty() {
+                groups.push(WorkspaceGroup { workspace, chats });
+            }
+        }
+        groups.sort_by(|a, b| {
+            repo_name(&a.workspace)
+                .to_lowercase()
+                .cmp(&repo_name(&b.workspace).to_lowercase())
+        });
+        Ok(groups)
+    }
+
+    pub fn groups_for(workspaces: &[PathBuf]) -> Result<Vec<WorkspaceGroup>> {
+        let all = Self::all_groups()?;
+        let mut out = Vec::new();
+        for ws in workspaces {
+            let canon = ws.canonicalize().unwrap_or_else(|_| ws.clone());
+            if let Some(mut g) = all
+                .iter()
+                .find(|g| {
+                    g.workspace.canonicalize().unwrap_or_else(|_| g.workspace.clone()) == canon
+                        || g.workspace == *ws
+                })
+                .cloned()
+            {
+                g.workspace = ws.clone();
+                out.push(g);
+            } else {
+                out.push(WorkspaceGroup {
+                    workspace: ws.clone(),
+                    chats: Vec::new(),
+                });
+            }
+        }
+        Ok(out)
+    }
+
     pub fn add(&mut self, e: Entry) -> Result<()> {
         append_json(&self.path, &e)?;
         self.entries.push(e);
@@ -307,7 +440,15 @@ impl Session {
     }
 }
 
-pub(crate) fn list_sessions(workspace: &Path) -> Result<()> {
+fn repo_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| path.to_str().unwrap_or("folder"))
+        .to_string()
+}
+
+pub fn list_sessions(workspace: &Path) -> Result<()> {
     let files = jsonl_files(&sessions_dir(workspace)?);
     if files.is_empty() {
         println!("no sessions yet");

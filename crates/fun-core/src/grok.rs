@@ -150,7 +150,7 @@ struct WirePart {
     text: Option<String>,
 }
 
-pub(crate) struct Reply {
+pub struct Reply {
     pub text: String,
     pub thinking: String,
     pub calls: Vec<Call>,
@@ -221,15 +221,15 @@ fn tool_def(tool: &Tool) -> WireTool {
     }
 }
 
-pub(crate) struct Grok {
+#[derive(Clone)]
+pub struct Grok {
     base_url: String,
     http: reqwest::Client,
     pub effort: String,
 }
 
 impl Grok {
-    pub async fn from_env() -> Result<(Self, String)> {
-        provider_grok::bearer().await.map_err(auth_err)?;
+    pub async fn client() -> Result<(Self, String)> {
         let base_url = env_or("FUN_CODING_AGENT_BASE_URL", "https://api.x.ai/v1");
         let model = env_or("FUN_CODING_AGENT_MODEL", "grok-4.6");
         let effort = reasoning_effort();
@@ -248,6 +248,11 @@ impl Grok {
             },
             model,
         ))
+    }
+
+    pub async fn from_env() -> Result<(Self, String)> {
+        provider_grok::bearer().await.map_err(auth_err)?;
+        Self::client().await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -731,11 +736,11 @@ fn parse_response(v: WireResponse) -> Reply {
     }
 }
 
-pub(crate) async fn login() -> Result<()> {
+pub async fn login() -> Result<()> {
     provider_grok::login().await
 }
 
-pub(crate) async fn logout() -> Result<()> {
+pub async fn logout() -> Result<()> {
     if provider_grok::logout().await? {
         println!("logged out");
     } else {
