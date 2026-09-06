@@ -194,7 +194,8 @@ fn format_bash_output(stdout: &[u8], stderr: &[u8], status: std::process::ExitSt
 }
 
 fn bash_command(workspace: &Path, cmd: &str) -> tokio::process::Command {
-    let mut child = tokio::process::Command::new("sh");
+    // Absolute path: iOS app PATH often does not include `sh`.
+    let mut child = tokio::process::Command::new("/bin/sh");
     child
         .arg("-c")
         .arg(cmd)
@@ -205,6 +206,7 @@ fn bash_command(workspace: &Path, cmd: &str) -> tokio::process::Command {
         // Keep password helpers from talking to the TUI.
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("SSH_ASKPASS_REQUIRE", "never")
+        .env("PATH", bash_path())
         .env_remove("GIT_ASKPASS")
         .env_remove("SSH_ASKPASS")
         .env_remove("SUDO_ASKPASS")
@@ -213,8 +215,17 @@ fn bash_command(workspace: &Path, cmd: &str) -> tokio::process::Command {
     child
 }
 
+fn bash_path() -> String {
+    let extra = "/usr/bin:/bin:/usr/sbin:/sbin";
+    match std::env::var("PATH") {
+        Ok(p) if !p.is_empty() => format!("{p}:{extra}"),
+        _ => extra.into(),
+    }
+}
+
 fn detach_from_tty(cmd: &mut tokio::process::Command) {
-    #[cfg(unix)]
+    // iOS cannot fork; `pre_exec` would make spawn fail.
+    #[cfg(all(unix, not(target_os = "ios")))]
     {
         // SAFETY: only setsid() so the child has no controlling terminal.
         unsafe {
@@ -227,12 +238,11 @@ fn detach_from_tty(cmd: &mut tokio::process::Command) {
             });
         }
     }
-    #[cfg(not(unix))]
     let _ = cmd;
 }
 
 fn kill_bash(child: &mut tokio::process::Child) {
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "ios")))]
     if let Some(id) = child.id() {
         // setsid() makes the child the process-group leader (pgid == pid).
         let _ = unsafe { libc::kill(-(id as i32), libc::SIGKILL) };
