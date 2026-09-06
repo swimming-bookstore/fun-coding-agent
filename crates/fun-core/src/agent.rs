@@ -10,7 +10,7 @@ use std::sync::Arc;
 const MAX_TOOL_ROUNDS: usize = 200;
 
 #[derive(Clone)]
-pub(crate) struct ToolRun {
+pub struct ToolRun {
     pub name: String,
     pub args: String,
     pub detail: String,
@@ -23,7 +23,7 @@ impl ToolRun {
     }
 }
 
-pub(crate) enum LogLine {
+pub enum LogLine {
     User(String),
     Text(String),
     Delta(String),
@@ -39,24 +39,27 @@ enum MailCmd {
     Steer(String),
     Idle(String),
     SetIdle(Vec<String>),
+    Adopt { session: Session, workspace: PathBuf },
 }
 
-pub(crate) struct MailboxTx {
+#[derive(Clone)]
+pub struct MailboxTx {
     cmd: Sender<MailCmd>,
     abort: Arc<Abort>,
     cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
-pub(crate) struct Mailbox {
+pub struct Mailbox {
     cmd: Receiver<MailCmd>,
     abort: Arc<Abort>,
     cancel: Arc<std::sync::atomic::AtomicBool>,
     interrupt: Vec<String>,
     steer: Vec<String>,
     idle: Vec<String>,
+    adopt: Option<(Session, PathBuf)>,
 }
 
-pub(crate) fn mailbox() -> (MailboxTx, Mailbox) {
+pub fn mailbox() -> (MailboxTx, Mailbox) {
     let (cmd, rx) = mpsc::channel();
     let abort = Abort::new();
     let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -73,6 +76,7 @@ pub(crate) fn mailbox() -> (MailboxTx, Mailbox) {
             interrupt: Vec::new(),
             steer: Vec::new(),
             idle: Vec::new(),
+            adopt: None,
         },
     )
 }
@@ -90,6 +94,10 @@ impl MailboxTx {
     }
     pub fn set_idle(&self, items: Vec<String>) {
         let _ = self.cmd.send(MailCmd::SetIdle(items));
+    }
+    pub fn adopt(&self, session: Session, workspace: PathBuf) {
+        let _ = self.cmd.send(MailCmd::Adopt { session, workspace });
+        self.abort.abort();
     }
     pub fn abort(&self) {
         self.cancel
@@ -117,6 +125,7 @@ impl Mailbox {
                 MailCmd::Steer(text) => self.steer.push(text),
                 MailCmd::Idle(text) => self.idle.push(text),
                 MailCmd::SetIdle(items) => self.idle = items,
+                MailCmd::Adopt { session, workspace } => self.adopt = Some((session, workspace)),
             }
         }
     }
@@ -144,15 +153,20 @@ impl Mailbox {
             Some(self.idle.remove(0))
         }
     }
+    fn take_adopt(&mut self) -> Option<(Session, PathBuf)> {
+        self.drain();
+        self.adopt.take()
+    }
     fn discard(&mut self) {
         self.drain();
         self.interrupt.clear();
         self.steer.clear();
         self.idle.clear();
+        self.adopt = None;
     }
 }
 
-pub(crate) struct Agent {
+pub struct Agent {
     pub workspace: PathBuf,
     pub model: String,
     pub effort: String,
@@ -201,13 +215,20 @@ impl Agent {
     }
 }
 
-pub(crate) async fn prompt(a: &mut Agent, text: String) -> Result<()> {
+pub async fn prompt(a: &mut Agent, text: String) -> Result<()> {
     a.mailbox.clear_cancel();
     a.session.add(Entry::User { text })?;
     let result = match agent_loop(a).await {
         Err(e) if is_abort(&e) => Ok(()),
         other => other,
     };
+    if let Some((session, workspace)) = a.mailbox.take_adopt() {
+        a.session = session;
+        a.workspace = workspace;
+        a.mailbox.clear_cancel();
+        a.mailbox.clear_abort();
+        return Ok(());
+    }
     if a.mailbox.cancelled() {
         a.mailbox.discard();
         a.emit(LogLine::Text("(aborted)".into()));
@@ -440,14 +461,14 @@ fn finish_skipped_tools(a: &mut Agent, calls: &[Call], from: usize) -> Result<()
     Ok(())
 }
 
-pub(crate) fn title_case(name: &str) -> String {
+pub fn title_case(name: &str) -> String {
     let mut c = name.chars();
     c.next().map_or_else(String::new, |ch| {
         ch.to_uppercase().collect::<String>() + c.as_str()
     })
 }
 
-pub(crate) fn ellipsize(s: &str, max: usize) -> String {
+pub fn ellipsize(s: &str, max: usize) -> String {
     let clip = clip_utf8(s, max);
     if clip.len() < s.len() {
         format!("{clip}…")
@@ -456,7 +477,7 @@ pub(crate) fn ellipsize(s: &str, max: usize) -> String {
     }
 }
 
-pub(crate) fn args_repr(v: &Value) -> String {
+pub fn args_repr(v: &Value) -> String {
     let s = if let Some(map) = v.as_object() {
         map.iter()
             .map(|(k, val)| match val {
@@ -471,7 +492,7 @@ pub(crate) fn args_repr(v: &Value) -> String {
     ellipsize(&s, 100)
 }
 
-pub(crate) fn tool_ok(name: &str, args: &Value) -> ToolRun {
+pub fn tool_ok(name: &str, args: &Value) -> ToolRun {
     ToolRun {
         name: title_case(name),
         args: args_repr(args),
@@ -480,7 +501,7 @@ pub(crate) fn tool_ok(name: &str, args: &Value) -> ToolRun {
     }
 }
 
-pub(crate) fn tool_fail(name: &str, args: &Value, content: &str) -> ToolRun {
+pub fn tool_fail(name: &str, args: &Value, content: &str) -> ToolRun {
     let body = content.trim();
     let body = if body.is_empty() { "failed" } else { body };
     ToolRun {
@@ -491,7 +512,7 @@ pub(crate) fn tool_fail(name: &str, args: &Value, content: &str) -> ToolRun {
     }
 }
 
-pub(crate) fn tool_counts(runs: &[ToolRun]) -> (usize, usize) {
+pub fn tool_counts(runs: &[ToolRun]) -> (usize, usize) {
     let mut ok = 0usize;
     let mut fail = 0usize;
     for r in runs {
@@ -512,7 +533,7 @@ fn count_label(n: usize, singular: &str, plural: &str) -> String {
     }
 }
 
-pub(crate) fn tool_summary(ok: usize, fail: usize) -> String {
+pub fn tool_summary(ok: usize, fail: usize) -> String {
     match (ok, fail) {
         (0, 0) => String::new(),
         (n, 0) => format!("{} succeeded", count_label(n, "tool", "tools")),
@@ -525,7 +546,7 @@ pub(crate) fn tool_summary(ok: usize, fail: usize) -> String {
     }
 }
 
-pub(crate) fn print_log(line: &LogLine) {
+pub fn print_log(line: &LogLine) {
     use std::io::{self, Write};
     match line {
         LogLine::Text(t) => {

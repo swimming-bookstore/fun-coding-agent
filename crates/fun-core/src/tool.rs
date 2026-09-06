@@ -11,7 +11,7 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::Notify;
 
 #[derive(Debug)]
-pub(crate) struct Aborted;
+pub struct Aborted;
 
 impl std::fmt::Display for Aborted {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -21,11 +21,11 @@ impl std::fmt::Display for Aborted {
 
 impl std::error::Error for Aborted {}
 
-pub(crate) fn aborted() -> anyhow::Error {
+pub fn aborted() -> anyhow::Error {
     anyhow::Error::new(Aborted)
 }
 
-pub(crate) fn is_abort(e: &anyhow::Error) -> bool {
+pub fn is_abort(e: &anyhow::Error) -> bool {
     e.downcast_ref::<Aborted>().is_some()
 }
 
@@ -41,7 +41,7 @@ fn bash_timeout(seconds: Option<u64>) -> Duration {
     }
 }
 
-pub(crate) fn clip_utf8(s: &str, max: usize) -> &str {
+pub fn clip_utf8(s: &str, max: usize) -> &str {
     if s.len() <= max {
         return s;
     }
@@ -60,7 +60,7 @@ fn cap_utf8(text: &mut String, max: usize) {
     }
 }
 
-pub(crate) struct Abort {
+pub struct Abort {
     flag: AtomicBool,
     notify: Notify,
 }
@@ -100,7 +100,7 @@ impl Abort {
     }
 }
 
-pub(crate) struct Property {
+pub struct Property {
     pub name: &'static str,
     pub r#type: &'static str,
     pub description: &'static str,
@@ -109,7 +109,7 @@ pub(crate) struct Property {
 
 type ToolFn = fn(&Path, &Value, &Abort) -> Result<String>;
 
-pub(crate) struct Tool {
+pub struct Tool {
     pub name: &'static str,
     pub description: &'static str,
     pub properties: &'static [Property],
@@ -240,6 +240,15 @@ fn kill_bash(child: &mut tokio::process::Child) {
     let _ = child.start_kill();
 }
 
+async fn reap_bash(child: &mut tokio::process::Child) {
+    if tokio::time::timeout(Duration::from_secs(2), child.wait())
+        .await
+        .is_err()
+    {
+        let _ = child.start_kill();
+    }
+}
+
 async fn bash_execute_async(workspace: &Path, raw: &Value, abort: &Abort) -> Result<String> {
     #[derive(Deserialize)]
     struct Args {
@@ -267,12 +276,16 @@ async fn bash_execute_async(workspace: &Path, raw: &Value, abort: &Abort) -> Res
         status = child.wait() => status.context("wait bash")?,
         _ = abort.wait() => {
             kill_bash(&mut child);
-            let _ = child.wait().await;
+            reap_bash(&mut child).await;
+            out_task.abort();
+            err_task.abort();
             return Err(aborted());
         }
         _ = tokio::time::sleep(timeout) => {
             kill_bash(&mut child);
-            let _ = child.wait().await;
+            reap_bash(&mut child).await;
+            out_task.abort();
+            err_task.abort();
             bail!("bash timed out after {}s", timeout.as_secs());
         }
     };
@@ -281,7 +294,7 @@ async fn bash_execute_async(workspace: &Path, raw: &Value, abort: &Abort) -> Res
     format_bash_output(&stdout, &stderr, status)
 }
 
-pub(crate) async fn execute_tool(
+pub async fn execute_tool(
     tool: &Tool,
     workspace: &Path,
     args: &Value,
@@ -546,7 +559,7 @@ fn edit_execute(workspace: &Path, raw: &Value, abort: &Abort) -> Result<String> 
     Ok(format!("edited {}", path.display()))
 }
 
-pub(crate) fn get_tools() -> Vec<Tool> {
+pub fn get_tools() -> Vec<Tool> {
     vec![tool_read(), tool_write(), tool_edit(), tool_bash()]
 }
 
