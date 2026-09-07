@@ -30,6 +30,7 @@ enum KeyAction {
     SelectDrag(u16, u16),
     SelectEnd(u16, u16),
     ClickTools(u16, u16),
+    Hover(u16, u16),
     QueueSteer(usize),
     QueueUp(usize),
     QueueDown(usize),
@@ -379,7 +380,7 @@ fn on_mouse(ui: &mut Ui, mouse: crossterm::event::MouseEvent) -> KeyAction {
             if ui.is_selecting() {
                 KeyAction::SelectDrag(mouse.column, mouse.row)
             } else {
-                KeyAction::Skip
+                KeyAction::Hover(mouse.column, mouse.row)
             }
         }
         MouseEventKind::Up(_) => {
@@ -1329,9 +1330,17 @@ fn apply_ui(ui: &mut Ui, edit: &LineEdit, action: KeyAction) -> Result<KeyAction
             Ok(KeyAction::Skip)
         }
         KeyAction::ClickTools(x, y) => {
-            if !ui.click_tools(x, y)? {
+            if ui.click_tools(x, y)? {
+                Ok(KeyAction::Skip)
+            } else if ui.open_clicked_link(x, y) {
+                Ok(KeyAction::Skip)
+            } else {
                 ui.select_start(x, y)?;
+                Ok(KeyAction::Skip)
             }
+        }
+        KeyAction::Hover(x, y) => {
+            ui.hover_at(x, y)?;
             Ok(KeyAction::Skip)
         }
         KeyAction::SelectDrag(x, y) => {
