@@ -26,8 +26,8 @@ impl Terminal {
             out.execute(EnterAlternateScreen)?;
             out.execute(EnableBracketedPaste)?;
             out.execute(Hide)?;
-            // 1000+1002+1006: wheel + drag. 1003 (all-motion) is enabled only while selecting.
-            write!(out, "\x1b[?7l\x1b[?1000h\x1b[?1002h\x1b[?1006h")?;
+            // 1000+1002+1003+1006: wheel, drag, hover.
+            write!(out, "\x1b[?7l\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h")?;
             let (cols, rows) = term_size().unwrap_or((80, 24));
             let size = Rect::new(0, 0, cols.max(1), rows.max(1));
             queue!(out, MoveTo(0, 0), Clear(ClearType::All))?;
@@ -42,17 +42,6 @@ impl Terminal {
             restore_terminal();
         }
         started
-    }
-
-    pub fn set_mouse_motion(&mut self, on: bool) -> Result<()> {
-        let mut out = io::stdout();
-        if on {
-            write!(out, "\x1b[?1003h")?;
-        } else {
-            write!(out, "\x1b[?1003l")?;
-        }
-        out.flush()?;
-        Ok(())
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {

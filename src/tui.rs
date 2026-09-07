@@ -196,6 +196,7 @@ const QUEUE_CTRLS: &[(&str, QueueCtrl)] = &[
 struct Span {
     text: String,
     style: Style,
+    link: Option<String>,
 }
 
 impl Span {
@@ -203,6 +204,15 @@ impl Span {
         Self {
             text: text.into(),
             style,
+            link: None,
+        }
+    }
+
+    fn linked(text: impl Into<String>, style: Style, link: Option<String>) -> Self {
+        Self {
+            text: text.into(),
+            style,
+            link,
         }
     }
 }
@@ -266,6 +276,7 @@ pub struct Ui {
     paused: bool,
     body_area: Rect,
     queue_area: Rect,
+    link_area: Rect,
     composer_area: Rect,
     chip_hits: Vec<(Rect, usize)>,
     actions: Vec<(Rect, ActionHit)>,
@@ -280,6 +291,8 @@ pub struct Ui {
     interrupts: Vec<String>,
     steers: Vec<String>,
     copied_until: Option<Instant>,
+    hover_url: Option<String>,
+    select_held: bool,
     ask: Option<AskDialog>,
 }
 
@@ -312,6 +325,7 @@ impl Ui {
             paused: false,
             body_area: Rect::new(0, 0, 0, 0),
             queue_area: Rect::new(0, 0, 0, 0),
+            link_area: Rect::new(0, 0, 0, 0),
             composer_area: Rect::new(0, 0, 0, 0),
             chip_hits: Vec::new(),
             actions: Vec::new(),
@@ -326,6 +340,8 @@ impl Ui {
             interrupts: Vec::new(),
             steers: Vec::new(),
             copied_until: None,
+            hover_url: None,
+            select_held: false,
             ask: None,
         };
         ui.redraw()?;
@@ -481,12 +497,12 @@ impl Ui {
     pub fn select_start(&mut self, x: u16, y: u16) -> Result<()> {
         if !self.in_body(x, y) {
             self.select = None;
-            self.term.set_mouse_motion(false)?;
+            self.select_held = false;
             return self.redraw();
         }
         let p = self.screen_to_sel(x, y);
         self.select = Some((p, p));
-        self.term.set_mouse_motion(true)?;
+        self.select_held = true;
         self.redraw()
     }
 
@@ -511,6 +527,51 @@ impl Ui {
         Ok(true)
     }
 
+    fn link_at_pointer(&self, x: u16, y: u16) -> Option<String> {
+        if self.link_area.contains(x, y) {
+            return self.hover_url.clone();
+        }
+        link_at(
+            &self.rows,
+            &self.partial,
+            self.working,
+            self.body_area,
+            x,
+            y,
+            self.body_start,
+        )
+    }
+
+    pub fn open_clicked_link(&mut self, x: u16, y: u16) -> bool {
+        let Some(url) = self.link_at_pointer(x, y) else {
+            return false;
+        };
+        self.select = None;
+        self.select_held = false;
+        let _ = open_url(&url);
+        true
+    }
+
+    pub fn hover_at(&mut self, x: u16, y: u16) -> Result<()> {
+        if self.link_area.contains(x, y) && self.hover_url.is_some() {
+            return Ok(());
+        }
+        let url = link_at(
+            &self.rows,
+            &self.partial,
+            self.working,
+            self.body_area,
+            x,
+            y,
+            self.body_start,
+        );
+        if url == self.hover_url {
+            return Ok(());
+        }
+        self.hover_url = url;
+        self.redraw()
+    }
+
     pub fn select_drag(&mut self, x: u16, y: u16) -> Result<()> {
         if self.queue_pointer {
             return Ok(());
@@ -527,7 +588,7 @@ impl Ui {
     }
 
     pub fn select_end(&mut self, x: u16, y: u16) -> Result<Option<String>> {
-        self.term.set_mouse_motion(false)?;
+        self.select_held = false;
         if self.take_queue_pointer() {
             return Ok(None);
         }
@@ -536,7 +597,7 @@ impl Ui {
     }
 
     pub fn is_selecting(&self) -> bool {
-        self.select.is_some() && !self.queue_pointer
+        self.select_held && self.select.is_some() && !self.queue_pointer
     }
 
     pub fn asking(&self) -> bool {
@@ -899,11 +960,13 @@ impl Ui {
             .copied_until
             .is_some_and(|at| Instant::now() < at);
         let follow = self.follow;
+        let hover_url = self.hover_url.as_deref();
         let ask = self.ask.as_ref();
         let mut used_scroll = 0usize;
         let mut body_start = self.body_start;
         let mut body_area = Rect::new(0, 0, 0, 0);
         let mut queue_area = Rect::new(0, 0, 0, 0);
+        let mut link_area = Rect::new(0, 0, 0, 0);
         let mut composer_area = Rect::new(0, 0, 0, 0);
         let mut chip_hits = Vec::new();
         let mut actions = Vec::new();
@@ -996,6 +1059,20 @@ impl Ui {
             if status_h > 0 {
                 status(buf, parts[i], bar, working, spinner, used_scroll);
             }
+            if let Some(url) = hover_url.filter(|u| !u.is_empty()) {
+                link_area = overlay_above(area, composer_area, 3);
+                if !link_area.is_empty() {
+                    fill_rect(buf, link_area, Style::new());
+                    notice_panel(
+                        buf,
+                        link_area,
+                        "link",
+                        accent(),
+                        accent().bold(),
+                        &[url.to_string()],
+                    );
+                }
+            }
             if show_copied {
                 paint_copied(buf, area, composer_area);
             }
@@ -1006,6 +1083,7 @@ impl Ui {
         })?;
         self.body_area = body_area;
         self.queue_area = queue_area;
+        self.link_area = link_area;
         self.composer_area = composer_area;
         self.chip_hits = chip_hits;
         self.actions = actions;
@@ -1493,6 +1571,22 @@ fn paint_copied(buf: &mut Buffer, screen: Rect, composer: Rect) {
     } else {
         buf.write(toast, toast.x, toast.y, label, ok_col().bold());
     }
+}
+
+fn overlay_above(screen: Rect, composer: Rect, height: u16) -> Rect {
+    if screen.is_empty() || height == 0 {
+        return Rect::new(0, 0, 0, 0);
+    }
+    let h = height.min(screen.height);
+    let y = if !composer.is_empty() && composer.y >= screen.y.saturating_add(h) {
+        composer.y.saturating_sub(h)
+    } else if !composer.is_empty() && composer.y > screen.y {
+        screen.y
+    } else {
+        screen.bottom().saturating_sub(h.saturating_add(composer.height.max(1)))
+            .max(screen.y)
+    };
+    Rect::new(screen.x, y, screen.width, h)
 }
 
 fn paint_select(
@@ -1990,6 +2084,38 @@ fn queue_panel(
     }
 }
 
+fn link_at(
+    rows: &[Line],
+    partial: &str,
+    working: bool,
+    area: Rect,
+    x: u16,
+    y: u16,
+    body_start: usize,
+) -> Option<String> {
+    if !area.contains(x, y) {
+        return None;
+    }
+    let wrap_w = area.width.saturating_sub(2).max(1) as usize;
+    let lines = wrap_body(rows, partial, working, wrap_w);
+    let row = body_start + y.saturating_sub(area.top()) as usize;
+    let line = lines.get(row)?;
+    let origin = area.x.saturating_add(1);
+    if x < origin {
+        return None;
+    }
+    let mut col = origin;
+    for span in &line.spans {
+        let w = width(&span.text) as u16;
+        let end = col.saturating_add(w);
+        if x >= col && (x < end || w == 0 && x == col) {
+            return span.link.as_deref().and_then(http_url).map(str::to_string);
+        }
+        col = end;
+    }
+    None
+}
+
 fn wrap_body(rows: &[Line], partial: &str, working: bool, width: usize) -> Vec<Line> {
     let mut wrapped = rows.to_vec();
     if !partial.is_empty() {
@@ -2279,6 +2405,7 @@ fn wrap_row(spans: &[Span], max: usize, hang: usize) -> Vec<Line> {
     struct Chunk {
         text: String,
         style: Style,
+        link: Option<String>,
         width: usize,
         space: bool,
         newline: bool,
@@ -2291,6 +2418,7 @@ fn wrap_row(spans: &[Span], max: usize, hang: usize) -> Vec<Line> {
                 chunks.push(Chunk {
                     text: String::new(),
                     style: span.style,
+                    link: span.link.clone(),
                     width: 0,
                     space: false,
                     newline: true,
@@ -2305,6 +2433,7 @@ fn wrap_row(spans: &[Span], max: usize, hang: usize) -> Vec<Line> {
             if let Some(last) = chunks.last_mut()
                 && !last.newline
                 && last.style == span.style
+                && last.link == span.link
                 && last.space == space
             {
                 last.text.push(c);
@@ -2314,6 +2443,7 @@ fn wrap_row(spans: &[Span], max: usize, hang: usize) -> Vec<Line> {
             chunks.push(Chunk {
                 text: c.to_string(),
                 style: span.style,
+                link: span.link.clone(),
                 width: cw,
                 space,
                 newline: false,
@@ -2334,7 +2464,7 @@ fn wrap_row(spans: &[Span], max: usize, hang: usize) -> Vec<Line> {
         }
     };
 
-    let push_span = |rows: &mut Vec<Vec<Span>>, text: String, style: Style| {
+    let push_span = |rows: &mut Vec<Vec<Span>>, text: String, style: Style, link: Option<String>| {
         if rows.is_empty() {
             rows.push(Vec::new());
         }
@@ -2343,11 +2473,12 @@ fn wrap_row(spans: &[Span], max: usize, hang: usize) -> Vec<Line> {
         };
         if let Some(prev) = row.last_mut()
             && prev.style == style
+            && prev.link == link
         {
             prev.text.push_str(&text);
             return;
         }
-        row.push(Span::new(text, style));
+        row.push(Span::linked(text, style, link));
     };
     let trim_trailing = |row: &mut Vec<Span>, w: &mut usize| {
         while let Some(last) = row.last_mut() {
@@ -2396,7 +2527,7 @@ fn wrap_row(spans: &[Span], max: usize, hang: usize) -> Vec<Line> {
             if w == 0 {
                 // Keep indent on the original line; drop leading space after wrap.
                 if line_idx == 0 {
-                    push_span(&mut rows, chunk.text, chunk.style);
+                    push_span(&mut rows, chunk.text, chunk.style, chunk.link.clone());
                     w += chunk.width;
                 }
                 continue;
@@ -2405,7 +2536,7 @@ fn wrap_row(spans: &[Span], max: usize, hang: usize) -> Vec<Line> {
                 wrap(&mut rows, &mut w, &mut line_idx);
                 continue;
             }
-            push_span(&mut rows, chunk.text, chunk.style);
+            push_span(&mut rows, chunk.text, chunk.style, chunk.link.clone());
             w += chunk.width;
             continue;
         }
@@ -2414,7 +2545,7 @@ fn wrap_row(spans: &[Span], max: usize, hang: usize) -> Vec<Line> {
         }
         let max_here = line_max(line_idx);
         if chunk.width <= max_here {
-            push_span(&mut rows, chunk.text, chunk.style);
+            push_span(&mut rows, chunk.text, chunk.style, chunk.link.clone());
             w += chunk.width;
             continue;
         }
@@ -2426,7 +2557,12 @@ fn wrap_row(spans: &[Span], max: usize, hang: usize) -> Vec<Line> {
             let cw = c.width().unwrap_or(0);
             let max_here = line_max(idx);
             if buf_w + cw > max_here && buf_w > 0 {
-                push_span(&mut rows, std::mem::take(&mut buf), chunk.style);
+                push_span(
+                    &mut rows,
+                    std::mem::take(&mut buf),
+                    chunk.style,
+                    chunk.link.clone(),
+                );
                 rows.push(Vec::new());
                 idx += 1;
                 buf_w = 0;
@@ -2437,7 +2573,7 @@ fn wrap_row(spans: &[Span], max: usize, hang: usize) -> Vec<Line> {
         line_idx = idx;
         w = buf_w;
         if !buf.is_empty() {
-            push_span(&mut rows, buf, chunk.style);
+            push_span(&mut rows, buf, chunk.style, chunk.link.clone());
         }
     }
 
@@ -2613,6 +2749,83 @@ fn render_plain(text: &str) -> Vec<Line> {
         .collect()
 }
 
+fn next_http_url(s: &str) -> Option<(usize, usize, &str)> {
+    let mut i = 0usize;
+    while i < s.len() {
+        let rest = &s[i..];
+        let prefix = if rest.starts_with("https://") {
+            8
+        } else if rest.starts_with("http://") {
+            7
+        } else {
+            i += rest.chars().next()?.len_utf8();
+            continue;
+        };
+        let mut end = i + prefix;
+        for c in s[end..].chars() {
+            if c.is_whitespace() || matches!(c, '<' | '>' | '"' | '\'') {
+                break;
+            }
+            end += c.len_utf8();
+        }
+        let mut trimmed = end;
+        while trimmed > i + prefix {
+            let Some(last) = s[..trimmed].chars().last() else {
+                break;
+            };
+            if matches!(last, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}') {
+                trimmed -= last.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if trimmed > i + prefix
+            && let Some(url) = http_url(&s[i..trimmed])
+        {
+            return Some((i, trimmed, url));
+        }
+        i += prefix;
+    }
+    None
+}
+
+fn http_url(url: &str) -> Option<&str> {
+    let url = url.trim();
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return None;
+    }
+    if url.bytes().any(|b| b < b' ' || b == b'\x7f') {
+        return None;
+    }
+    Some(url)
+}
+
+pub fn open_url(url: &str) -> bool {
+    let Some(url) = http_url(url) else {
+        return false;
+    };
+    #[cfg(target_os = "macos")]
+    let bin = "open";
+    #[cfg(target_os = "windows")]
+    let bin = "cmd";
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let bin = "xdg-open";
+    let mut cmd = std::process::Command::new(bin);
+    #[cfg(target_os = "windows")]
+    {
+        cmd.args(["/C", "start", "", url]);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        cmd.arg(url);
+    }
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .is_ok()
+}
+
 fn md_options() -> Options {
     Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS
 }
@@ -2640,6 +2853,7 @@ struct Md {
     spans: Vec<Span>,
     style: Style,
     style_stack: Vec<Style>,
+    link: Option<String>,
     lists: Vec<ListState>,
     item_marker: Option<String>,
     quote: usize,
@@ -2660,6 +2874,7 @@ impl Md {
             spans: Vec::new(),
             style: Style::new(),
             style_stack: Vec::new(),
+            link: None,
             lists: Vec::new(),
             item_marker: None,
             quote: 0,
@@ -2696,14 +2911,39 @@ impl Md {
         if text.is_empty() {
             return;
         }
+        let link = self.link.clone();
         let dest = self.dest();
         if let Some(last) = dest.last_mut()
             && last.style == style
+            && last.link == link
         {
             last.text.push_str(text);
             return;
         }
-        dest.push(Span::new(text, style));
+        dest.push(Span::linked(text, style, link));
+    }
+
+    fn push_markdown_text(&mut self, text: &str) {
+        if self.link.is_some() {
+            self.push_text(text, self.style);
+            return;
+        }
+        let mut rest = text;
+        while !rest.is_empty() {
+            if let Some((start, end, url)) = next_http_url(rest) {
+                if start > 0 {
+                    self.push_text(&rest[..start], self.style);
+                }
+                let prev = self.link.clone();
+                self.link = Some(url.to_string());
+                self.push_text(url, self.style.underline());
+                self.link = prev;
+                rest = &rest[end..];
+            } else {
+                self.push_text(rest, self.style);
+                break;
+            }
+        }
     }
 
     fn indent(&self) -> usize {
@@ -2756,7 +2996,7 @@ impl Md {
                 if self.code_lang.is_some() {
                     self.push_code(&text);
                 } else {
-                    self.push_text(&text, self.style);
+                    self.push_markdown_text(&text);
                 }
             }
             Event::Code(code) => self.push_text(&code, code_col().bold()),
@@ -2887,8 +3127,9 @@ impl Md {
             Tag::Emphasis => self.push_style(self.style.italic()),
             Tag::Strong => self.push_style(self.style.bold()),
             Tag::Strikethrough => self.push_style(self.style.strike()),
-            Tag::Link { .. } => {
-                self.push_style(accent().underline());
+            Tag::Link { dest_url, .. } => {
+                self.link = Some(dest_url.to_string());
+                self.push_style(self.style.underline());
             }
             Tag::Image { dest_url, .. } => {
                 self.push_text(&format!("[{dest_url}]"), muted());
@@ -2943,7 +3184,10 @@ impl Md {
                 self.row.push(std::mem::take(&mut self.cell));
             }
             TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => self.pop_style(),
-            TagEnd::Link => self.pop_style(),
+            TagEnd::Link => {
+                self.link = None;
+                self.pop_style();
+            }
             TagEnd::Image
             | TagEnd::HtmlBlock
             | TagEnd::MetadataBlock(_)
@@ -3006,7 +3250,7 @@ fn truncate_spans(spans: &[Span], max: usize) -> Vec<Span> {
             used += cw;
         }
         if !text.is_empty() {
-            out.push(Span::new(text, span.style));
+            out.push(Span::linked(text, span.style, span.link.clone()));
         }
         if used >= max {
             break;
@@ -3159,9 +3403,84 @@ mod tests {
     }
 
     #[test]
+    fn stream_keeps_markdown_raw() {
+        let src = "see [docs](https://example.com/a) and https://example.com/b";
+        let lines = render_plain(src);
+        assert_eq!(plain_text(src), vec![src]);
+        assert!(lines.iter().all(|l| l.spans.iter().all(|s| s.link.is_none())));
+        assert!(lines.iter().all(|l| l.spans.iter().all(|s| !s.style.underline)));
+    }
+
+    #[test]
     fn markdown_joins_paragraph_softbreaks() {
         let lines = md_text("hello\nworld\n\nnext", 80);
         assert_eq!(lines, vec!["hello world", "next"]);
+    }
+
+    #[test]
+    fn markdown_link_keeps_url() {
+        let lines = render_md("see [docs](https://example.com/a) please", 80);
+        let hit = lines.iter().find_map(|l| {
+            l.spans
+                .iter()
+                .find(|s| s.link.as_deref() == Some("https://example.com/a"))
+        });
+        assert!(hit.is_some());
+        assert!(hit.unwrap().text.contains("docs"));
+        assert!(hit.unwrap().style.underline);
+        assert!(hit.unwrap().style.fg.is_none());
+        assert!(http_url("https://example.com/a").is_some());
+        assert!(http_url("javascript:alert(1)").is_none());
+        assert!(http_url("file:///etc/passwd").is_none());
+    }
+
+    #[test]
+    fn markdown_autolinks_bare_http_url() {
+        let lines = render_md("open https://example.com/a, please", 80);
+        let hit = lines.iter().find_map(|l| {
+            l.spans
+                .iter()
+                .find(|s| s.link.as_deref() == Some("https://example.com/a"))
+        });
+        assert!(hit.is_some());
+        assert_eq!(hit.unwrap().text, "https://example.com/a");
+        assert!(hit.unwrap().style.underline);
+    }
+
+    #[test]
+    fn link_at_hits_markdown_label() {
+        let rows = indent_lines(
+            wrap_lines(&render_md("see [docs](https://example.com/a) please", 40), 40),
+            "  ",
+        );
+        let area = Rect::new(0, 0, 44, 3);
+        assert_eq!(
+            link_at(&rows, "", false, area, 7, 0, 0).as_deref(),
+            Some("https://example.com/a")
+        );
+        assert_eq!(link_at(&rows, "", false, area, 3, 0, 0), None);
+    }
+
+    #[test]
+    fn link_preview_uses_notice_box() {
+        let url = "https://example.com/a";
+        let items = vec![url.to_string()];
+        let mut buf = Buffer::new(40, 12);
+        let screen = buf.area();
+        let composer = Rect::new(0, 8, 40, 3);
+        let overlay = overlay_above(screen, composer, 3);
+        assert_eq!(overlay, Rect::new(0, 5, 40, 3));
+        fill_rect(&mut buf, overlay, Style::new());
+        notice_panel(&mut buf, overlay, "link", accent(), accent().bold(), &items);
+        assert_eq!(buf.get(3, 5).ch, 'l');
+        let inner = Block::inner(overlay);
+        let shown: String = (inner.x.saturating_add(1)..inner.right())
+            .map(|x| buf.get(x, inner.y).ch)
+            .collect::<String>()
+            .trim()
+            .to_string();
+        assert!(shown.contains(url), "{shown:?}");
+        assert_eq!(composer.y, 8);
     }
 
     #[test]
