@@ -276,6 +276,7 @@ pub struct Ui {
     paused: bool,
     body_area: Rect,
     queue_area: Rect,
+    link_area: Rect,
     composer_area: Rect,
     chip_hits: Vec<(Rect, usize)>,
     actions: Vec<(Rect, ActionHit)>,
@@ -324,6 +325,7 @@ impl Ui {
             paused: false,
             body_area: Rect::new(0, 0, 0, 0),
             queue_area: Rect::new(0, 0, 0, 0),
+            link_area: Rect::new(0, 0, 0, 0),
             composer_area: Rect::new(0, 0, 0, 0),
             chip_hits: Vec::new(),
             actions: Vec::new(),
@@ -526,6 +528,9 @@ impl Ui {
     }
 
     fn link_at_pointer(&self, x: u16, y: u16) -> Option<String> {
+        if self.link_area.contains(x, y) {
+            return self.hover_url.clone();
+        }
         link_at(
             &self.rows,
             &self.partial,
@@ -548,7 +553,18 @@ impl Ui {
     }
 
     pub fn hover_at(&mut self, x: u16, y: u16) -> Result<()> {
-        let url = self.link_at_pointer(x, y);
+        if self.link_area.contains(x, y) && self.hover_url.is_some() {
+            return Ok(());
+        }
+        let url = link_at(
+            &self.rows,
+            &self.partial,
+            self.working,
+            self.body_area,
+            x,
+            y,
+            self.body_start,
+        );
         if url == self.hover_url {
             return Ok(());
         }
@@ -950,6 +966,7 @@ impl Ui {
         let mut body_start = self.body_start;
         let mut body_area = Rect::new(0, 0, 0, 0);
         let mut queue_area = Rect::new(0, 0, 0, 0);
+        let mut link_area = Rect::new(0, 0, 0, 0);
         let mut composer_area = Rect::new(0, 0, 0, 0);
         let mut chip_hits = Vec::new();
         let mut actions = Vec::new();
@@ -970,11 +987,6 @@ impl Ui {
             room = room.saturating_sub(steer_h);
             let queue_h = queue_height(queue, room);
             room = room.saturating_sub(queue_h);
-            let link_url = hover_url.filter(|u| !u.is_empty());
-            let link_items = link_url.map(|u| vec![u.to_string()]).unwrap_or_default();
-            let link_h = notice_height(&link_items, room);
-            room = room.saturating_sub(link_h);
-            room = room.saturating_sub(link_h);
             let action_h = action_bar_height(
                 area.width,
                 bar.pull.as_deref(),
@@ -993,9 +1005,6 @@ impl Ui {
             }
             if queue_h > 0 {
                 constraints.push(Constraint::Length(queue_h));
-            }
-            if link_h > 0 {
-                constraints.push(Constraint::Length(link_h));
             }
             if action_h > 0 {
                 constraints.push(Constraint::Length(action_h));
@@ -1029,10 +1038,6 @@ impl Ui {
                 queue_panel(buf, parts[i], queue, queue_hl, queue_edit.zip(queue_edit_text));
                 i += 1;
             }
-            if link_h > 0 {
-                notice_panel(buf, parts[i], "link", accent(), accent().bold(), &link_items);
-                i += 1;
-            }
             if action_h > 0 {
                 actions = paint_action_bar(
                     buf,
@@ -1054,6 +1059,20 @@ impl Ui {
             if status_h > 0 {
                 status(buf, parts[i], bar, working, spinner, used_scroll);
             }
+            if let Some(url) = hover_url.filter(|u| !u.is_empty()) {
+                link_area = overlay_above(area, composer_area, 3);
+                if !link_area.is_empty() {
+                    fill_rect(buf, link_area, Style::new());
+                    notice_panel(
+                        buf,
+                        link_area,
+                        "link",
+                        accent(),
+                        accent().bold(),
+                        &[url.to_string()],
+                    );
+                }
+            }
             if show_copied {
                 paint_copied(buf, area, composer_area);
             }
@@ -1064,6 +1083,7 @@ impl Ui {
         })?;
         self.body_area = body_area;
         self.queue_area = queue_area;
+        self.link_area = link_area;
         self.composer_area = composer_area;
         self.chip_hits = chip_hits;
         self.actions = actions;
@@ -1551,6 +1571,22 @@ fn paint_copied(buf: &mut Buffer, screen: Rect, composer: Rect) {
     } else {
         buf.write(toast, toast.x, toast.y, label, ok_col().bold());
     }
+}
+
+fn overlay_above(screen: Rect, composer: Rect, height: u16) -> Rect {
+    if screen.is_empty() || height == 0 {
+        return Rect::new(0, 0, 0, 0);
+    }
+    let h = height.min(screen.height);
+    let y = if !composer.is_empty() && composer.y >= screen.y.saturating_add(h) {
+        composer.y.saturating_sub(h)
+    } else if !composer.is_empty() && composer.y > screen.y {
+        screen.y
+    } else {
+        screen.bottom().saturating_sub(h.saturating_add(composer.height.max(1)))
+            .max(screen.y)
+    };
+    Rect::new(screen.x, y, screen.width, h)
 }
 
 fn paint_select(
@@ -3429,19 +3465,22 @@ mod tests {
     fn link_preview_uses_notice_box() {
         let url = "https://example.com/a";
         let items = vec![url.to_string()];
-        assert_eq!(notice_height(&items, 24), 3);
-        assert_eq!(notice_height(&[], 24), 0);
-        let mut buf = Buffer::new(40, 3);
-        let area = buf.area();
-        notice_panel(&mut buf, area, "link", accent(), accent().bold(), &items);
-        assert_eq!(buf.get(3, 0).ch, 'l');
-        let inner = Block::inner(area);
+        let mut buf = Buffer::new(40, 12);
+        let screen = buf.area();
+        let composer = Rect::new(0, 8, 40, 3);
+        let overlay = overlay_above(screen, composer, 3);
+        assert_eq!(overlay, Rect::new(0, 5, 40, 3));
+        fill_rect(&mut buf, overlay, Style::new());
+        notice_panel(&mut buf, overlay, "link", accent(), accent().bold(), &items);
+        assert_eq!(buf.get(3, 5).ch, 'l');
+        let inner = Block::inner(overlay);
         let shown: String = (inner.x.saturating_add(1)..inner.right())
             .map(|x| buf.get(x, inner.y).ch)
             .collect::<String>()
             .trim()
             .to_string();
         assert!(shown.contains(url), "{shown:?}");
+        assert_eq!(composer.y, 8);
     }
 
     #[test]

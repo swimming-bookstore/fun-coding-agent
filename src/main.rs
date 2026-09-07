@@ -1330,9 +1330,9 @@ fn apply_ui(ui: &mut Ui, edit: &LineEdit, action: KeyAction) -> Result<KeyAction
             Ok(KeyAction::Skip)
         }
         KeyAction::ClickTools(x, y) => {
-            if ui.click_tools(x, y)? {
+            if ui.open_clicked_link(x, y) {
                 Ok(KeyAction::Skip)
-            } else if ui.open_clicked_link(x, y) {
+            } else if ui.click_tools(x, y)? {
                 Ok(KeyAction::Skip)
             } else {
                 ui.select_start(x, y)?;
