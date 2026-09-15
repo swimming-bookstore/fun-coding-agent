@@ -40,6 +40,8 @@ enum KeyAction {
     DropChip(usize),
     Action(usize),
     AskSubmit,
+    OpenPrune(Vec<String>),
+    ClosePrune,
 }
 
 struct LineEdit {
@@ -259,6 +261,9 @@ fn on_event(ui: &mut Ui, edit: &mut LineEdit, ev: CEvent) -> KeyAction {
     if ui.asking() {
         return on_ask(ui, ev);
     }
+    if ui.pruning() {
+        return on_prune(ui, ev);
+    }
     if let CEvent::Paste(s) = ev {
         edit.paste(&s);
         return KeyAction::Skip;
@@ -267,6 +272,55 @@ fn on_event(ui: &mut Ui, edit: &mut LineEdit, ev: CEvent) -> KeyAction {
         return on_mouse(ui, mouse);
     }
     on_key(edit, ev)
+}
+
+fn on_prune(ui: &mut Ui, ev: CEvent) -> KeyAction {
+    if let CEvent::Mouse(mouse) = ev {
+        return match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                let _ = ui.prune_scroll(-3);
+                KeyAction::Skip
+            }
+            MouseEventKind::ScrollDown => {
+                let _ = ui.prune_scroll(3);
+                KeyAction::Skip
+            }
+            MouseEventKind::Down(MouseButton::Left) => KeyAction::ClosePrune,
+            _ => KeyAction::Skip,
+        };
+    }
+    let CEvent::Key(key) = ev else {
+        return KeyAction::Skip;
+    };
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c' | 'C'))
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
+    {
+        return KeyAction::Quit;
+    }
+    if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
+        return KeyAction::Skip;
+    }
+    match key.code {
+        KeyCode::Esc => KeyAction::ClosePrune,
+        KeyCode::Up | KeyCode::PageUp => {
+            let _ = ui.prune_scroll(if matches!(key.code, KeyCode::PageUp) {
+                -8
+            } else {
+                -1
+            });
+            KeyAction::Skip
+        }
+        KeyCode::Down | KeyCode::PageDown => {
+            let _ = ui.prune_scroll(if matches!(key.code, KeyCode::PageDown) {
+                8
+            } else {
+                1
+            });
+            KeyAction::Skip
+        }
+        _ => KeyAction::Skip,
+    }
 }
 
 fn on_ask(ui: &mut Ui, ev: CEvent) -> KeyAction {
@@ -355,7 +409,13 @@ fn on_mouse(ui: &mut Ui, mouse: crossterm::event::MouseEvent) -> KeyAction {
                         ui.begin_queue_drag(i);
                         KeyAction::Skip
                     }
-                    None => KeyAction::ClickTools(mouse.column, mouse.row),
+                    None => {
+                        if let Some(lines) = ui.click_prune_note(mouse.column, mouse.row) {
+                            KeyAction::OpenPrune(lines)
+                        } else {
+                            KeyAction::ClickTools(mouse.column, mouse.row)
+                        }
+                    }
                 },
             }
         }
@@ -422,6 +482,7 @@ fn on_key(edit: &mut LineEdit, ev: CEvent) -> KeyAction {
                 }
                 return KeyAction::Skip;
             }
+            KeyCode::Char('p') => return KeyAction::Skip,
             KeyCode::Char('a') => {
                 edit.cursor = 0;
                 return KeyAction::Skip;
@@ -521,6 +582,7 @@ fn paint(ui: &mut Ui, line: &LogLine) -> Result<()> {
         LogLine::Dim(t) => ui.note(t),
         LogLine::Tools { runs } => ui.tools(runs.clone()),
         LogLine::Usage(_) => Ok(()),
+        LogLine::Pruned { .. } => Ok(()),
     }
 }
 
@@ -534,6 +596,18 @@ fn apply_log(
         LogLine::Usage(usage) => {
             status.usage = usage;
             refresh_bar(ui, status)
+        }
+        LogLine::Pruned { n: _, lines } => {
+            status.pending_inspect = Some(lines);
+            Ok(())
+        }
+        LogLine::Dim(text) => {
+            let inspect = if text.contains("dropped ") && text.contains("from context") {
+                status.pending_inspect.take()
+            } else {
+                None
+            };
+            ui.note_inspect(&text, inspect)
         }
         LogLine::User(text) => {
             if let Some(i) = pending.iter().position(|p| p.text() == text) {
@@ -842,6 +916,8 @@ struct Status {
     pull: Option<String>,
     git_at: Option<Instant>,
     usage: Usage,
+    pruned: Vec<String>,
+    pending_inspect: Option<Vec<String>>,
 }
 
 enum Pending {
@@ -1197,7 +1273,8 @@ fn replay(ui: &mut Ui, session: &Session) -> Result<()> {
             empty_args()
         }
     };
-    for e in &session.entries {
+    let mut notes = session.prune_notes.iter().peekable();
+    for (i, e) in session.entries.iter().enumerate() {
         match e {
             Entry::User { text } => {
                 flush(ui, &mut runs)?;
@@ -1227,6 +1304,18 @@ fn replay(ui: &mut Ui, session: &Session) -> Result<()> {
                 let args = take_args(&mut pending, &t.id);
                 runs.push(tool_ok(&t.name, &args));
             }
+        }
+        while notes.peek().is_some_and(|(at, _)| *at == i + 1) {
+            let (_, ids) = notes.next().expect("peeked");
+            flush(ui, &mut runs)?;
+            let n = ids.len();
+            ui.note_inspect(
+                &format!("(dropped {n} messages from context)"),
+                Some(fun_core::session::prune_inspect_ids(
+                    &session.entries,
+                    ids.iter().copied(),
+                )),
+            )?;
         }
     }
     flush(ui, &mut runs)
@@ -1313,10 +1402,10 @@ fn copy_system_once(slot: &mut Option<arboard::Clipboard>, text: &str) -> Result
     Ok(())
 }
 
-fn apply_ui(ui: &mut Ui, edit: &LineEdit, action: KeyAction) -> Result<KeyAction> {
+fn apply_ui(ui: &mut Ui, edit: &LineEdit, action: KeyAction, _status: &Status) -> Result<KeyAction> {
     match action {
         KeyAction::Skip => {
-            if !ui.asking() {
+            if !ui.asking() && !ui.pruning() {
                 paint_composer(ui, edit)?;
             }
             Ok(KeyAction::Skip)
@@ -1362,9 +1451,17 @@ fn apply_ui(ui: &mut Ui, edit: &LineEdit, action: KeyAction) -> Result<KeyAction
             Ok(KeyAction::Skip)
         }
         KeyAction::DropChip(_) => {
-            if !ui.asking() {
+            if !ui.asking() && !ui.pruning() {
                 paint_composer(ui, edit)?;
             }
+            Ok(KeyAction::Skip)
+        }
+        KeyAction::OpenPrune(lines) => {
+            ui.open_prune(lines)?;
+            Ok(KeyAction::Skip)
+        }
+        KeyAction::ClosePrune => {
+            ui.close_prune()?;
             Ok(KeyAction::Skip)
         }
         other => Ok(other),
@@ -1397,6 +1494,8 @@ async fn run_tui(
         pull: Some(resolve_home(&agent.workspace)),
         git_at: Some(Instant::now()),
         usage: agent.session.usage,
+        pruned: fun_core::session::prune_inspect(&agent.session.entries, &agent.session.hidden),
+        pending_inspect: None,
     };
     tui::set_git(git_dir(&agent.workspace).is_some());
     tui::set_origin(
@@ -1407,13 +1506,26 @@ async fn run_tui(
     refresh_bar(&mut ui, &status)?;
     ui.batch(|ui| {
         if !agent.session.entries.is_empty() {
-            paint(
-                ui,
-                &LogLine::Dim(format!(
-                    "(resumed {}, {} entries)",
-                    agent.session.path.display(),
-                    agent.session.entries.len()
-                )),
+            let n = agent.session.entries.len();
+            let dropped = status.pruned.len();
+            let msg = if dropped == 0 {
+                format!(
+                    "(resumed {}, {n} entries)",
+                    agent.session.path.display()
+                )
+            } else {
+                format!(
+                    "(resumed {}, {n} entries, {dropped} pruned from context)",
+                    agent.session.path.display()
+                )
+            };
+            ui.note_inspect(
+                &msg,
+                if dropped == 0 {
+                    None
+                } else {
+                    Some(status.pruned.clone())
+                },
             )?;
         }
         replay(ui, &agent.session)
@@ -1440,7 +1552,7 @@ async fn run_tui(
                 if apply_queue(&tx, &mut ui, &mut edit, &mut pending, &action)? {
                     continue;
                 }
-                match apply_ui(&mut ui, &edit, action)? {
+                match apply_ui(&mut ui, &edit, action, &status)? {
                     KeyAction::Quit => return Ok(()),
                     KeyAction::Abort => return Ok(()),
                     KeyAction::AskSubmit => {
@@ -1568,7 +1680,7 @@ async fn run_turn(
                 if apply_queue(tx, ui, edit, pending, &action)? {
                     continue;
                 }
-                match apply_ui(ui, edit, action)? {
+                match apply_ui(ui, edit, action, status)? {
                     KeyAction::Quit => {
                         tx.abort();
                         return Ok(true);
@@ -1609,9 +1721,6 @@ async fn run_turn(
                         sync_queue(ui, pending)?;
                         paint_composer(ui, edit)?;
                         tx.abort();
-                        (&mut fut).await?;
-                        flush_log(ui, status, pending, log_rx)?;
-                        return Ok(false);
                     }
                     KeyAction::Confirm => {
                         if let Some(text) = take_composer(edit) {
@@ -1945,6 +2054,8 @@ mod tests {
             pull: Some("master".into()),
             git_at: None,
             usage: Usage::default(),
+            pruned: Vec::new(),
+            pending_inspect: None,
         };
         assert_eq!(
             action_prompt(&KeyAction::Action(1), &on_home).as_deref(),

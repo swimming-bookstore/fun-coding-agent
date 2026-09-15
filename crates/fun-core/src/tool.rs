@@ -1,11 +1,11 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use serde_json::Value;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::sync::Notify;
@@ -120,7 +120,9 @@ fn resolve_path(workspace: &Path, path: &str) -> Result<PathBuf> {
     if path.is_empty() {
         bail!("empty path");
     }
-    let root = workspace.canonicalize().unwrap_or_else(|_| clean(workspace));
+    let root = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| clean(workspace));
     let requested = Path::new(path);
     let candidate = if requested.is_absolute() {
         clean(requested)
@@ -179,7 +181,11 @@ fn tool_bash() -> Tool {
     }
 }
 
-fn format_bash_output(stdout: &[u8], stderr: &[u8], status: std::process::ExitStatus) -> Result<String> {
+fn format_bash_output(
+    stdout: &[u8],
+    stderr: &[u8],
+    status: std::process::ExitStatus,
+) -> Result<String> {
     let mut text = String::from_utf8_lossy(stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(stderr));
     cap_utf8(&mut text, MAX_BASH_BYTES);
@@ -241,12 +247,14 @@ fn detach_from_tty(cmd: &mut tokio::process::Command) {
     let _ = cmd;
 }
 
-fn kill_bash(child: &mut tokio::process::Child) {
+fn kill_bash(child: &mut tokio::process::Child, pid: Option<u32>) {
     #[cfg(all(unix, not(target_os = "ios")))]
-    if let Some(id) = child.id() {
+    if let Some(id) = pid {
         // setsid() makes the child the process-group leader (pgid == pid).
         let _ = unsafe { libc::kill(-(id as i32), libc::SIGKILL) };
     }
+    #[cfg(not(all(unix, not(target_os = "ios"))))]
+    let _ = pid;
     let _ = child.start_kill();
 }
 
@@ -270,38 +278,55 @@ async fn bash_execute_async(workspace: &Path, raw: &Value, abort: &Abort) -> Res
     let mut child = bash_command(workspace, &a.cmd)
         .spawn()
         .context("spawn bash")?;
+    let pid = child.id();
     let mut stdout = child.stdout.take().context("bash stdout")?;
     let mut stderr = child.stderr.take().context("bash stderr")?;
-    let out_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        stdout.read_to_end(&mut buf).await?;
-        Ok::<_, std::io::Error>(buf)
-    });
-    let err_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        stderr.read_to_end(&mut buf).await?;
-        Ok::<_, std::io::Error>(buf)
-    });
-    let status = tokio::select! {
-        status = child.wait() => status.context("wait bash")?,
-        _ = abort.wait() => {
-            kill_bash(&mut child);
-            reap_bash(&mut child).await;
-            out_task.abort();
-            err_task.abort();
-            return Err(aborted());
+    let mut out_buf = Vec::new();
+    let mut err_buf = Vec::new();
+    let mut out_tmp = [0u8; 8192];
+    let mut err_tmp = [0u8; 8192];
+    let mut out_open = true;
+    let mut err_open = true;
+    let mut status = None;
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        tokio::select! {
+            n = stdout.read(&mut out_tmp), if out_open => match n {
+                Ok(0) | Err(_) => out_open = false,
+                Ok(n) => {
+                    if out_buf.len() < MAX_BASH_BYTES {
+                        out_buf.extend_from_slice(&out_tmp[..n]);
+                    }
+                }
+            },
+            n = stderr.read(&mut err_tmp), if err_open => match n {
+                Ok(0) | Err(_) => err_open = false,
+                Ok(n) => {
+                    if err_buf.len() < MAX_BASH_BYTES {
+                        err_buf.extend_from_slice(&err_tmp[..n]);
+                    }
+                }
+            },
+            s = child.wait(), if status.is_none() => {
+                status = Some(s.context("wait bash")?);
+            }
+            _ = abort.wait() => {
+                kill_bash(&mut child, pid);
+                reap_bash(&mut child).await;
+                return Err(aborted());
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                kill_bash(&mut child, pid);
+                reap_bash(&mut child).await;
+                bail!("bash timed out after {}s", timeout.as_secs());
+            }
         }
-        _ = tokio::time::sleep(timeout) => {
-            kill_bash(&mut child);
-            reap_bash(&mut child).await;
-            out_task.abort();
-            err_task.abort();
-            bail!("bash timed out after {}s", timeout.as_secs());
+        if status.is_some() && !out_open && !err_open {
+            break;
         }
-    };
-    let stdout = out_task.await.context("bash stdout task")?.context("read bash stdout")?;
-    let stderr = err_task.await.context("bash stderr task")?.context("read bash stderr")?;
-    format_bash_output(&stdout, &stderr, status)
+    }
+    let status = status.ok_or_else(|| anyhow::anyhow!("bash exited without a status"))?;
+    format_bash_output(&out_buf, &err_buf, status)
 }
 
 pub async fn execute_tool(
@@ -595,10 +620,7 @@ mod tests {
     #[test]
     fn resolve_relative_and_outside() {
         let root = workspace();
-        assert!(
-            fs::write(root.join("a.txt"), "ok").is_ok(),
-            "write fixture"
-        );
+        assert!(fs::write(root.join("a.txt"), "ok").is_ok(), "write fixture");
         let resolved = resolve_path(&root, "a.txt");
         assert!(resolved.as_ref().is_ok_and(|p| p.ends_with("a.txt")));
         assert!(resolve_path(&root, "../secret").is_ok());
@@ -609,10 +631,10 @@ mod tests {
     #[test]
     fn read_outside_workspace_and_directory() {
         let root = workspace();
-        let outside = root.parent().unwrap().join(format!(
-            "fun-tool-out-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let outside = root
+            .parent()
+            .unwrap()
+            .join(format!("fun-tool-out-{}", uuid::Uuid::new_v4().simple()));
         assert!(fs::create_dir_all(&outside).is_ok());
         assert!(fs::write(outside.join("secret.txt"), "peek").is_ok());
         let out = read_execute(
@@ -677,7 +699,12 @@ mod tests {
     fn write_edit_read_roundtrip() {
         let root = workspace();
         assert!(
-            write_execute(&root, &json!({"path": "n.txt", "content": "hello world"}), &Abort::new()).is_ok(),
+            write_execute(
+                &root,
+                &json!({"path": "n.txt", "content": "hello world"}),
+                &Abort::new()
+            )
+            .is_ok(),
             "write"
         );
         assert!(
@@ -691,12 +718,14 @@ mod tests {
         );
         let out = read_execute(&root, &json!({"path": "n.txt"}), &Abort::new());
         assert!(out.as_ref().is_ok_and(|s| s.contains("hello there")));
-        assert!(edit_execute(
-            &root,
-            &json!({"path": "n.txt", "old": "missing", "new": "x"}),
-            &Abort::new(),
-        )
-        .is_err());
+        assert!(
+            edit_execute(
+                &root,
+                &json!({"path": "n.txt", "old": "missing", "new": "x"}),
+                &Abort::new(),
+            )
+            .is_err()
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -725,21 +754,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bash_abort_stops_orphaned_stdout() {
+        let root = workspace();
+        let abort = Abort::new();
+        let abort2 = abort.clone();
+        let root2 = root.clone();
+        let task = tokio::spawn(async move {
+            bash_execute_async(
+                &root2,
+                &json!({"cmd": "(sleep 30) &", "timeout": 60}),
+                &abort2,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        abort.abort();
+        let started = std::time::Instant::now();
+        let out = task.await.expect("join");
+        let elapsed = started.elapsed();
+        let _ = fs::remove_dir_all(&root);
+        assert!(out.as_ref().is_err_and(is_abort), "{out:?}");
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+    }
+
+    #[tokio::test]
     async fn bash_times_out() {
         let root = workspace();
         let abort = Abort::new();
         let started = std::time::Instant::now();
-        let out = bash_execute_async(
-            &root,
-            &json!({"cmd": "sleep 8", "timeout": 1}),
-            &abort,
-        )
-        .await;
+        let out = bash_execute_async(&root, &json!({"cmd": "sleep 8", "timeout": 1}), &abort).await;
         let elapsed = started.elapsed();
         let _ = fs::remove_dir_all(&root);
         assert!(out.is_err(), "{out:?}");
         assert!(
-            out.as_ref().is_err_and(|e| format!("{e:#}").contains("timed out")),
+            out.as_ref()
+                .is_err_and(|e| format!("{e:#}").contains("timed out")),
             "{out:?}"
         );
         assert!(elapsed < Duration::from_secs(4), "{elapsed:?}");

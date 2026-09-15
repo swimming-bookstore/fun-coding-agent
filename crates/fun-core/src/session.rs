@@ -1,11 +1,17 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+pub use crate::prune::{
+    parse_drop_ids, prune_inspect, prune_inspect_ids, prune_restored, record_turn, sanitize_hidden,
+    should_prune, PruneTurn, PruneView,
+};
 
 pub fn empty_args() -> Value {
     Value::Object(serde_json::Map::default())
@@ -30,7 +36,9 @@ pub struct ToolResult {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Entry {
-    User { text: String },
+    User {
+        text: String,
+    },
     Assistant {
         text: String,
         #[serde(default)]
@@ -126,9 +134,27 @@ pub struct Usage {
 
 impl Usage {
     pub fn add(&mut self, input: u64, output: u64, cached: u64, reasoning: u64) {
+        self.add_inner(input, output, cached, reasoning, true);
+    }
+
+    /// Count prune-turn tokens without treating that payload as the live context size.
+    pub fn add_prune(&mut self, input: u64, output: u64, cached: u64, reasoning: u64) {
+        self.add_inner(input, output, cached, reasoning, false);
+    }
+
+    fn add_inner(
+        &mut self,
+        input: u64,
+        output: u64,
+        cached: u64,
+        reasoning: u64,
+        set_last_input: bool,
+    ) {
         if input > 0 {
             self.input_tokens += input;
-            self.last_input_tokens = input;
+            if set_last_input {
+                self.last_input_tokens = input;
+            }
         }
         if output > 0 {
             self.output_tokens += output;
@@ -148,6 +174,25 @@ struct DiskUsage {
     kind: String,
     #[serde(flatten)]
     usage: Usage,
+}
+
+#[derive(Serialize, Deserialize)]
+struct DiskPrune {
+    #[serde(rename = "type")]
+    kind: String,
+    hidden: Vec<usize>,
+    /// Newly hidden this prune (0 on older files — recovered from the hidden-set delta).
+    #[serde(default)]
+    dropped: usize,
+    /// Ids hidden this prune (empty on older files — recovered from the hidden-set delta).
+    #[serde(default)]
+    added: Vec<usize>,
+    /// Ids still sent after this prune (empty on older files — recovered as complement of hidden).
+    #[serde(default)]
+    keep: Vec<usize>,
+    /// Hidden write/edit ids currently restored as compact stubs.
+    #[serde(default)]
+    restored: Vec<usize>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -215,6 +260,13 @@ pub struct Session {
     pub entries: Vec<Entry>,
     pub path: PathBuf,
     pub usage: Usage,
+    pub hidden: BTreeSet<usize>,
+    /// Hidden write/edit ids sent as compact stubs. Kept across later prunes.
+    pub restored: BTreeSet<usize>,
+    /// Drop notes: `(entries.len() when pruned, newly hidden ids)`.
+    pub prune_notes: Vec<(usize, Vec<usize>)>,
+    /// Per-turn keep/drop. The next send is last keep plus later messages, minus later drop.
+    pub ledger: Vec<PruneTurn>,
 }
 
 #[derive(Clone)]
@@ -253,6 +305,10 @@ impl Session {
             entries: Vec::new(),
             path,
             usage: Usage::default(),
+            hidden: BTreeSet::new(),
+            restored: BTreeSet::new(),
+            prune_notes: Vec::new(),
+            ledger: Vec::new(),
         })
     }
 
@@ -261,6 +317,10 @@ impl Session {
             .with_context(|| format!("read session {}", path.display()))?;
         let mut entries = Vec::new();
         let mut usage = Usage::default();
+        let mut hidden = BTreeSet::new();
+        let mut restored = BTreeSet::new();
+        let mut prune_notes = Vec::new();
+        let mut ledger = Vec::new();
         for line in text.lines() {
             if line.trim().is_empty() {
                 continue;
@@ -273,6 +333,35 @@ impl Session {
                 Some("usage") => {
                     if let Ok(u) = serde_json::from_value::<DiskUsage>(v) {
                         usage = u.usage;
+                    }
+                }
+                Some("compact") => {}
+                Some("prune") => {
+                    if let Ok(p) = serde_json::from_value::<DiskPrune>(v) {
+                        let next: BTreeSet<usize> = p.hidden.into_iter().collect();
+                        let added: Vec<usize> = if !p.added.is_empty() {
+                            p.added
+                        } else {
+                            next.difference(&hidden).copied().collect()
+                        };
+                        if !added.is_empty() {
+                            prune_notes.push((entries.len(), added.clone()));
+                        }
+                        restored = p.restored.into_iter().collect();
+                        let keep = if p.keep.is_empty() {
+                            (0..entries.len())
+                                .filter(|i| !next.contains(i))
+                                .collect()
+                        } else {
+                            p.keep
+                        };
+                        ledger.push(PruneTurn {
+                            at: entries.len(),
+                            keep,
+                            drop: added,
+                            restored: restored.iter().copied().collect(),
+                        });
+                        hidden = next;
                     }
                 }
                 Some("entry") => {
@@ -290,10 +379,21 @@ impl Session {
                 }
             }
         }
+        hidden.retain(|i| *i < entries.len());
+        hidden = sanitize_hidden(&entries, &hidden);
+        if restored.is_empty() {
+            restored = prune_restored(&entries, &hidden).into_keys().collect();
+        } else {
+            restored.retain(|i| hidden.contains(i));
+        }
         Ok(Self {
             entries,
             path,
             usage,
+            hidden,
+            restored,
+            prune_notes,
+            ledger,
         })
     }
 
@@ -346,7 +446,11 @@ impl Session {
         let Ok(rd) = fs::read_dir(&root) else {
             return Ok(groups);
         };
-        let mut dirs: Vec<_> = rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+        let mut dirs: Vec<_> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
         dirs.sort();
         for dir in dirs {
             let mut chats = Vec::new();
@@ -405,7 +509,10 @@ impl Session {
             if let Some(mut g) = all
                 .iter()
                 .find(|g| {
-                    g.workspace.canonicalize().unwrap_or_else(|_| g.workspace.clone()) == canon
+                    g.workspace
+                        .canonicalize()
+                        .unwrap_or_else(|_| g.workspace.clone())
+                        == canon
                         || g.workspace == *ws
                 })
                 .cloned()
@@ -436,6 +543,58 @@ impl Session {
                 kind: "usage".into(),
                 usage,
             },
+        )
+    }
+
+    pub fn save_hidden(&mut self, hidden: BTreeSet<usize>) -> Result<(Vec<usize>, Vec<usize>)> {
+        let hidden = sanitize_hidden(&self.entries, &hidden);
+        let added: Vec<usize> = hidden.difference(&self.hidden).copied().collect();
+        let dropped = added.len();
+        let restored: BTreeSet<usize> = prune_restored(&self.entries, &hidden).into_keys().collect();
+        let mut newly: Vec<usize> = restored.difference(&self.restored).copied().collect();
+        newly.sort_unstable();
+        append_json(
+            &self.path,
+            &DiskPrune {
+                kind: "prune".into(),
+                hidden: hidden.iter().copied().collect(),
+                dropped,
+                added: added.clone(),
+                keep: (0..self.entries.len())
+                    .filter(|i| !hidden.contains(i))
+                    .collect(),
+                restored: restored.iter().copied().collect(),
+            },
+        )?;
+        if dropped > 0 {
+            self.prune_notes.push((self.entries.len(), added.clone()));
+        }
+        self.ledger.push(record_turn(
+            self.entries.len(),
+            &hidden,
+            added.clone(),
+            prune_restored(&self.entries, &hidden),
+        ));
+        self.hidden = hidden;
+        self.restored = restored;
+        Ok((added, newly))
+    }
+
+    /// Entries sent to the model: last keep plus later messages, minus later drop.
+    pub fn model_entries(&self) -> Vec<Entry> {
+        crate::prune::model_entries(&self.entries, &self.ledger)
+    }
+
+    /// Live / Keep / Candidate / Hidden, with previous keep/drop for the prune model.
+    pub fn prune_view(&self) -> PruneView<'_> {
+        PruneView::with_ledger(&self.entries, &self.hidden, &self.ledger)
+    }
+
+    pub fn should_prune(&self) -> Option<usize> {
+        should_prune(
+            &self.entries,
+            &self.hidden,
+            self.usage.last_input_tokens,
         )
     }
 }
@@ -508,11 +667,12 @@ mod tests {
             entries: Vec::new(),
             path: path.clone(),
             usage: Usage::default(),
+            hidden: BTreeSet::new(),
+            restored: BTreeSet::new(),
+            prune_notes: Vec::new(),
+            ledger: Vec::new(),
         };
-        assert!(
-            s.add(Entry::User { text: "hi".into() }).is_ok(),
-            "add user"
-        );
+        assert!(s.add(Entry::User { text: "hi".into() }).is_ok(), "add user");
         assert!(
             s.add(Entry::Assistant {
                 text: "yo".into(),
@@ -560,7 +720,10 @@ mod tests {
 
     #[test]
     fn load_missing_file_errors() {
-        let path = std::env::temp_dir().join(format!("fun-missing-{}.jsonl", uuid::Uuid::new_v4().simple()));
+        let path = std::env::temp_dir().join(format!(
+            "fun-missing-{}.jsonl",
+            uuid::Uuid::new_v4().simple()
+        ));
         assert!(Session::load(path).is_err());
     }
 
@@ -573,5 +736,160 @@ mod tests {
         u.add(8, 1, 0, 0);
         assert_eq!(u.input_tokens, 20);
         assert_eq!(u.last_input_tokens, 8);
+        u.add_prune(40_000, 20, 0, 0);
+        assert_eq!(u.input_tokens, 40_020);
+        assert_eq!(u.last_input_tokens, 8);
+    }
+
+    fn user(s: &str) -> Entry {
+        Entry::User { text: s.into() }
+    }
+
+    fn assistant_call(id: &str, name: &str) -> Entry {
+        Entry::Assistant {
+            text: String::new(),
+            thinking: String::new(),
+            calls: vec![Call {
+                id: id.into(),
+                name: name.into(),
+                args: empty_args(),
+            }],
+        }
+    }
+
+    fn tool_named(id: &str, name: &str, content: &str) -> Entry {
+        Entry::Tool(ToolResult {
+            id: id.into(),
+            name: name.into(),
+            content: content.into(),
+            is_error: false,
+        })
+    }
+
+    fn assistant_write(id: &str, path: &str, content: &str) -> Entry {
+        Entry::Assistant {
+            text: String::new(),
+            thinking: String::new(),
+            calls: vec![Call {
+                id: id.into(),
+                name: "write".into(),
+                args: serde_json::json!({"path": path, "content": content}),
+            }],
+        }
+    }
+
+    fn tool(id: &str, content: &str) -> Entry {
+        Entry::Tool(ToolResult {
+            id: id.into(),
+            name: "read".into(),
+            content: content.into(),
+            is_error: false,
+        })
+    }
+
+    #[test]
+    fn save_and_reload_hidden() {
+        let dir = tmp();
+        let path = dir.join("c.jsonl");
+        let mut s = Session {
+            entries: Vec::new(),
+            path: path.clone(),
+            usage: Usage::default(),
+            hidden: BTreeSet::new(),
+            restored: BTreeSet::new(),
+            prune_notes: Vec::new(),
+            ledger: Vec::new(),
+        };
+        assert!(s.add(user("one")).is_ok());
+        assert!(s.add(assistant_call("c1", "bash")).is_ok());
+        assert!(s.add(tool("c1", "noise")).is_ok());
+        assert!(s.save_hidden(BTreeSet::from([1, 2])).is_ok());
+        let loaded = Session::load(path);
+        assert!(loaded.is_ok());
+        if let Ok(loaded) = loaded {
+            assert_eq!(loaded.entries.len(), 3);
+            assert!(loaded.hidden.contains(&1));
+            assert!(loaded.hidden.contains(&2));
+            assert!(!loaded.hidden.contains(&0));
+            assert_eq!(loaded.prune_notes, vec![(3, vec![1, 2])]);
+            assert!(loaded.restored.is_empty());
+            assert_eq!(loaded.ledger.len(), 1);
+            assert_eq!(loaded.ledger[0].drop, vec![1, 2]);
+            assert_eq!(loaded.ledger[0].keep, vec![0]);
+            assert_eq!(loaded.ledger[0].at, 3);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_persists_across_later_prunes() {
+        let dir = tmp();
+        let path = dir.join("r.jsonl");
+        let mut s = Session {
+            entries: Vec::new(),
+            path: path.clone(),
+            usage: Usage::default(),
+            hidden: BTreeSet::new(),
+            restored: BTreeSet::new(),
+            prune_notes: Vec::new(),
+            ledger: Vec::new(),
+        };
+        assert!(s.add(user("make okta")).is_ok());
+        assert!(s.add(assistant_write("w1", "src/login.rs", "okta")).is_ok());
+        assert!(s.add(tool_named("w1", "write", "wrote okta")).is_ok());
+        assert!(s.add(assistant_call("c1", "bash")).is_ok());
+        assert!(s.add(tool("c1", "noise")).is_ok());
+        assert!(s.add(user("open")).is_ok());
+        let (added, newly) = s.save_hidden(BTreeSet::from([1, 2, 3, 4])).expect("prune 1");
+        assert_eq!(added, vec![1, 2, 3, 4]);
+        assert_eq!(newly, vec![1, 2]);
+        assert_eq!(s.restored, BTreeSet::from([1, 2]));
+        assert!(s.add(assistant_call("c2", "bash")).is_ok());
+        assert!(s.add(tool("c2", "more noise")).is_ok());
+        assert!(s.add(user("open again")).is_ok());
+        let (added, newly) = s.save_hidden(BTreeSet::from([1, 2, 3, 4, 6, 7])).expect("prune 2");
+        assert_eq!(added, vec![6, 7]);
+        assert!(newly.is_empty(), "already-restored writes stay restored");
+        assert_eq!(s.restored, BTreeSet::from([1, 2]));
+        let out = s.model_entries();
+        assert!(out.iter().any(|e| matches!(e, Entry::Assistant { calls, .. } if calls.iter().any(|c| c.name == "write"))));
+        assert!(!out.iter().any(|e| matches!(e, Entry::Assistant { calls, .. } if calls.iter().any(|c| c.name == "bash"))));
+        let loaded = Session::load(path).expect("reload");
+        assert_eq!(loaded.restored, BTreeSet::from([1, 2]));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_recovers_prune_note_without_dropped_field() {
+        let dir = tmp();
+        let path = dir.join("old-prune.jsonl");
+        let header = r#"{"type":"header","version":1,"id":"x","cwd":"/tmp","createdAt":1}"#;
+        let user = r#"{"kind":"user","text":"hi"}"#;
+        let asst = r#"{"kind":"assistant","text":"yo","thinking":"","calls":[]}"#;
+        let prune = r#"{"type":"prune","hidden":[0]}"#;
+        fs::write(&path, format!("{header}\n{user}\n{asst}\n{prune}\n")).unwrap();
+        let loaded = Session::load(path).expect("load");
+        assert_eq!(loaded.prune_notes, vec![(2, vec![0])]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_keeps_each_prune_added_ids() {
+        let dir = tmp();
+        let path = dir.join("two-prune.jsonl");
+        let header = r#"{"type":"header","version":1,"id":"x","cwd":"/tmp","createdAt":1}"#;
+        let a = r#"{"kind":"user","text":"a"}"#;
+        let b = r#"{"kind":"assistant","text":"b","thinking":"","calls":[]}"#;
+        let c = r#"{"kind":"user","text":"c"}"#;
+        let p1 = r#"{"type":"prune","hidden":[0,1],"dropped":2,"added":[0,1]}"#;
+        let p2 = r#"{"type":"prune","hidden":[0,1,2],"dropped":1,"added":[2]}"#;
+        fs::write(&path, format!("{header}\n{a}\n{b}\n{p1}\n{c}\n{p2}\n")).unwrap();
+        let loaded = Session::load(path).expect("load");
+        assert_eq!(loaded.prune_notes, vec![(2, vec![0, 1]), (3, vec![2])]);
+        assert_eq!(
+            prune_inspect_ids(&loaded.entries, loaded.prune_notes[0].1.iter().copied()).len(),
+            2
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

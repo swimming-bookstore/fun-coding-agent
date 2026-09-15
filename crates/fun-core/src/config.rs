@@ -49,7 +49,7 @@
 //! }
 //! ```
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::env;
 use std::fs;
@@ -150,7 +150,12 @@ pub fn on_home(home: Option<&str>, branch: Option<&str>) -> bool {
     }
 }
 
-fn pick<'a>(home_s: Option<&'a str>, other: &'a str, home: Option<&str>, branch: Option<&str>) -> &'a str {
+fn pick<'a>(
+    home_s: Option<&'a str>,
+    other: &'a str,
+    home: Option<&str>,
+    branch: Option<&str>,
+) -> &'a str {
     if on_home(home, branch) {
         home_s.unwrap_or(other)
     } else {
@@ -331,8 +336,8 @@ fn load_from(path: &Path) -> Result<Config> {
         return Ok(Config::default());
     }
     let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let file: File = serde_json::from_str(&raw)
-        .with_context(|| format!("parse {}", path.display()))?;
+    let file: File =
+        serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
     Ok(Config {
         palette: file.colors.into_palette()?,
         actions: match file.actions {
@@ -422,7 +427,11 @@ impl ColorFile {
         overlay(&mut pal.select, self.select, "colors.select")?;
         overlay(&mut pal.queue, self.queue, "colors.queue")?;
         overlay(&mut pal.think, self.think, "colors.think")?;
-        overlay(&mut pal.think_border, self.think_border, "colors.think_border")?;
+        overlay(
+            &mut pal.think_border,
+            self.think_border,
+            "colors.think_border",
+        )?;
         Ok(pal)
     }
 }
@@ -479,10 +488,22 @@ mod tests {
 
     #[test]
     fn parse_hex() {
-        assert_eq!(parse_color("#e2e6f1").ok().and_then(rgb_of), Some((226, 230, 241)));
-        assert_eq!(parse_color("7dcfe7").ok().and_then(rgb_of), Some((125, 207, 231)));
-        assert_eq!(parse_color("#fff").ok().and_then(rgb_of), Some((255, 255, 255)));
-        assert_eq!(parse_color("#f80").ok().and_then(rgb_of), Some((255, 136, 0)));
+        assert_eq!(
+            parse_color("#e2e6f1").ok().and_then(rgb_of),
+            Some((226, 230, 241))
+        );
+        assert_eq!(
+            parse_color("7dcfe7").ok().and_then(rgb_of),
+            Some((125, 207, 231))
+        );
+        assert_eq!(
+            parse_color("#fff").ok().and_then(rgb_of),
+            Some((255, 255, 255))
+        );
+        assert_eq!(
+            parse_color("#f80").ok().and_then(rgb_of),
+            Some((255, 136, 0))
+        );
         assert!(parse_color("red").is_err());
         assert!(parse_color("#gg0000").is_err());
     }
@@ -585,13 +606,18 @@ mod tests {
             fill_action("checkout and pull {home}", Some("master"), None, None).as_deref(),
             Some("checkout and pull master")
         );
-        assert_eq!(fill_action("checkout and pull {home}", None, None, None), None);
+        assert_eq!(
+            fill_action("checkout and pull {home}", None, None, None),
+            None
+        );
         assert_eq!(
             fill_action("[ commit to {home} and push ]", Some("dev"), None, None).as_deref(),
             Some("[ commit to dev and push ]")
         );
         assert_eq!(
-            commit.filled_prompt(Some("master"), Some("master"), None).as_deref(),
+            commit
+                .filled_prompt(Some("master"), Some("master"), None)
+                .as_deref(),
             Some("commit and push a new branch")
         );
         assert_eq!(
@@ -638,12 +664,7 @@ mod tests {
             )
         );
         assert_eq!(
-            fill_action(
-                commit.ask.as_deref().unwrap(),
-                Some("master"),
-                None,
-                None,
-            ),
+            fill_action(commit.ask.as_deref().unwrap(), Some("master"), None, None,),
             None
         );
         assert_eq!(parse_home(Some("dev".into())), "dev");

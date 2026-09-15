@@ -1,13 +1,24 @@
 use crate::grok::Grok;
+use crate::prune::{parse_drop_ids, prune_inspect_ids, PRUNE_MIN_CANDIDATES};
 use crate::session::{Call, Entry, Session, ToolResult, Usage};
-use crate::tool::{clip_utf8, execute_tool, is_abort, Abort, Tool};
+use crate::tool::{Abort, Tool, clip_utf8, execute_tool, is_abort};
 use anyhow::Result;
 use serde_json::Value;
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, Sender};
 
 const MAX_TOOL_ROUNDS: usize = 200;
+const PRUNE_SYSTEM: &str = "\
+You prune a coding-agent transcript. Reply with JSON only: {\"drop\":[ids]}.\n\
+Live and Keep messages must never appear in drop. User messages are Keep.\n\
+A Ledger of previous keep/drop turns is bookkeeping — the next send is last keep plus later messages, minus later drop.\n\
+Drop only the candidate ids you name (tool pairs are filled in). Do not treat a low id as “drop everything after”.\n\
+Prefer dead-end tool noise (failed bash, superseded dumps) so later file edits stay.\n\
+Drop: repeated or superseded tool output, dead-end commands, old plans, chatter, and old tool-less conclusions that later user lines replaced.\n\
+Do not drop user goals, later constraints, latest writes/edits of a file, or the previous turn’s latest read — the agent will otherwise redo or delete finished work.\n\
+Keep: every user message, the previous turn’s conclusion, current files/paths, remaining errors, and anything the live messages still need.\n\
+If nothing should go, return {\"drop\":[]}. No tools. No extra text.";
 
 #[derive(Clone)]
 pub struct ToolRun {
@@ -32,6 +43,7 @@ pub enum LogLine {
     Tools { runs: Vec<ToolRun> },
     Dim(String),
     Usage(Usage),
+    Pruned { n: usize, lines: Vec<String> },
 }
 
 enum MailCmd {
@@ -39,7 +51,10 @@ enum MailCmd {
     Steer(String),
     Idle(String),
     SetIdle(Vec<String>),
-    Adopt { session: Session, workspace: PathBuf },
+    Adopt {
+        session: Session,
+        workspace: PathBuf,
+    },
 }
 
 #[derive(Clone)]
@@ -175,6 +190,8 @@ pub struct Agent {
     pub session: Session,
     mailbox: Mailbox,
     log: Sender<LogLine>,
+    /// Live-tail index of a prune already tried this turn. Skip until that tail moves.
+    prune_stuck: Option<usize>,
 }
 
 impl Agent {
@@ -196,6 +213,7 @@ impl Agent {
             session,
             mailbox,
             log,
+            prune_stuck: None,
         }
     }
 
@@ -247,14 +265,38 @@ async fn agent_loop(a: &mut Agent) -> Result<()> {
             tool_rounds = 0;
             continue;
         }
+        match maybe_prune(a).await {
+            Ok(()) => {}
+            Err(e) if is_abort(&e) => {
+                if a.mailbox.cancelled() {
+                    break;
+                }
+                if inject_interrupt(a)? {
+                    a.mailbox.clear_abort();
+                    tool_rounds = 0;
+                    continue;
+                }
+                break;
+            }
+            Err(e) => return Err(e),
+        }
+        if a.mailbox.cancelled() {
+            break;
+        }
+        if inject_interrupt(a)? {
+            a.mailbox.clear_abort();
+            tool_rounds = 0;
+            continue;
+        }
         let system = a.system();
         let abort = a.mailbox.abort.clone();
+        let model_entries = a.session.model_entries();
         let reply = match a
             .provider
             .complete(
                 &a.model,
                 &system,
-                &a.session.entries,
+                &model_entries,
                 &a.tools,
                 &abort,
                 |d| a.emit(LogLine::Delta(d.into())),
@@ -445,6 +487,103 @@ fn inject_user(a: &mut Agent, text: Option<String>) -> Result<bool> {
     Ok(true)
 }
 
+async fn maybe_prune(a: &mut Agent) -> Result<()> {
+    // Only at the start of a user turn. Mid-turn the live tail already locks
+    // this turn's tools, so pruning after each tool just nibbles leftovers.
+    if !matches!(a.session.entries.last(), Some(Entry::User { .. })) {
+        return Ok(());
+    }
+    if a.session.should_prune().is_none() {
+        return Ok(());
+    }
+    let live_from = a.session.prune_view().live_from();
+    if a.prune_stuck == Some(live_from) {
+        return Ok(());
+    }
+    match run_prune(a).await {
+        Ok((added, _)) if added.is_empty() => {
+            a.prune_stuck = Some(live_from);
+            a.emit(LogLine::Dim("(nothing to drop)".into()));
+        }
+        Ok((added, restored)) => {
+            a.prune_stuck = Some(live_from);
+            emit_prune_note(a, added, restored);
+        }
+        Err(e) if is_abort(&e) => return Err(e),
+        Err(e) => {
+            a.prune_stuck = Some(live_from);
+            a.emit(LogLine::Dim(format!("(prune skipped: {e})")));
+        }
+    }
+    Ok(())
+}
+
+async fn run_prune(a: &mut Agent) -> Result<(Vec<usize>, Vec<usize>)> {
+    let (ids, listing) = a.session.prune_view().listing();
+    if ids.len() < PRUNE_MIN_CANDIDATES {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let abort = a.mailbox.abort.clone();
+    let prompt = format!(
+        "Workspace: {}\nDrop only candidate ids that no longer matter given the live messages.\n\n{listing}",
+        a.workspace.display()
+    );
+    let reply = a
+        .provider
+        .complete_with_effort(
+            &a.model,
+            PRUNE_SYSTEM,
+            &[Entry::User { text: prompt }],
+            &[],
+            &abort,
+            "low",
+            |_| {},
+            |_| {},
+        )
+        .await?;
+    a.session.usage.add_prune(
+        reply.input_tokens,
+        reply.output_tokens,
+        reply.cached_tokens,
+        reply.reasoning_tokens,
+    );
+    a.session.save_usage(a.session.usage)?;
+    a.emit(LogLine::Usage(a.session.usage));
+    let drop = parse_drop_ids(&reply.text, &ids);
+    if drop.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let hidden = a.session.prune_view().apply(&drop);
+    if hidden.difference(&a.session.hidden).next().is_none() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let (added, restored) = a.session.save_hidden(hidden)?;
+    if added.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    // Hidden rows are gone from the next payload; don't keep the pre-prune size.
+    a.session.usage.last_input_tokens = 0;
+    a.session.save_usage(a.session.usage)?;
+    Ok((added, restored))
+}
+
+fn emit_prune_note(a: &mut Agent, added: Vec<usize>, restored: Vec<usize>) {
+    let n = added.len();
+    let r = restored.len();
+    let mut lines = prune_inspect_ids(&a.session.entries, added);
+    if r > 0 {
+        lines.push(format!("restored {r}:"));
+        lines.extend(prune_inspect_ids(&a.session.entries, restored));
+    }
+    a.emit(LogLine::Pruned { n, lines });
+    let text = if r == 0 {
+        format!("(dropped {n} messages from context)")
+    } else {
+        format!("(dropped {n} messages from context, restored {r})")
+    };
+    a.emit(LogLine::Dim(text));
+}
+
 fn finish_skipped_tools(a: &mut Agent, calls: &[Call], from: usize) -> Result<()> {
     let rest = &calls[from..];
     if rest.is_empty() {
@@ -560,7 +699,11 @@ pub fn print_log(line: &LogLine) {
             print!("{t}");
             let _ = io::stdout().flush();
         }
-        LogLine::Think(_) | LogLine::User(_) | LogLine::Dim(_) | LogLine::Usage(_) => {}
+        LogLine::Think(_)
+        | LogLine::User(_)
+        | LogLine::Dim(_)
+        | LogLine::Usage(_)
+        | LogLine::Pruned { .. } => {}
         LogLine::End => println!(),
         LogLine::Tools { runs } => {
             let (ok, fail) = tool_counts(runs);
@@ -645,7 +788,10 @@ mod tests {
         assert_eq!(ellipsize("abcd", 4), "abcd");
         assert_eq!(ellipsize("abcde", 4), "abcd…");
         assert_eq!(title_case("bash"), "Bash");
-        assert_eq!(args_repr(&json!({"path": "../secret"})), "path=\"../secret\"");
+        assert_eq!(
+            args_repr(&json!({"path": "../secret"})),
+            "path=\"../secret\""
+        );
         let read = tool_fail(
             "read",
             &json!({"path": "../secret"}),

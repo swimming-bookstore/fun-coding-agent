@@ -1,0 +1,8 @@
+[book]
+authors = ["Fun"]
+language = "en"
+src = "src"
+title = "Fun Book"
+
+[output.html]
+site-url = "/fun-coding-agent/"
