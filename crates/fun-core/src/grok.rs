@@ -1,6 +1,6 @@
-use crate::session::{empty_args, Call, Entry};
-use crate::tool::{aborted, is_abort, Abort, Tool};
-use anyhow::{bail, Context, Result};
+use crate::session::{Call, Entry, empty_args};
+use crate::tool::{Abort, Tool, aborted, is_abort};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -22,7 +22,10 @@ fn env_or(name: &str, default: &str) -> String {
 }
 
 fn reasoning_effort() -> String {
-    match env_or("FUN_CODING_AGENT_EFFORT", "medium").to_ascii_lowercase().as_str() {
+    match env_or("FUN_CODING_AGENT_EFFORT", "medium")
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "low" | "minimal" => "low".into(),
         "high" | "xhigh" | "x-high" => "high".into(),
         _ => "medium".into(),
@@ -255,7 +258,6 @@ impl Grok {
         Self::client().await
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn complete(
         &self,
         model: &str,
@@ -263,6 +265,31 @@ impl Grok {
         entries: &[Entry],
         tools: &[Tool],
         abort: &Abort,
+        on_delta: impl FnMut(&str),
+        on_think: impl FnMut(&str),
+    ) -> Result<Reply> {
+        self.complete_with_effort(
+            model,
+            system,
+            entries,
+            tools,
+            abort,
+            &self.effort,
+            on_delta,
+            on_think,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn complete_with_effort(
+        &self,
+        model: &str,
+        system: &str,
+        entries: &[Entry],
+        tools: &[Tool],
+        abort: &Abort,
+        effort: &str,
         mut on_delta: impl FnMut(&str),
         mut on_think: impl FnMut(&str),
     ) -> Result<Reply> {
@@ -277,6 +304,7 @@ impl Grok {
                     entries,
                     tools,
                     abort,
+                    effort,
                     &mut started,
                     &mut on_delta,
                     &mut on_think,
@@ -308,6 +336,7 @@ impl Grok {
         entries: &[Entry],
         tools: &[Tool],
         abort: &Abort,
+        effort: &str,
         started: &mut bool,
         on_delta: &mut impl FnMut(&str),
         on_think: &mut impl FnMut(&str),
@@ -321,9 +350,7 @@ impl Grok {
             input: &input,
             tools: &defs,
             stream: true,
-            reasoning: Some(WireReasoning {
-                effort: &self.effort,
-            }),
+            reasoning: Some(WireReasoning { effort }),
         };
         let mut token = provider_grok::bearer().await.map_err(auth_err)?;
         let send = self
@@ -384,7 +411,10 @@ impl Grok {
             };
             let chunk = match chunk {
                 Ok(c) => c,
-                Err(e) if is_unclean_eof(&e) && has_stream_content(final_reply.as_ref(), &text, &calls) => {
+                Err(e)
+                    if is_unclean_eof(&e)
+                        && has_stream_content(final_reply.as_ref(), &text, &calls) =>
+                {
                     break;
                 }
                 Err(e) => return Err(e).context("grok stream"),
@@ -647,9 +677,12 @@ fn apply_sse(typ: &str, v: &Value, s: &mut SseState<'_>) {
     if typ.ends_with("function_call_arguments.delta") {
         if let Some(d) = v.get("delta").and_then(|x| x.as_str()) {
             let item_id = v.get("item_id").and_then(|x| x.as_str()).unwrap_or("");
-            if let Some(c) = s.calls.iter_mut().rev().find(|c| {
-                item_id.is_empty() || c.item_id == item_id
-            }) {
+            if let Some(c) = s
+                .calls
+                .iter_mut()
+                .rev()
+                .find(|c| item_id.is_empty() || c.item_id == item_id)
+            {
                 c.arguments.push_str(d);
             }
         }
@@ -708,9 +741,8 @@ fn parse_response(v: WireResponse) -> Reply {
     {
         text = t;
     }
-    let (input_tokens, output_tokens, cached_tokens, reasoning_tokens) = v
-        .usage
-        .map_or((0, 0, 0, 0), |u| {
+    let (input_tokens, output_tokens, cached_tokens, reasoning_tokens) =
+        v.usage.map_or((0, 0, 0, 0), |u| {
             let input = u.input_tokens;
             let output = if u.output_tokens > 0 {
                 u.output_tokens
@@ -783,9 +815,8 @@ mod tests {
 
     #[test]
     fn sse_text_delta() {
-        let (text, _, calls, trunc) = drain(
-            "event: response.output_text.delta\ndata: {\"delta\":\"hi\"}\n\n",
-        );
+        let (text, _, calls, trunc) =
+            drain("event: response.output_text.delta\ndata: {\"delta\":\"hi\"}\n\n");
         assert_eq!(text, "hi");
         assert!(calls.is_empty());
         assert!(!trunc);
@@ -793,9 +824,8 @@ mod tests {
 
     #[test]
     fn sse_think_delta() {
-        let (_, think, _, _) = drain(
-            "event: response.reasoning.delta\ndata: {\"delta\":\"hmm\"}\n\n",
-        );
+        let (_, think, _, _) =
+            drain("event: response.reasoning.delta\ndata: {\"delta\":\"hmm\"}\n\n");
         assert_eq!(think, "hmm");
     }
 

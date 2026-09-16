@@ -1,17 +1,16 @@
 # Fun coding agent
 
-CLI: `fun` (terminal UI). GTK 4: `fun-gtk4` in `~/fun-coding-agent-gtk4`.
+CLI: `fun` (terminal UI).
 
 ```sh
 cargo run --bin fun -- login
 cargo run --bin fun
 fun "fix the tests"
-
-# other repo, shares fun-core
-cargo run --manifest-path ../fun-coding-agent-gtk4/Cargo.toml --bin fun-gtk4
 ```
 
 Shared crate: `crates/fun-core` (agent, tools, Grok, sessions, config).
+
+Docs: mdBook in `book/src/`. Preview: `mdbook serve book`.
 
 Config: `~/.config/fun/config.json`  
 Auth: `~/.local/share/fun/auth.json`  
