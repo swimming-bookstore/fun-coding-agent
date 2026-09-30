@@ -8,6 +8,7 @@ done.
 
 ```sh
 fun "fix the tests"
+fun --image shot.png "what is wrong in this screenshot"
 fun --new "add a failing test first"
 fun --dir ~/src/my-project --new "run cargo test and fix failures"
 ```

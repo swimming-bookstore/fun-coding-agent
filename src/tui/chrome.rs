@@ -1279,6 +1279,7 @@ pub(super) struct ComposerPiece {
     pub(super) text: String,
     pub(super) style: Style,
     pub(super) chip: Option<usize>,
+    pub(super) image: bool,
 }
 
 pub(super) struct ComposerLine {
@@ -1355,11 +1356,16 @@ pub(super) fn composer_view(atoms: &[ComposerAtom], cursor: usize, max: usize) -
                         text: ch,
                         style: Style::new(),
                         chip: None,
+                        image: false,
                     });
                 }
                 line.width += cw;
             }
-            ComposerAtom::Chip { index, label } => {
+            ComposerAtom::Chip {
+                index,
+                label,
+                image,
+            } => {
                 let text = chip_text(label, max);
                 let tw = width(&text).min(max).max(1);
                 if lines
@@ -1371,10 +1377,16 @@ pub(super) fn composer_view(atoms: &[ComposerAtom], cursor: usize, max: usize) -
                 let Some(line) = lines.last_mut() else {
                     continue;
                 };
+                let style = if *image {
+                    pal_col(pal().text).bg(rgb_color(pal().tool))
+                } else {
+                    pal_col(pal().text).bg(rgb_color(pal().queue))
+                };
                 line.pieces.push(ComposerPiece {
                     text,
-                    style: pal_col(pal().text).bg(rgb_color(pal().queue)),
+                    style,
                     chip: Some(*index),
+                    image: *image,
                 });
                 line.width += tw;
             }
@@ -1396,7 +1408,7 @@ pub(super) fn composer(
     atoms: &[ComposerAtom],
     cursor: usize,
     working: bool,
-) -> ((u16, u16), Vec<(Rect, usize)>) {
+) -> ((u16, u16), Vec<(Rect, usize, bool)>) {
     let border = if working { tool_col() } else { muted() };
     Block::new().border(border).render(buf, area);
     let inner = Block::inner(area);
@@ -1426,7 +1438,7 @@ pub(super) fn composer(
                 let w = x.saturating_sub(start_x).max(1);
                 let close_w = 3u16.min(w);
                 let close_x = start_x.saturating_add(w.saturating_sub(close_w));
-                hits.push((Rect::new(close_x, y, close_w, 1), index));
+                hits.push((Rect::new(close_x, y, close_w, 1), index, piece.image));
             }
         }
     }

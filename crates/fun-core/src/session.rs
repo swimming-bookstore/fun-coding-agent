@@ -13,11 +13,14 @@ pub use crate::prune::{
     prune_restored, record_turn, sanitize_hidden, should_prune,
 };
 
+/// Largest image Fun will attach to a user message (decoded bytes).
+pub const MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
+
 pub fn empty_args() -> Value {
     Value::Object(serde_json::Map::default())
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Call {
     pub id: String,
     pub name: String,
@@ -25,7 +28,7 @@ pub struct Call {
     pub args: Value,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolResult {
     pub id: String,
     pub name: String,
@@ -33,11 +36,142 @@ pub struct ToolResult {
     pub is_error: bool,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+/// One picture attached to a user message. Bytes are base64 on disk.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Image {
+    /// `png`, `jpeg`, `gif`, or `webp`.
+    pub media: String,
+    pub data: String,
+    /// Basename shown in the transcript. Empty on older files.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+}
+
+impl Image {
+    pub fn media_type(&self) -> String {
+        format!("image/{}", self.media)
+    }
+}
+
+pub fn user_display(text: &str, images: &[Image]) -> String {
+    let mut out = text.trim().to_string();
+    for image in images {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        let name = if image.name.is_empty() {
+            image.media.as_str()
+        } else {
+            image.name.as_str()
+        };
+        out.push_str(&format!("[image {name}]"));
+    }
+    out
+}
+
+/// Display name for a transcript chip. Path basename, or `image`.
+pub fn image_label(path: &str) -> String {
+    let name = path
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("image");
+    format!("image {name}")
+}
+
+fn image_media(ext: &str) -> Option<&'static str> {
+    match ext.to_ascii_lowercase().as_str() {
+        "png" => Some("png"),
+        "jpg" | "jpeg" => Some("jpeg"),
+        "gif" => Some("gif"),
+        "webp" => Some("webp"),
+        _ => None,
+    }
+}
+
+fn sniff_media(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return Some("png");
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("gif");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("webp");
+    }
+    None
+}
+
+/// Load a local image for a user message. Rejects unknown types and files over 4MB.
+pub fn load_image(path: &Path) -> Result<Image> {
+    let bytes = fs::read(path).with_context(|| format!("read image {}", path.display()))?;
+    if bytes.is_empty() {
+        bail!("empty image {}", path.display());
+    }
+    if bytes.len() > MAX_IMAGE_BYTES {
+        bail!(
+            "image {} is {} bytes (max {MAX_IMAGE_BYTES})",
+            path.display(),
+            bytes.len()
+        );
+    }
+    let hinted = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .and_then(image_media);
+    let media = sniff_media(&bytes).or(hinted).ok_or_else(|| {
+        anyhow::anyhow!("not a png, jpeg, gif, or webp image: {}", path.display())
+    })?;
+    Ok(Image {
+        media: media.into(),
+        data: base64_encode(&bytes),
+        name: String::new(),
+    })
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    let mut i = 0;
+    while i + 3 <= bytes.len() {
+        let n =
+            (u32::from(bytes[i]) << 16) | (u32::from(bytes[i + 1]) << 8) | u32::from(bytes[i + 2]);
+        out.push(T[((n >> 18) & 63) as usize] as char);
+        out.push(T[((n >> 12) & 63) as usize] as char);
+        out.push(T[((n >> 6) & 63) as usize] as char);
+        out.push(T[(n & 63) as usize] as char);
+        i += 3;
+    }
+    match bytes.len() - i {
+        1 => {
+            let n = u32::from(bytes[i]) << 16;
+            out.push(T[((n >> 18) & 63) as usize] as char);
+            out.push(T[((n >> 12) & 63) as usize] as char);
+            out.push('=');
+            out.push('=');
+        }
+        2 => {
+            let n = (u32::from(bytes[i]) << 16) | (u32::from(bytes[i + 1]) << 8);
+            out.push(T[((n >> 18) & 63) as usize] as char);
+            out.push(T[((n >> 12) & 63) as usize] as char);
+            out.push(T[((n >> 6) & 63) as usize] as char);
+            out.push('=');
+        }
+        _ => {}
+    }
+    out
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Entry {
     User {
         text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<Image>,
     },
     Assistant {
         text: String,
@@ -218,6 +352,7 @@ fn entry_from_old(role: &str, content: Value) -> Option<Entry> {
     match role {
         "user" => Some(Entry::User {
             text: content.as_str().unwrap_or("").into(),
+            images: Vec::new(),
         }),
         "assistant" => Some(Entry::Assistant {
             text: content
@@ -415,8 +550,8 @@ impl Session {
                 for line in text.lines() {
                     if let Ok(e) = serde_json::from_str::<Entry>(line) {
                         n += 1;
-                        if let Entry::User { text } = e {
-                            title = text.chars().take(72).collect();
+                        if let Entry::User { text, images } = e {
+                            title = user_preview(&text, &images);
                         }
                     }
                 }
@@ -468,8 +603,8 @@ impl Session {
                         }
                         if let Ok(e) = serde_json::from_str::<Entry>(line) {
                             n += 1;
-                            if let Entry::User { text } = e {
-                                title = text.chars().take(72).collect();
+                            if let Entry::User { text, images } = e {
+                                title = user_preview(&text, &images);
                             }
                         }
                     }
@@ -602,6 +737,18 @@ fn repo_name(path: &Path) -> String {
         .to_string()
 }
 
+fn user_preview(text: &str, images: &[Image]) -> String {
+    let text = text.trim();
+    if !text.is_empty() {
+        return text.chars().take(72).collect();
+    }
+    match images.len() {
+        0 => String::new(),
+        1 => "image".into(),
+        n => format!("{n} images"),
+    }
+}
+
 pub fn list_sessions(workspace: &Path) -> Result<()> {
     let files = jsonl_files(&sessions_dir(workspace)?);
     if files.is_empty() {
@@ -622,9 +769,9 @@ pub fn list_sessions(workspace: &Path) -> Result<()> {
                 if let Ok(e) = serde_json::from_str::<Entry>(line) {
                     n += 1;
                     if preview.is_empty()
-                        && let Entry::User { text } = e
+                        && let Entry::User { text, images } = e
                     {
-                        preview = text.chars().take(60).collect();
+                        preview = user_preview(&text, &images).chars().take(60).collect();
                     }
                 } else if let Ok(e) = serde_json::from_str::<OldEntry>(line)
                     && e.kind == "entry"
@@ -667,7 +814,14 @@ mod tests {
             prune_notes: Vec::new(),
             ledger: Vec::new(),
         };
-        assert!(s.add(Entry::User { text: "hi".into() }).is_ok(), "add user");
+        assert!(
+            s.add(Entry::User {
+                text: "hi".into(),
+                images: Vec::new(),
+            })
+            .is_ok(),
+            "add user"
+        );
         assert!(
             s.add(Entry::Assistant {
                 text: "yo".into(),
@@ -682,7 +836,7 @@ mod tests {
         if let Ok(loaded) = loaded {
             assert_eq!(loaded.entries.len(), 2);
             assert!(
-                matches!(&loaded.entries[0], Entry::User { text } if text == "hi"),
+                matches!(&loaded.entries[0], Entry::User { text, images } if text == "hi" && images.is_empty()),
                 "expected user"
             );
         }
@@ -737,7 +891,55 @@ mod tests {
     }
 
     fn user(s: &str) -> Entry {
-        Entry::User { text: s.into() }
+        Entry::User {
+            text: s.into(),
+            images: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn user_image_roundtrip_and_load() {
+        let dir = tmp();
+        let png = dir.join("dot.png");
+        fs::write(
+            &png,
+            [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x01],
+        )
+        .unwrap();
+        let image = load_image(&png).expect("png");
+        assert_eq!(image.media, "png");
+        assert_eq!(
+            user_display("see", std::slice::from_ref(&image)),
+            "see\n[image png]"
+        );
+        let path = dir.join("s.jsonl");
+        let mut s = Session {
+            entries: Vec::new(),
+            path: path.clone(),
+            usage: Usage::default(),
+            hidden: BTreeSet::new(),
+            restored: BTreeSet::new(),
+            prune_notes: Vec::new(),
+            ledger: Vec::new(),
+        };
+        s.add(Entry::User {
+            text: "see this".into(),
+            images: vec![image.clone()],
+        })
+        .unwrap();
+        let loaded = Session::load(path).unwrap();
+        match &loaded.entries[0] {
+            Entry::User { text, images } => {
+                assert_eq!(text, "see this");
+                assert_eq!(images, &vec![image]);
+            }
+            other => panic!("expected user, got {other:?}"),
+        }
+        let old = r#"{"kind":"user","text":"plain"}"#;
+        let parsed: Entry = serde_json::from_str(old).unwrap();
+        assert!(matches!(parsed, Entry::User { images, .. } if images.is_empty()));
+        assert!(load_image(&dir.join("missing.png")).is_err());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     fn assistant_call(id: &str, name: &str) -> Entry {

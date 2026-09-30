@@ -252,7 +252,13 @@ pub fn record_turn(
 
 pub fn entry_chars(e: &Entry) -> usize {
     match e {
-        Entry::User { text } => text.len(),
+        Entry::User { text, images } => {
+            text.len()
+                + images
+                    .iter()
+                    .map(|img| img.data.len() + img.media.len())
+                    .sum::<usize>()
+        }
         Entry::Assistant {
             text,
             thinking,
@@ -668,7 +674,14 @@ fn prune_restore_preview(e: &Entry) -> String {
 
 fn prune_line(e: &Entry) -> String {
     match e {
-        Entry::User { text } => format!("user {}", clip_entry(text, 240)),
+        Entry::User { text, images } => {
+            let extra = if images.is_empty() {
+                String::new()
+            } else {
+                format!(" [{} image(s)]", images.len())
+            };
+            format!("user {}{extra}", clip_entry(text, 240))
+        }
         Entry::Assistant { text, calls, .. } => {
             if calls.is_empty() {
                 format!("assistant {}", clip_entry(text, 240))
@@ -773,7 +786,10 @@ mod tests {
     use std::collections::BTreeSet;
 
     fn user(s: &str) -> Entry {
-        Entry::User { text: s.into() }
+        Entry::User {
+            text: s.into(),
+            images: Vec::new(),
+        }
     }
 
     fn assistant(s: &str) -> Entry {
@@ -859,8 +875,8 @@ mod tests {
         hidden.insert(2);
         let out = payload_from_hidden(&entries, &hidden);
         assert_eq!(out.len(), 3);
-        assert!(matches!(&out[0], Entry::User { text } if text == "old"));
-        assert!(matches!(&out[1], Entry::User { text } if text == "new"));
+        assert!(matches!(&out[0], Entry::User { text, .. } if text == "old"));
+        assert!(matches!(&out[1], Entry::User { text, .. } if text == "new"));
         assert!(matches!(&out[2], Entry::Assistant { text, .. } if text == "b"));
     }
 
@@ -898,7 +914,7 @@ mod tests {
         ];
         let hidden = BTreeSet::from([1, 2, 3, 4]);
         let out = payload_from_hidden(&entries, &hidden);
-        assert!(matches!(&out[0], Entry::User { text } if text == "make okta work"));
+        assert!(matches!(&out[0], Entry::User { text, .. } if text == "make okta work"));
         assert!(
             matches!(&out[1], Entry::Assistant { calls, .. } if calls.len() == 1 && calls[0].name == "write"),
             "latest write stub comes back"
@@ -916,7 +932,7 @@ mod tests {
         assert!(!out.iter().any(|e| matches!(e, Entry::Assistant { calls, .. } if calls.iter().any(|c| c.name == "bash"))));
         assert!(
             out.iter()
-                .any(|e| matches!(e, Entry::User { text } if text == "final code review"))
+                .any(|e| matches!(e, Entry::User { text, .. } if text == "final code review"))
         );
         assert_eq!(out.len(), 5);
     }
@@ -956,8 +972,8 @@ mod tests {
         let hidden = BTreeSet::from([0, 1, 2, 3]);
         let out = payload_from_hidden(&entries, &hidden);
         assert_eq!(out.len(), 3);
-        assert!(matches!(&out[0], Entry::User { text } if text == "goal"));
-        assert!(matches!(&out[1], Entry::User { text } if text == "draw assets"));
+        assert!(matches!(&out[0], Entry::User { text, .. } if text == "goal"));
+        assert!(matches!(&out[1], Entry::User { text, .. } if text == "draw assets"));
         assert!(matches!(&out[2], Entry::Assistant { text, .. } if text == "ok"));
         let cleaned = sanitize_hidden(&entries, &hidden);
         assert_eq!(cleaned, BTreeSet::from([1, 2]));
@@ -1082,7 +1098,7 @@ mod tests {
         assert!(!hidden.contains(&6));
         assert!(!hidden.contains(&7));
         let kept = payload_from_hidden(&entries, &hidden);
-        assert!(matches!(&kept[0], Entry::User { text } if text == "goal"));
+        assert!(matches!(&kept[0], Entry::User { text, .. } if text == "goal"));
         assert!(matches!(&kept[1], Entry::Assistant { text, .. } if text == "plan"));
     }
 

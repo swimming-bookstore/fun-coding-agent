@@ -12,7 +12,8 @@
 //!
 //! Keys while a turn is running:
 //!   Enter       queue (after the turn)
-//!   Ctrl+Enter  interrupt (stop now and inject the composer)
+//!   Ctrl+Enter  interrupt (stop now and inject the composer, including images)
+//!   Ctrl+V      attach a clipboard image path, or paste clipboard text
 //!   Esc         abort, then send from the composer
 //!   click send now / edit / move up / move down / cancel  on a queued prompt
 
@@ -179,7 +180,12 @@ pub struct ActionHit {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ComposerAtom {
     Char(char),
-    Chip { index: usize, label: String },
+    Chip {
+        index: usize,
+        label: String,
+        /// True when the chip is an attached image, not a paste body.
+        image: bool,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -288,7 +294,7 @@ pub struct Ui {
     queue_area: Rect,
     link_area: Rect,
     composer_area: Rect,
-    chip_hits: Vec<(Rect, usize)>,
+    chip_hits: Vec<(Rect, usize, bool)>,
     actions: Vec<(Rect, ActionHit)>,
     queue_drag: Option<usize>,
     queue_flash: Option<(usize, Instant)>,
@@ -394,11 +400,11 @@ impl Ui {
         self.redraw()
     }
 
-    pub fn chip_hit(&self, x: u16, y: u16) -> Option<usize> {
+    pub fn chip_hit(&self, x: u16, y: u16) -> Option<(usize, bool)> {
         self.chip_hits
             .iter()
-            .find(|(r, _)| r.contains(x, y))
-            .map(|(_, i)| *i)
+            .find(|(r, _, _)| r.contains(x, y))
+            .map(|(_, i, image)| (*i, *image))
     }
 
     pub fn set_queue(&mut self, queue: Vec<Queued>) -> Result<()> {
@@ -1586,6 +1592,7 @@ mod tests {
             ComposerAtom::Chip {
                 index: 0,
                 label: "paste 12 lines".into(),
+                image: false,
             },
         ];
         let mut buf = Buffer::new(40, 3);

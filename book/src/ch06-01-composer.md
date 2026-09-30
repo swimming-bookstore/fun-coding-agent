@@ -26,11 +26,38 @@ Control characters other than newline are stripped.
 On send, Fun concatenates atoms:
 
 - each character as itself
-- each chip as its stored body, wrapped with newlines so it does not
+- each paste chip as its stored body, wrapped with newlines so it does not
   glue to neighboring words
+- each image chip as an image part, not as text
 
-That string is the user entry written to jsonl and shown in the
-transcript. The chip is only a composer convenience.
+That string, plus any image parts, is the user entry written to jsonl and
+shown in the transcript. The chip is only a composer convenience. The
+transcript shows `[image name]` where the picture was attached. The
+bytes go to Grok as `input_image` data URLs. They are not pasted into
+the text.
+
+## Images
+
+Ctrl+V attaches a picture when the clipboard is a path to a local
+`png`, `jpeg`, `gif`, or `webp` file. Otherwise Ctrl+V pastes the
+clipboard as text, same as a bracketed paste.
+
+An image is always a chip, even if the file is small. The label is
+`image <basename>`. Click the `×` to drop it. Backspace on the chip
+drops it too.
+
+The file must be 4 MB or smaller. Fun stores the bytes as base64 on the
+user entry. Older sessions without an `images` field still load.
+
+Headless prompts use `--image PATH`, which can be repeated:
+
+```sh
+fun --image shot.png "what is wrong in this screenshot"
+```
+
+Queue, steer, and interrupt keep the images attached to that pending
+turn. A queued chip shows `[image name]` in its label. Editing the chip
+puts the image back in the composer.
 
 ## History
 

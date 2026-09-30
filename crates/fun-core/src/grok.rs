@@ -34,10 +34,24 @@ fn reasoning_effort() -> String {
 
 #[derive(Serialize)]
 #[serde(untagged)]
+enum WireContent {
+    Text(String),
+    Parts(Vec<WirePartOut>),
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum WirePartOut {
+    InputText { text: String },
+    InputImage { image_url: String },
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
 enum WireInput {
     Message {
         role: &'static str,
-        content: String,
+        content: WireContent,
     },
     FunctionCall {
         #[serde(rename = "type")]
@@ -166,16 +180,16 @@ pub struct Reply {
 
 fn to_input(e: &Entry) -> Vec<WireInput> {
     match e {
-        Entry::User { text } => vec![WireInput::Message {
+        Entry::User { text, images } => vec![WireInput::Message {
             role: "user",
-            content: text.clone(),
+            content: user_content(text, images),
         }],
         Entry::Assistant { text, calls, .. } => {
             let mut out = Vec::new();
             if !text.is_empty() {
                 out.push(WireInput::Message {
                     role: "assistant",
-                    content: text.clone(),
+                    content: WireContent::Text(text.clone()),
                 });
             }
             for c in calls {
@@ -194,6 +208,27 @@ fn to_input(e: &Entry) -> Vec<WireInput> {
             output: t.content.clone(),
         }],
     }
+}
+
+fn user_content(text: &str, images: &[crate::session::Image]) -> WireContent {
+    if images.is_empty() {
+        return WireContent::Text(text.to_string());
+    }
+    let mut parts = Vec::new();
+    if !text.is_empty() {
+        parts.push(WirePartOut::InputText {
+            text: text.to_string(),
+        });
+    }
+    for image in images {
+        parts.push(WirePartOut::InputImage {
+            image_url: format!("data:{};base64,{}", image.media_type(), image.data),
+        });
+    }
+    if parts.is_empty() {
+        return WireContent::Text(String::new());
+    }
+    WireContent::Parts(parts)
 }
 
 fn tool_def(tool: &Tool) -> WireTool {
@@ -811,6 +846,32 @@ mod tests {
         );
         let _ = (final_reply, started);
         (text, thinking, calls, truncated)
+    }
+
+    #[test]
+    fn user_image_is_input_image_part() {
+        use crate::session::Image;
+        let entry = Entry::User {
+            text: "what is this".into(),
+            images: vec![Image {
+                media: "png".into(),
+                data: "AAAA".into(),
+                name: String::new(),
+            }],
+        };
+        let wire = to_input(&entry);
+        let json = serde_json::to_value(&wire).unwrap();
+        let content = &json[0]["content"];
+        assert_eq!(content[0]["type"], "input_text");
+        assert_eq!(content[0]["text"], "what is this");
+        assert_eq!(content[1]["type"], "input_image");
+        assert_eq!(content[1]["image_url"], "data:image/png;base64,AAAA");
+        let plain = to_input(&Entry::User {
+            text: "hi".into(),
+            images: Vec::new(),
+        });
+        let plain_json = serde_json::to_value(&plain).unwrap();
+        assert_eq!(plain_json[0]["content"], "hi");
     }
 
     #[test]
