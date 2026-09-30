@@ -11,7 +11,7 @@ previous drop) scored **out**; they are not candidates again.
 | Bucket | Meaning | May drop? |
 | --- | --- | --- |
 | **Live** | Newest messages: current user turn, at least two. | No |
-| **Keep** | Users, previous-turn reads and conclusions, latest writes and edits. | No |
+| **Keep** | Users, previous-turn reads and conclusions. | No |
 | **Candidate** | Visible, before the live tail, not Keep. | Yes |
 | **Hidden** | Already off the wire. | Already gone |
 
@@ -20,7 +20,7 @@ The listing the prune model sees, in order:
 ```text
 ## Ledger     previous keep/drop (omitted if this is the first prune)
 ## Live       do not drop — current task
-## Keep       do not drop — users, latest mutations, previous-turn reads
+## Keep       do not drop — users, previous-turn reads and conclusions
 ## Candidates may drop
 ```
 

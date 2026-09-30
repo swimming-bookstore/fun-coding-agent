@@ -6,10 +6,10 @@ use crossterm::style::{
     Attribute, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
 };
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, size as term_size, Clear, ClearType, EnterAlternateScreen,
-    LeaveAlternateScreen,
+    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+    enable_raw_mode, size as term_size,
 };
-use crossterm::{queue, ExecutableCommand};
+use crossterm::{ExecutableCommand, queue};
 use std::io::{self, Write};
 
 pub struct Terminal {

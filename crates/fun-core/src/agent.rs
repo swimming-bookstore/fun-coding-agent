@@ -1,5 +1,5 @@
 use crate::grok::Grok;
-use crate::prune::{parse_drop_ids, prune_inspect_ids, PRUNE_MIN_CANDIDATES};
+use crate::prune::{PRUNE_MIN_CANDIDATES, parse_drop_ids, prune_inspect_note};
 use crate::session::{Call, Entry, Session, ToolResult, Usage};
 use crate::tool::{Abort, Tool, clip_utf8, execute_tool, is_abort};
 use anyhow::Result;
@@ -14,10 +14,11 @@ You prune a coding-agent transcript. Reply with JSON only: {\"drop\":[ids]}.\n\
 Live and Keep messages must never appear in drop. User messages are Keep.\n\
 A Ledger of previous keep/drop turns is bookkeeping — the next send is last keep plus later messages, minus later drop.\n\
 Drop only the candidate ids you name (tool pairs are filled in). Do not treat a low id as “drop everything after”.\n\
-Prefer dead-end tool noise (failed bash, superseded dumps) so later file edits stay.\n\
-Drop: repeated or superseded tool output, dead-end commands, old plans, chatter, and old tool-less conclusions that later user lines replaced.\n\
-Do not drop user goals, later constraints, latest writes/edits of a file, or the previous turn’s latest read — the agent will otherwise redo or delete finished work.\n\
-Keep: every user message, the previous turn’s conclusion, current files/paths, remaining errors, and anything the live messages still need.\n\
+Prefer dead-end tool noise (failed bash, superseded dumps) and fat write/edit bodies a restore stub can replace.\n\
+Drop: repeated or superseded tool output, dead-end commands, old plans, chatter, old tool-less conclusions that later user lines replaced, and write/edit calls whose full file body is no longer needed.\n\
+Do not drop user goals, later constraints, or the previous turn’s latest read — the agent will otherwise redo or delete finished work.\n\
+Dropped latest writes/edits still reach the next payload as compact path stubs, so a later review can see that the file exists.\n\
+Keep: every user message, the previous turn’s conclusion, remaining errors, and anything the live messages still need.\n\
 If nothing should go, return {\"drop\":[]}. No tools. No extra text.";
 
 #[derive(Clone)]
@@ -570,11 +571,7 @@ async fn run_prune(a: &mut Agent) -> Result<(Vec<usize>, Vec<usize>)> {
 fn emit_prune_note(a: &mut Agent, added: Vec<usize>, restored: Vec<usize>) {
     let n = added.len();
     let r = restored.len();
-    let mut lines = prune_inspect_ids(&a.session.entries, added);
-    if r > 0 {
-        lines.push(format!("restored {r}:"));
-        lines.extend(prune_inspect_ids(&a.session.entries, restored));
-    }
+    let lines = prune_inspect_note(&a.session.entries, added, restored);
     a.emit(LogLine::Pruned { n, lines });
     let text = if r == 0 {
         format!("(dropped {n} messages from context)")

@@ -4,12 +4,11 @@ Keep means “never hide this row.” Restore means “this row is still
 hidden, but send a tiny reminder so a later review does not treat
 finished work as dead.”
 
-An older prune can still have a whole feature turn hidden — that was
-legal under older rules, and Fun will not rewrite history. New prunes
-refuse to hide the latest write or edit of each path. Disk stays hidden
-either way. On the **next** payload, those rows come back as compact
-stubs (path only) so “final code review / cut dead code” still sees
-that the file exists.
+Latest successful writes and edits per path are droppable. Hiding the
+fat body is the point — a 4k `write` of `login.rs` should not stay on
+the wire forever. Disk stays hidden. On the **next** payload, those
+rows come back as compact stubs (path only) so “final code review /
+cut dead code” still sees that the file exists.
 
 Without this, the review only had the user line plus the live tail and
 deleted finished work as leftover.

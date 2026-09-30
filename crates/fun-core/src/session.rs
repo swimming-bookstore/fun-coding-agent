@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use crate::prune::{
-    parse_drop_ids, prune_inspect, prune_inspect_ids, prune_restored, record_turn, sanitize_hidden,
-    should_prune, PruneTurn, PruneView,
+    PruneTurn, PruneView, parse_drop_ids, prune_inspect, prune_inspect_ids, prune_inspect_note,
+    prune_restored, record_turn, sanitize_hidden, should_prune,
 };
 
 pub fn empty_args() -> Value {
@@ -349,9 +349,7 @@ impl Session {
                         }
                         restored = p.restored.into_iter().collect();
                         let keep = if p.keep.is_empty() {
-                            (0..entries.len())
-                                .filter(|i| !next.contains(i))
-                                .collect()
+                            (0..entries.len()).filter(|i| !next.contains(i)).collect()
                         } else {
                             p.keep
                         };
@@ -550,7 +548,8 @@ impl Session {
         let hidden = sanitize_hidden(&self.entries, &hidden);
         let added: Vec<usize> = hidden.difference(&self.hidden).copied().collect();
         let dropped = added.len();
-        let restored: BTreeSet<usize> = prune_restored(&self.entries, &hidden).into_keys().collect();
+        let restored: BTreeSet<usize> =
+            prune_restored(&self.entries, &hidden).into_keys().collect();
         let mut newly: Vec<usize> = restored.difference(&self.restored).copied().collect();
         newly.sort_unstable();
         append_json(
@@ -591,11 +590,7 @@ impl Session {
     }
 
     pub fn should_prune(&self) -> Option<usize> {
-        should_prune(
-            &self.entries,
-            &self.hidden,
-            self.usage.last_input_tokens,
-        )
+        should_prune(&self.entries, &self.hidden, self.usage.last_input_tokens)
     }
 }
 
@@ -840,14 +835,18 @@ mod tests {
         assert!(s.add(assistant_call("c1", "bash")).is_ok());
         assert!(s.add(tool("c1", "noise")).is_ok());
         assert!(s.add(user("open")).is_ok());
-        let (added, newly) = s.save_hidden(BTreeSet::from([1, 2, 3, 4])).expect("prune 1");
+        let (added, newly) = s
+            .save_hidden(BTreeSet::from([1, 2, 3, 4]))
+            .expect("prune 1");
         assert_eq!(added, vec![1, 2, 3, 4]);
         assert_eq!(newly, vec![1, 2]);
         assert_eq!(s.restored, BTreeSet::from([1, 2]));
         assert!(s.add(assistant_call("c2", "bash")).is_ok());
         assert!(s.add(tool("c2", "more noise")).is_ok());
         assert!(s.add(user("open again")).is_ok());
-        let (added, newly) = s.save_hidden(BTreeSet::from([1, 2, 3, 4, 6, 7])).expect("prune 2");
+        let (added, newly) = s
+            .save_hidden(BTreeSet::from([1, 2, 3, 4, 6, 7]))
+            .expect("prune 2");
         assert_eq!(added, vec![6, 7]);
         assert!(newly.is_empty(), "already-restored writes stay restored");
         assert_eq!(s.restored, BTreeSet::from([1, 2]));

@@ -72,7 +72,8 @@ One dim line in the transcript:
 | `(nothing to drop)` | The model returned an empty list (or nothing valid) |
 | `(prune skipped: …)` | Gate failed after Fun had already started talking about it |
 
-Click a drop line to inspect ids. The overlay does not open by itself.
+Click a drop line to inspect ids. Restored writes appear once, as stubs.
+The overlay does not open by itself.
 
 ## What you do not see
 

@@ -42,7 +42,7 @@ pub struct PruneTurn {
 pub enum PruneBucket {
     /// Newest messages (current user turn, at least [`PRUNE_KEEP_TAIL`]). Never drop.
     Live,
-    /// User lines, previous-turn reads/conclusions, latest writes/edits. Never drop.
+    /// User lines, previous-turn reads/conclusions. Never drop.
     Keep,
     /// Visible, before the live tail, not Keep. The model may name these.
     Candidate,
@@ -119,11 +119,18 @@ impl<'a> PruneView<'a> {
         if !self.ledger.is_empty() {
             out.push_str("## Ledger (previous keep/drop — next send is keep minus later drop)\n");
             for t in self.ledger {
+                let restored: BTreeSet<usize> = t.restored.iter().copied().collect();
+                let drop: Vec<usize> = t
+                    .drop
+                    .iter()
+                    .copied()
+                    .filter(|i| !restored.contains(i))
+                    .collect();
                 out.push_str(&format!(
                     "@{} keep {} drop {}{}\n",
                     t.at,
                     join_ids(&t.keep),
-                    join_ids(&t.drop),
+                    join_ids(&drop),
                     if t.restored.is_empty() {
                         String::new()
                     } else {
@@ -139,7 +146,9 @@ impl<'a> PruneView<'a> {
         }
         let kept = self.keep();
         if !kept.is_empty() {
-            out.push_str("\n## Keep (do not drop — user messages, latest writes/edits, previous-turn reads and conclusions)\n");
+            out.push_str(
+                "\n## Keep (do not drop — user messages, previous-turn reads and conclusions)\n",
+            );
             for i in &kept {
                 out.push_str(&format!("[{i}] {}\n", prune_line(&self.entries[*i])));
             }
@@ -178,7 +187,12 @@ impl<'a> PruneView<'a> {
     /// Snapshot keep/drop for this apply, including compact restore ids.
     pub fn record(&self, hidden: &BTreeSet<usize>) -> PruneTurn {
         let added: Vec<usize> = hidden.difference(self.hidden).copied().collect();
-        record_turn(self.entries.len(), hidden, added, prune_restored(self.entries, hidden))
+        record_turn(
+            self.entries.len(),
+            hidden,
+            added,
+            prune_restored(self.entries, hidden),
+        )
     }
 }
 
@@ -443,20 +457,8 @@ fn latest_mutations(entries: &[Entry], until: usize) -> Vec<(usize, usize, Strin
     latest
 }
 
-/// Latest successful write/edit per path. Never suffix-drop these — that is
-/// what made “open again” wipe the origami engine.
-pub fn prune_protected_mutations(entries: &[Entry], until: usize) -> BTreeSet<usize> {
-    let mut out = BTreeSet::new();
-    for (asst, tool, _) in latest_mutations(entries, until) {
-        out.insert(asst);
-        out.insert(tool);
-    }
-    out
-}
-
 fn prune_locked(entries: &[Entry], until: usize) -> BTreeSet<usize> {
     let mut out = prune_protected_reads(entries, until);
-    out.extend(prune_protected_mutations(entries, until));
     out.extend(prune_protected_conclusions(entries, until));
     out
 }
@@ -602,6 +604,68 @@ pub fn prune_inspect_ids(entries: &[Entry], ids: impl IntoIterator<Item = usize>
         .collect()
 }
 
+/// Overlay for one prune: dropped noise first, then restored write/edit stubs.
+/// Restored ids are omitted from the dropped list so the same write is not listed twice.
+pub fn prune_inspect_note(
+    entries: &[Entry],
+    added: impl IntoIterator<Item = usize>,
+    restored: impl IntoIterator<Item = usize>,
+) -> Vec<String> {
+    let mut restored: Vec<usize> = restored.into_iter().collect();
+    restored.sort_unstable();
+    restored.dedup();
+    let restored_set: BTreeSet<usize> = restored.iter().copied().collect();
+    let dropped: Vec<usize> = added
+        .into_iter()
+        .filter(|i| !restored_set.contains(i))
+        .collect();
+    let mut lines = prune_inspect_ids(entries, dropped);
+    if restored.is_empty() {
+        return lines;
+    }
+    lines.push(format!("restored {}:", restored.len()));
+    let stubs = prune_restored(entries, &restored_set);
+    for i in restored {
+        let line = stubs
+            .get(&i)
+            .or_else(|| entries.get(i))
+            .map(|e| format!("[{i}] {}", prune_restore_preview(e)))
+            .unwrap_or_else(|| format!("[{i}]"));
+        lines.push(line);
+    }
+    lines
+}
+
+fn prune_restore_preview(e: &Entry) -> String {
+    match e {
+        Entry::Assistant { calls, .. } => {
+            let bits: Vec<String> = calls
+                .iter()
+                .filter_map(|c| {
+                    c.args
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .map(|p| format!("{} {p}", c.name))
+                })
+                .collect();
+            if bits.is_empty() {
+                format!(
+                    "restored {}",
+                    calls
+                        .iter()
+                        .map(|c| c.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            } else {
+                format!("restored {}", bits.join(", "))
+            }
+        }
+        Entry::Tool(t) => format!("restored tool {} {}", t.name, clip_entry(&t.content, 80)),
+        other => prune_line(other),
+    }
+}
+
 fn prune_line(e: &Entry) -> String {
     match e {
         Entry::User { text } => format!("user {}", clip_entry(text, 240)),
@@ -705,7 +769,7 @@ fn clip_entry(s: &str, max: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{empty_args, Call, Entry, ToolResult};
+    use crate::session::{Call, Entry, ToolResult, empty_args};
     use std::collections::BTreeSet;
 
     fn user(s: &str) -> Entry {
@@ -839,7 +903,10 @@ mod tests {
             matches!(&out[1], Entry::Assistant { calls, .. } if calls.len() == 1 && calls[0].name == "write"),
             "latest write stub comes back"
         );
-        if let Entry::Assistant { calls, thinking, .. } = &out[1] {
+        if let Entry::Assistant {
+            calls, thinking, ..
+        } = &out[1]
+        {
             assert!(thinking.is_empty());
             assert_eq!(calls[0].args["path"], "src/login.rs");
             assert_eq!(calls[0].args["restored"], true);
@@ -847,7 +914,10 @@ mod tests {
         }
         assert!(matches!(&out[2], Entry::Tool(t) if t.name == "write"));
         assert!(!out.iter().any(|e| matches!(e, Entry::Assistant { calls, .. } if calls.iter().any(|c| c.name == "bash"))));
-        assert!(out.iter().any(|e| matches!(e, Entry::User { text } if text == "final code review")));
+        assert!(
+            out.iter()
+                .any(|e| matches!(e, Entry::User { text } if text == "final code review"))
+        );
         assert_eq!(out.len(), 5);
     }
 
@@ -1095,8 +1165,11 @@ mod tests {
         let (ids, listing) = PruneView::new(&entries, &BTreeSet::new()).listing();
         assert!(ids.contains(&1), "old conclusion is droppable");
         assert!(!ids.contains(&5), "previous-turn conclusion stays");
-        assert!(!ids.contains(&6), "latest edit stays");
-        assert!(!ids.contains(&7));
+        assert!(
+            ids.contains(&6),
+            "latest edit is droppable; restore stub covers it"
+        );
+        assert!(ids.contains(&7));
         assert!(ids.contains(&8));
         assert!(ids.contains(&9));
         assert!(listing.contains("## Keep"));
@@ -1104,10 +1177,47 @@ mod tests {
         assert!(hidden.contains(&1));
         assert!(hidden.contains(&8));
         assert!(hidden.contains(&9));
-        assert!(!hidden.contains(&6), "later engine edit survives an early drop");
+        assert!(
+            !hidden.contains(&6),
+            "later engine edit survives an early drop"
+        );
         assert!(!hidden.contains(&7));
-        assert!(!hidden.contains(&2), "latest write of catalog.rs is locked");
+        assert!(!hidden.contains(&2), "unnamed write is not suffix-wiped");
         assert!(!hidden.contains(&3));
+    }
+
+    #[test]
+    fn apply_prune_restores_dropped_latest_writes() {
+        let entries = origami();
+        let hidden = PruneView::new(&entries, &BTreeSet::new()).apply(&[2, 6, 8]);
+        assert!(hidden.contains(&2));
+        assert!(hidden.contains(&3));
+        assert!(hidden.contains(&6));
+        assert!(hidden.contains(&7));
+        assert!(hidden.contains(&8));
+        assert!(hidden.contains(&9));
+        let turn = PruneView::new(&entries, &BTreeSet::new()).record(&hidden);
+        assert_eq!(turn.restored, vec![2, 3, 6, 7]);
+        let out = payload_from_hidden(&entries, &hidden);
+        let writes: Vec<&str> = out
+            .iter()
+            .filter_map(|e| match e {
+                Entry::Assistant { calls, .. } => calls
+                    .iter()
+                    .find(|c| c.name == "write")
+                    .map(|c| c.args.get("path").and_then(|v| v.as_str()).unwrap_or("")),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(writes, vec!["src/catalog.rs"]);
+        assert!(out.iter().any(|e| matches!(
+            e,
+            Entry::Assistant { calls, .. } if calls.iter().any(|c| c.name == "edit" && c.args.get("restored") == Some(&Value::Bool(true)))
+        )));
+        assert!(!out.iter().any(|e| matches!(
+            e,
+            Entry::Assistant { calls, .. } if calls.iter().any(|c| c.name == "bash")
+        )));
     }
 
     #[test]
@@ -1168,6 +1278,29 @@ mod tests {
     }
 
     #[test]
+    fn prune_inspect_note_lists_restored_writes_once() {
+        let entries = vec![
+            user("make okta"),
+            assistant_write("w1", "src/login.rs", "okta"),
+            tool_named("w1", "write", "wrote okta"),
+            assistant_call("c1", "bash"),
+            tool("c1", "noise"),
+            user("review"),
+        ];
+        let lines = prune_inspect_note(&entries, [1, 2, 3, 4], [1, 2]);
+        let joined = lines.join("\n");
+        assert!(joined.contains("[3] assistant tools bash"));
+        assert!(joined.contains("[4] tool read"));
+        assert!(joined.contains("restored 2:"));
+        assert!(joined.contains("[1] restored write src/login.rs"));
+        assert!(joined.contains("[2] restored tool write"));
+        assert!(
+            !joined.contains("[1] assistant tools write"),
+            "full write must not also appear as dropped:\n{joined}"
+        );
+    }
+
+    #[test]
     fn prune_buckets_cover_prefix_without_overlap() {
         let entries = origami();
         let hidden = BTreeSet::new();
@@ -1180,8 +1313,8 @@ mod tests {
         assert_eq!(view.bucket(8), PruneBucket::Candidate);
         let (live_from, keep, candidates) = listing_buckets(&entries, &hidden);
         assert_eq!(live_from, 10);
-        assert_eq!(keep, vec![0, 2, 3, 4, 5, 6, 7]);
-        assert_eq!(candidates, vec![1, 8, 9]);
+        assert_eq!(keep, vec![0, 4, 5]);
+        assert_eq!(candidates, vec![1, 2, 3, 6, 7, 8, 9]);
         let mut seen = BTreeSet::new();
         for i in keep.iter().chain(candidates.iter()).copied() {
             assert!(i < live_from);
@@ -1242,7 +1375,7 @@ mod tests {
         assert!(hidden.contains(&1));
         assert!(hidden.contains(&8));
         assert!(hidden.contains(&9), "tool pair of 8");
-        assert!(!hidden.contains(&2));
+        assert!(!hidden.contains(&2), "unnamed write stays until dropped");
     }
 
     #[test]
@@ -1338,7 +1471,12 @@ mod tests {
             assistant("still"),
         ];
         let h1 = PruneView::new(&entries, &BTreeSet::new()).apply(&[1]);
-        let t1 = record_turn(entries.len(), &h1, vec![1, 2], prune_restored(&entries, &h1));
+        let t1 = record_turn(
+            entries.len(),
+            &h1,
+            vec![1, 2],
+            prune_restored(&entries, &h1),
+        );
         assert_eq!(t1.drop, vec![1, 2]);
         assert_eq!(t1.keep, vec![0, 3, 4]);
 
@@ -1378,7 +1516,9 @@ mod tests {
             hidden.iter().copied().collect(),
             prune_restored(&entries, &hidden),
         );
-        let listing = PruneView::with_ledger(&entries, &hidden, &[turn]).listing().1;
+        let listing = PruneView::with_ledger(&entries, &hidden, &[turn])
+            .listing()
+            .1;
         assert!(listing.contains("## Ledger"));
         assert!(listing.contains("keep "));
         assert!(listing.contains("drop "));
@@ -1402,6 +1542,15 @@ mod tests {
         assert!(!restored.contains_key(&3));
         let turn = record_turn(entries.len(), &hidden, vec![1, 2, 3, 4], restored);
         assert_eq!(turn.restored, vec![1, 2]);
+        let listing = PruneView::with_ledger(&entries, &hidden, &[turn.clone()])
+            .listing()
+            .1;
+        assert!(listing.contains("drop 3,4"));
+        assert!(listing.contains("restored 1,2"));
+        assert!(
+            !listing.contains("drop 1,2,3,4"),
+            "ledger must not list restored ids as drop too:\n{listing}"
+        );
         let send = model_entries(&entries, &[turn]);
         assert!(send.iter().any(
             |e| matches!(e, Entry::Assistant { calls, .. } if calls.iter().any(|c| c.name == "write"))

@@ -238,7 +238,9 @@ fn need_login() -> anyhow::Error {
 fn oauth_fail(kind: &str, status: u16, body: &TokenBody) -> anyhow::Error {
     let err = body.error.as_deref().unwrap_or("?");
     let desc = body.error_description.as_deref().unwrap_or("");
-    anyhow!(format!("xAI {kind} failed (HTTP {status}): {err} {desc}").trim_end().to_string())
+    anyhow!(format!("xAI {kind} failed (HTTP {status}): {err} {desc}")
+        .trim_end()
+        .to_string())
 }
 
 fn refresh_revoked(body: &TokenBody) -> bool {
@@ -433,9 +435,7 @@ pub async fn poll_token(device_code: &str) -> Result<Poll> {
     }
     Ok(match tok.error.as_deref() {
         Some("authorization_pending") => Poll::Pending,
-        Some("slow_down") => {
-            Poll::SlowDown(tok.interval.filter(|n| *n > 0).unwrap_or(5))
-        }
+        Some("slow_down") => Poll::SlowDown(tok.interval.filter(|n| *n > 0).unwrap_or(5)),
         Some("access_denied") | Some("authorization_denied") => Poll::Denied,
         Some("expired_token") => Poll::Expired,
         _ => return Err(oauth_fail("token poll", st, &tok)),
@@ -527,7 +527,10 @@ mod tests {
             interval: None,
         };
         let t = tokens_from_body(&body, None).unwrap();
-        assert!(still_fresh(&t), "60s token should not look expired immediately");
+        assert!(
+            still_fresh(&t),
+            "60s token should not look expired immediately"
+        );
         assert!(t.expires > now_ms());
         assert!(t.expires - now_ms() >= MIN_TTL_MS - 1);
     }
@@ -551,7 +554,10 @@ mod tests {
     #[test]
     fn tilde_and_lock_follow_auth_file() {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/home/tester".into());
-        assert_eq!(expand_tilde("~/tokens/x.json"), PathBuf::from(home).join("tokens/x.json"));
+        assert_eq!(
+            expand_tilde("~/tokens/x.json"),
+            PathBuf::from(home).join("tokens/x.json")
+        );
         assert_eq!(
             PathBuf::from("/tmp/shared/auth.json").with_extension("lock"),
             PathBuf::from("/tmp/shared/auth.lock")

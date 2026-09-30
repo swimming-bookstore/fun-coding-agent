@@ -12,9 +12,6 @@ strips them even if it does.
 
 - Every **user** message. Hiding users is what dropped later
   constraints.
-- Latest successful **write / edit per path** before the live tail, plus
-  the assistant call that issued it. Naming an old bash dump must not
-  wipe a later `write` of the same feature.
 - Latest successful **read per path in the previous completed turn**,
   and the whole assistant tool-call group that issued it. Older unique
   reads are candidates — locking every crop forever leaves no room for
@@ -41,9 +38,15 @@ the live tail, up to that tail.
 
 Dropping `1` may hide 1–2 only (the read pair). It must not hide 3–5.
 
+Latest write/edit bodies are **candidates**, not Keep. Dropping them
+hides the fat file on disk; the next payload still gets a
+[restore stub](ch15-09-restore.md) (path only) so a later review does
+not treat finished work as dead. Naming an old bash dump still must
+not suffix-wipe a later edit — only the named ids (plus tool pairs)
+hide.
+
 Dead-end bash in a keep-looking range can still be a candidate if it
-is not a protected read/write group. The model is told to prefer that
-noise.
+is not a protected read group. The model is told to prefer that noise.
 
 On resume, Fun **sanitizes** hidden so user ids are never stored there,
 even if an older jsonl prune line still lists them.

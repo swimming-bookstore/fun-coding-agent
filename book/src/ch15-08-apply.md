@@ -13,8 +13,9 @@ valid. This page is the apply pipeline, in order.
    hidden. A low id must not wipe later edits.
 4. **Never store user ids** in hidden, even if an older jsonl prune
    line still lists them.
-5. **Reject locks.** Live, previous-turn reads and conclusions, and
-   latest write/edit groups are stripped even if the model named them.
+5. **Reject locks.** Live, previous-turn reads, and previous-turn
+   conclusions are stripped even if the model named them. Latest
+   writes/edits may drop; they come back as [restore stubs](ch15-09-restore.md).
 6. **Restore broken pairs.** If one side of a call/result pair would
    remain visible, both stay visible.
 7. **Append to jsonl.** Transcript rows are not rewritten. Fun appends
