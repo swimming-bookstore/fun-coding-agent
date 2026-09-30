@@ -1,21 +1,23 @@
 mod tui;
 mod ui;
 
-use fun_core::agent::{mailbox, print_log, prompt, tool_fail, tool_ok, Agent, LogLine, MailboxTx, ToolRun};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use crossterm::event::{
     self, Event as CEvent, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
-use fun_core::grok::{login, logout, Grok};
-use fun_core::session::{empty_args, list_sessions, Call, Entry, Session, Usage};
+use fun_core::agent::{
+    Agent, LogLine, MailboxTx, ToolRun, mailbox, print_log, prompt, tool_fail, tool_ok,
+};
+use fun_core::grok::{Grok, login, logout};
+use fun_core::session::{Call, Entry, Session, Usage, empty_args, list_sessions};
+use fun_core::tool::get_tools;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
-use fun_core::tool::get_tools;
 use tui::{Bar, ComposerAtom, QueueHit, Queued, Ui};
 
 enum KeyAction {
@@ -158,7 +160,10 @@ impl LineEdit {
         });
         self.chips = remaining_chips(&self.atoms, &self.chips);
         reindex_chips(&mut self.atoms);
-        self.cursor = self.cursor.saturating_sub(removed_before).min(self.atoms.len());
+        self.cursor = self
+            .cursor
+            .saturating_sub(removed_before)
+            .min(self.atoms.len());
     }
 
     fn remove_at(&mut self, i: usize) {
@@ -459,8 +464,7 @@ fn on_key(edit: &mut LineEdit, ev: CEvent) -> KeyAction {
     let CEvent::Key(key) = ev else {
         return KeyAction::Skip;
     };
-    if key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(key.code, KeyCode::Char('c' | 'C'))
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c' | 'C'))
     {
         // Shift+Ctrl+C copies the highlight; Ctrl+C always quits.
         if key.modifiers.contains(KeyModifiers::SHIFT) {
@@ -697,7 +701,10 @@ fn packed_ref_exists(packed: &str, rel: &str) -> bool {
     let want = format!(" {rel}");
     packed.lines().any(|line| {
         let line = line.trim();
-        !line.is_empty() && !line.starts_with('#') && !line.starts_with('^') && line.ends_with(&want)
+        !line.is_empty()
+            && !line.starts_with('#')
+            && !line.starts_with('^')
+            && line.ends_with(&want)
     })
 }
 
@@ -761,11 +768,7 @@ fn git_has_origin(git: &Path) -> bool {
             })
 }
 
-fn pick_home_branch(
-    locals: &[&str],
-    origin_head: Option<&str>,
-    preferred: &str,
-) -> String {
+fn pick_home_branch(locals: &[&str], origin_head: Option<&str>, preferred: &str) -> String {
     if locals.contains(&preferred) {
         return preferred.to_string();
     }
@@ -1309,11 +1312,23 @@ fn replay(ui: &mut Ui, session: &Session) -> Result<()> {
             let (_, ids) = notes.next().expect("peeked");
             flush(ui, &mut runs)?;
             let n = ids.len();
+            let restored: Vec<usize> = ids
+                .iter()
+                .copied()
+                .filter(|i| session.restored.contains(i))
+                .collect();
+            let r = restored.len();
+            let text = if r == 0 {
+                format!("(dropped {n} messages from context)")
+            } else {
+                format!("(dropped {n} messages from context, restored {r})")
+            };
             ui.note_inspect(
-                &format!("(dropped {n} messages from context)"),
-                Some(fun_core::session::prune_inspect_ids(
+                &text,
+                Some(fun_core::session::prune_inspect_note(
                     &session.entries,
                     ids.iter().copied(),
+                    restored,
                 )),
             )?;
         }
@@ -1402,7 +1417,12 @@ fn copy_system_once(slot: &mut Option<arboard::Clipboard>, text: &str) -> Result
     Ok(())
 }
 
-fn apply_ui(ui: &mut Ui, edit: &LineEdit, action: KeyAction, _status: &Status) -> Result<KeyAction> {
+fn apply_ui(
+    ui: &mut Ui,
+    edit: &LineEdit,
+    action: KeyAction,
+    _status: &Status,
+) -> Result<KeyAction> {
     match action {
         KeyAction::Skip => {
             if !ui.asking() && !ui.pruning() {
@@ -1477,11 +1497,7 @@ fn handle_resize(ui: &mut Ui, ev: &CEvent) -> Result<bool> {
     }
 }
 
-async fn run_tui(
-    agent: &mut Agent,
-    tx: MailboxTx,
-    log_rx: Receiver<LogLine>,
-) -> Result<()> {
+async fn run_tui(agent: &mut Agent, tx: MailboxTx, log_rx: Receiver<LogLine>) -> Result<()> {
     let mut ui = Ui::start()?;
     let mut events = spawn_events();
     let mut edit = LineEdit::from_session(&agent.session);
@@ -1509,10 +1525,7 @@ async fn run_tui(
             let n = agent.session.entries.len();
             let dropped = status.pruned.len();
             let msg = if dropped == 0 {
-                format!(
-                    "(resumed {}, {n} entries)",
-                    agent.session.path.display()
-                )
+                format!("(resumed {}, {n} entries)", agent.session.path.display())
             } else {
                 format!(
                     "(resumed {}, {n} entries, {dropped} pruned from context)",
@@ -1845,15 +1858,7 @@ async fn main() -> Result<()> {
     let interactive = asked.is_empty();
     let (provider, model) = Grok::from_env().await?;
     let session = open_session(&cli, &workspace)?;
-    let mut agent = Agent::new(
-        workspace,
-        model,
-        provider,
-        get_tools(),
-        session,
-        mb,
-        log_tx,
-    );
+    let mut agent = Agent::new(workspace, model, provider, get_tools(), session, mb, log_tx);
 
     if !interactive {
         let printer = std::thread::spawn(move || {
@@ -1877,10 +1882,7 @@ mod tests {
     use super::*;
 
     fn idle_only(texts: &[&str]) -> Vec<Pending> {
-        texts
-            .iter()
-            .map(|t| Pending::Idle((*t).into()))
-            .collect()
+        texts.iter().map(|t| Pending::Idle((*t).into())).collect()
     }
 
     #[test]
@@ -1925,10 +1927,7 @@ mod tests {
             Some(ComposerAtom::Chip { index: 0, .. })
         ));
         assert!(edit.preview().contains("paste 4 lines"));
-        assert_eq!(
-            edit.text(),
-            "hi \nline1\nline2\nline3\nline4\n"
-        );
+        assert_eq!(edit.text(), "hi \nline1\nline2\nline3\nline4\n");
         edit.drop_chip(0);
         assert!(edit.chips.is_empty());
         assert_eq!(edit.text(), "hi ");
@@ -2003,8 +2002,7 @@ mod tests {
             Some("master")
         );
         assert_eq!(
-            branch_from_head("ref: refs/heads/fix/demo-clicks-and-binary-read\n")
-                .as_deref(),
+            branch_from_head("ref: refs/heads/fix/demo-clicks-and-binary-read\n").as_deref(),
             Some("fix/demo-clicks-and-binary-read")
         );
         assert_eq!(branch_from_head("948352c..."), None);
@@ -2017,18 +2015,9 @@ mod tests {
             pick_home_branch(&["main", "master"], Some("main"), "master"),
             "master"
         );
-        assert_eq!(
-            pick_home_branch(&["main"], Some("main"), "master"),
-            "main"
-        );
-        assert_eq!(
-            pick_home_branch(&["dev"], Some("main"), "master"),
-            "dev"
-        );
-        assert_eq!(
-            pick_home_branch(&[], Some("main"), "master"),
-            "main"
-        );
+        assert_eq!(pick_home_branch(&["main"], Some("main"), "master"), "main");
+        assert_eq!(pick_home_branch(&["dev"], Some("main"), "master"), "dev");
+        assert_eq!(pick_home_branch(&[], Some("main"), "master"), "main");
         assert_eq!(pick_home_branch(&[], None, "dev"), "dev");
         let packed = "# pack-refs with: peeled fully-peeled sorted\n\
                       1111111111111111111111111111111111111111 refs/heads/master\n\
@@ -2081,13 +2070,13 @@ mod tests {
         assert_eq!(action_prompt(&KeyAction::Action(1), &no_git), None);
         assert_eq!(
             action_ask(&KeyAction::Action(1), &no_git).as_deref(),
-            Some(
-                "init git on {home} if needed, add origin {origin}, then commit and push"
-            )
+            Some("init git on {home} if needed, add origin {origin}, then commit and push")
         );
         assert_eq!(
             fun_core::config::fill_action(
-                action_ask(&KeyAction::Action(1), &no_git).as_deref().unwrap(),
+                action_ask(&KeyAction::Action(1), &no_git)
+                    .as_deref()
+                    .unwrap(),
                 no_git.pull.as_deref(),
                 no_git.branch.as_deref(),
                 Some("git@github.com:swimming-bookstore/connect-agent.git"),

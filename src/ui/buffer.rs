@@ -78,7 +78,9 @@ impl Buffer {
             width: w as u8,
             style,
         };
-        if w == 2 && let Some(n) = self.index(x + 1, y) {
+        if w == 2
+            && let Some(n) = self.index(x + 1, y)
+        {
             self.cells[n] = Cell {
                 ch: ' ',
                 width: 0,

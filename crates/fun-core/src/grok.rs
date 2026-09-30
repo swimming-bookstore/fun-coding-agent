@@ -234,7 +234,7 @@ pub struct Grok {
 impl Grok {
     pub async fn client() -> Result<(Self, String)> {
         let base_url = env_or("FUN_CODING_AGENT_BASE_URL", "https://api.x.ai/v1");
-        let model = env_or("FUN_CODING_AGENT_MODEL", "grok-4.6");
+        let model = env_or("FUN_CODING_AGENT_MODEL", "grok-4.7");
         let effort = reasoning_effort();
         Ok((
             Self {

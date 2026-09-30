@@ -31,7 +31,7 @@ Example:
 5. Fun loops until the model replies with no tools, you abort, or it
    hits 200 tool rounds.
 
-Default model is `grok-4.6`. Default reasoning effort is `medium`.
+Default model is `grok-4.7`. Default reasoning effort is `medium`.
 Both can be changed; see [Environment](ch11-00-environment.md).
 
 ## Starting fresh, or elsewhere

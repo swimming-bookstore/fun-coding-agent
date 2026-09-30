@@ -103,7 +103,14 @@ mod tests {
     #[test]
     fn split_fill_and_lengths() {
         let area = Rect::new(0, 0, 10, 10);
-        let parts = split(area, &[Constraint::Fill, Constraint::Length(3), Constraint::Length(1)]);
+        let parts = split(
+            area,
+            &[
+                Constraint::Fill,
+                Constraint::Length(3),
+                Constraint::Length(1),
+            ],
+        );
         assert_eq!(parts.len(), 3);
         assert_eq!(parts[0].height, 6);
         assert_eq!(parts[1].height, 3);

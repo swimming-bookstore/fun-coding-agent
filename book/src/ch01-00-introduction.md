@@ -92,7 +92,7 @@ is not obvious from a blank composer.
 | Thing | Default |
 | --- | --- |
 | Binary | `fun` |
-| Model | `grok-4.6` |
+| Model | `grok-4.7` |
 | Reasoning effort | `medium` (prune calls always use `low`) |
 | Config | `~/.config/fun/config.json` |
 | Auth | `~/.local/share/fun/auth.json` |

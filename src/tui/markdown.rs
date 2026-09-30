@@ -284,8 +284,7 @@ impl Md {
                 self.flush_line();
                 blank_after(&mut self.out);
                 let n = self.width.clamp(3, 40);
-                self.out
-                    .push(Line::plain("─".repeat(n), muted()));
+                self.out.push(Line::plain("─".repeat(n), muted()));
                 blank_after(&mut self.out);
             }
             Event::TaskListMarker(checked) => {
@@ -579,7 +578,12 @@ pub(super) fn table_sep(widths: &[usize]) -> Line {
     Line::plain(s, muted())
 }
 
-pub(super) fn table_row(row: &[Vec<Span>], widths: &[usize], align: &[Align], header: bool) -> Line {
+pub(super) fn table_row(
+    row: &[Vec<Span>],
+    widths: &[usize],
+    align: &[Align],
+    header: bool,
+) -> Line {
     let mut spans = Vec::new();
     for (i, w) in widths.iter().enumerate() {
         if i > 0 {
@@ -629,4 +633,3 @@ pub(super) fn code_block(lines: &[String], lang: &str, max: usize) -> Vec<Line> 
     }
     out
 }
-

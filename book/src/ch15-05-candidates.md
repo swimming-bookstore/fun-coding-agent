@@ -13,9 +13,11 @@ Typical candidates:
 - old plans and chatter
 - old tool-less conclusions that a later user line replaced
 - older unique `read` dumps (not the previous turn’s latest read per path)
+- latest `write` / `edit` bodies (they come back as restore stubs)
 
-The prune prompt tells the model to prefer that noise so later file
-edits stay. If nothing should go, it returns `{"drop":[]}`. Fun then
+The prune prompt tells the model to prefer dead-end noise, and that
+dropped writes still reach the next payload as stubs. If nothing
+should go, it returns `{"drop":[]}`. Fun then
 notes `(nothing to drop)` and still will not retry until the next user
 line.
 

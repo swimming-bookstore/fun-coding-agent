@@ -16,15 +16,12 @@
 //!   Esc         abort, then send from the composer
 //!   click send now / edit / move up / move down / cancel  on a queued prompt
 
-
-use fun_core::agent::ToolRun;
-use fun_core::config::{Action, Palette};
-use crate::ui::{
-    split, Color, Constraint, Rect, Style, Terminal,
-};
 #[cfg(test)]
 use crate::ui::{Block, Buffer};
+use crate::ui::{Color, Constraint, Rect, Style, Terminal, split};
 use anyhow::Result;
+use fun_core::agent::ToolRun;
+use fun_core::config::{Action, Palette};
 use std::cell::Cell;
 use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthChar;
@@ -33,7 +30,6 @@ mod chrome;
 mod markdown;
 use chrome::*;
 use markdown::*;
-
 
 const THINK_HOLD: Duration = Duration::from_secs(2);
 const QUEUE_FLASH: Duration = Duration::from_millis(1200);
@@ -94,7 +90,11 @@ fn actions() -> Vec<Action> {
 }
 
 fn rgb_color(c: fun_core::config::Rgb) -> Color {
-    Color::Rgb { r: c.r, g: c.g, b: c.b }
+    Color::Rgb {
+        r: c.r,
+        g: c.g,
+        b: c.b,
+    }
 }
 
 fn col(c: Color) -> Style {
@@ -756,21 +756,14 @@ impl Ui {
         let lines = wrap_body(&self.rows, &self.partial, self.working, width);
         let origin = self.body_area.x.saturating_add(1);
         let text = selected_from_lines(&lines, select, origin, self.body_area.right());
-        if text.is_empty() {
-            None
-        } else {
-            Some(text)
-        }
+        if text.is_empty() { None } else { Some(text) }
     }
 
     fn screen_to_sel(&self, x: u16, y: u16) -> (u16, usize) {
         let a = self.body_area;
         let x = x.clamp(a.left(), a.right().saturating_sub(1));
         let y = y.clamp(a.top(), a.bottom().saturating_sub(1));
-        (
-            x,
-            self.body_start + y.saturating_sub(a.top()) as usize,
-        )
+        (x, self.body_start + y.saturating_sub(a.top()) as usize)
     }
 
     pub fn queue_hit(&self, x: u16, y: u16) -> Option<QueueHit> {
@@ -894,10 +887,7 @@ impl Ui {
             self.rows.clear();
             return self.redraw();
         }
-        self.push_plain(Item::Tools {
-            runs,
-            open: false,
-        })
+        self.push_plain(Item::Tools { runs, open: false })
     }
 
     fn push_plain(&mut self, item: Item) -> Result<()> {
@@ -1025,9 +1015,7 @@ impl Ui {
             .or(self.queue_drag);
         let interrupts = &self.interrupts;
         let steers = &self.steers;
-        let show_copied = self
-            .copied_until
-            .is_some_and(|at| Instant::now() < at);
+        let show_copied = self.copied_until.is_some_and(|at| Instant::now() < at);
         let follow = self.follow;
         let hover_url = self.hover_url.as_deref();
         let ask = self.ask.as_ref();
@@ -1049,21 +1037,23 @@ impl Ui {
             let composer_wanted = composer_wanted_height(atoms, area.width);
             let (composer_h, status_h) =
                 chrome_heights(area.height, status_wanted, composer_wanted);
-            let mut room = area.height.saturating_sub(composer_h.saturating_add(status_h));
+            let mut room = area
+                .height
+                .saturating_sub(composer_h.saturating_add(status_h));
             let think_h = think_height(think, area.width, room);
             room = room.saturating_sub(think_h);
-            let interrupt_h = if interrupts.is_empty() || room == 0 { 0 } else { 1 };
+            let interrupt_h = if interrupts.is_empty() || room == 0 {
+                0
+            } else {
+                1
+            };
             room = room.saturating_sub(interrupt_h);
             let steer_h = notice_height(steers, room);
             room = room.saturating_sub(steer_h);
             let queue_h = queue_height(queue, room);
             room = room.saturating_sub(queue_h);
-            let action_h = action_bar_height(
-                area.width,
-                bar.pull.as_deref(),
-                bar.branch.as_deref(),
-                room,
-            );
+            let action_h =
+                action_bar_height(area.width, bar.pull.as_deref(), bar.branch.as_deref(), room);
             let mut constraints = vec![Constraint::Fill];
             if think_h > 0 {
                 constraints.push(Constraint::Length(think_h));
@@ -1106,16 +1096,18 @@ impl Ui {
             }
             if queue_h > 0 {
                 queue_area = parts[i];
-                queue_panel(buf, parts[i], queue, queue_hl, queue_edit.zip(queue_edit_text));
+                queue_panel(
+                    buf,
+                    parts[i],
+                    queue,
+                    queue_hl,
+                    queue_edit.zip(queue_edit_text),
+                );
                 i += 1;
             }
             if action_h > 0 {
-                actions = paint_action_bar(
-                    buf,
-                    parts[i],
-                    bar.pull.as_deref(),
-                    bar.branch.as_deref(),
-                );
+                actions =
+                    paint_action_bar(buf, parts[i], bar.pull.as_deref(), bar.branch.as_deref());
                 i += 1;
             }
             let cursor_pos = if composer_h > 0 {
@@ -1168,7 +1160,6 @@ impl Ui {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1185,7 +1176,10 @@ mod tests {
     }
 
     fn plain_text(text: &str) -> Vec<String> {
-        render_plain(text).into_iter().map(|l| line_text(&l)).collect()
+        render_plain(text)
+            .into_iter()
+            .map(|l| line_text(&l))
+            .collect()
     }
 
     fn laid_out(text: &str, width: usize) -> Vec<String> {
@@ -1238,10 +1232,12 @@ mod tests {
             },
             80,
         );
-        assert!(lines
-            .iter()
-            .flat_map(|l| &l.spans)
-            .any(|s| s.style.underline && s.text.contains("dropped 25")));
+        assert!(
+            lines
+                .iter()
+                .flat_map(|l| &l.spans)
+                .any(|s| s.style.underline && s.text.contains("dropped 25"))
+        );
     }
 
     #[test]
@@ -1249,8 +1245,16 @@ mod tests {
         let src = "see [docs](https://example.com/a) and https://example.com/b";
         let lines = render_plain(src);
         assert_eq!(plain_text(src), vec![src]);
-        assert!(lines.iter().all(|l| l.spans.iter().all(|s| s.link.is_none())));
-        assert!(lines.iter().all(|l| l.spans.iter().all(|s| !s.style.underline)));
+        assert!(
+            lines
+                .iter()
+                .all(|l| l.spans.iter().all(|s| s.link.is_none()))
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|l| l.spans.iter().all(|s| !s.style.underline))
+        );
     }
 
     #[test]
@@ -1292,7 +1296,10 @@ mod tests {
     #[test]
     fn link_at_hits_markdown_label() {
         let rows = indent_lines(
-            wrap_lines(&render_md("see [docs](https://example.com/a) please", 40), 40),
+            wrap_lines(
+                &render_md("see [docs](https://example.com/a) please", 40),
+                40,
+            ),
             "  ",
         );
         let area = Rect::new(0, 0, 44, 3);
@@ -1334,9 +1341,20 @@ mod tests {
             "| milk | 1 |\n",
         );
         let lines = md_text(src, 80);
-        assert!(lines.iter().any(|l| l.contains("Name") && l.contains("Qty")), "{lines:?}");
-        assert!(lines.iter().any(|l| l.contains('─') && l.contains('┼')), "{lines:?}");
-        assert!(lines.iter().any(|l| l.contains("eggs") && l.contains("12")), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Name") && l.contains("Qty")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains('─') && l.contains('┼')),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("eggs") && l.contains("12")),
+            "{lines:?}"
+        );
         assert!(lines.iter().any(|l| l.contains("milk")), "{lines:?}");
     }
 
@@ -1344,10 +1362,7 @@ mod tests {
     fn table_does_not_join_into_paragraph() {
         let src = "| a | b |\n| --- | --- |\n| 1 | 2 |";
         let lines = md_text(src, 40);
-        assert!(
-            !lines.iter().any(|l| l.contains("| --- |")),
-            "{lines:?}"
-        );
+        assert!(!lines.iter().any(|l| l.contains("| --- |")), "{lines:?}");
         assert!(lines.len() >= 3, "{lines:?}");
     }
 
@@ -1404,10 +1419,7 @@ mod tests {
     #[test]
     fn queue_hit_maps_controls() {
         let area = Rect::new(0, 10, 80, 4);
-        let queue = vec![
-            Queued { text: "one".into() },
-            Queued { text: "two".into() },
-        ];
+        let queue = vec![Queued { text: "one".into() }, Queued { text: "two".into() }];
         let inner = queue_inner(area);
         let mut cx = queue_ctrl_origin(inner).saturating_add(1);
         let mut hits = Vec::new();
@@ -1418,12 +1430,24 @@ mod tests {
             hits.push((cx, queue_ctrl_hit(*kind, 0), queue_ctrl_hit(*kind, 1)));
             cx = cx.saturating_add(width(label) as u16);
         }
-        assert_eq!(queue_hit(area, &queue, inner.x, 11), Some(QueueHit::Drag(0)));
-        assert_eq!(queue_hit(area, &queue, hits[0].0, 11), Some(QueueHit::Steer(0)));
-        assert_eq!(queue_hit(area, &queue, hits[1].0, 11), Some(QueueHit::Edit(0)));
+        assert_eq!(
+            queue_hit(area, &queue, inner.x, 11),
+            Some(QueueHit::Drag(0))
+        );
+        assert_eq!(
+            queue_hit(area, &queue, hits[0].0, 11),
+            Some(QueueHit::Steer(0))
+        );
+        assert_eq!(
+            queue_hit(area, &queue, hits[1].0, 11),
+            Some(QueueHit::Edit(0))
+        );
         assert_eq!(queue_hit(area, &queue, hits[2].0, 12), Some(hits[2].2));
         assert_eq!(queue_hit(area, &queue, hits[3].0, 11), Some(hits[3].1));
-        assert_eq!(queue_hit(area, &queue, hits[4].0, 12), Some(QueueHit::Drop(1)));
+        assert_eq!(
+            queue_hit(area, &queue, hits[4].0, 12),
+            Some(QueueHit::Drop(1))
+        );
         assert_eq!(queue_hit(area, &queue, inner.x, 10), None);
         assert_eq!(queue_hit(area, &queue, inner.x, 13), None);
     }
@@ -1493,7 +1517,7 @@ mod tests {
             cache_hit: "80.0%".into(),
             cost: "$0.012".into(),
             context: "12.3%/500k".into(),
-            model: "grok-4.6".into(),
+            model: "grok-4.7".into(),
             effort: "medium".into(),
         }
     }
@@ -1516,10 +1540,7 @@ mod tests {
 
     #[test]
     fn composer_keeps_pasted_newlines() {
-        let atoms: Vec<ComposerAtom> = "hello\nworld\n!"
-            .chars()
-            .map(ComposerAtom::Char)
-            .collect();
+        let atoms: Vec<ComposerAtom> = "hello\nworld\n!".chars().map(ComposerAtom::Char).collect();
         let view = composer_view(&atoms, 13, 40);
         let lines: Vec<String> = view
             .lines
@@ -1614,10 +1635,10 @@ mod tests {
             let joined = lines.join(" ");
             assert!(joined.contains("~/fun-coding-agent"), "{joined}");
             assert!(!joined.contains("pull master"), "{joined}");
-            assert!(joined.contains("grok-4.6"), "{joined}");
+            assert!(joined.contains("grok-4.7"), "{joined}");
             assert!(joined.contains("medium"), "{joined}");
             let last = lines.last().map(String::as_str).unwrap_or("");
-            assert!(last.contains("grok-4.6"), "last {last:?}");
+            assert!(last.contains("grok-4.7"), "last {last:?}");
             assert!(last.contains("medium"), "last {last:?}");
         }
     }
@@ -1626,35 +1647,37 @@ mod tests {
     fn pull_master_sits_above_composer() {
         let area = Rect::new(0, 19, 80, 1);
         assert_eq!(
-            fun_core::config::fill_action("checkout and pull {home}", Some("master"), None, None).as_deref(),
+            fun_core::config::fill_action("checkout and pull {home}", Some("master"), None, None)
+                .as_deref(),
             Some("checkout and pull master")
         );
         assert_eq!(
-            fun_core::config::fill_action(&Action::defaults()[0].label, Some("master"), None, None).as_deref(),
+            fun_core::config::fill_action(&Action::defaults()[0].label, Some("master"), None, None)
+                .as_deref(),
             Some("[ checkout and pull master ]")
         );
         assert_eq!(
-            fun_core::config::fill_action(&Action::defaults()[0].label, Some("main"), None, None).as_deref(),
+            fun_core::config::fill_action(&Action::defaults()[0].label, Some("main"), None, None)
+                .as_deref(),
             Some("[ checkout and pull main ]")
         );
         assert_eq!(
-            Action::defaults()[1].filled_label(Some("master"), Some("feat")).as_deref(),
+            Action::defaults()[1]
+                .filled_label(Some("master"), Some("feat"))
+                .as_deref(),
             Some("[ commit to feat and push ]")
         );
         assert_eq!(
-            Action::defaults()[1].filled_label(Some("master"), Some("master")).as_deref(),
+            Action::defaults()[1]
+                .filled_label(Some("master"), Some("master"))
+                .as_deref(),
             Some("[ commit and push ]")
         );
         crate::tui::set_git(true);
         crate::tui::set_origin(true);
         assert_eq!(action_bar_height(80, Some("master"), Some("feat"), 4), 1);
         assert_eq!(action_bar_height(80, Some("master"), Some("feat"), 0), 0);
-        let hits = paint_action_bar(
-            &mut Buffer::new(80, 24),
-            area,
-            Some("master"),
-            Some("feat"),
-        );
+        let hits = paint_action_bar(&mut Buffer::new(80, 24), area, Some("master"), Some("feat"));
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].1, ActionHit { index: 0 });
         assert_eq!(hits[1].1, ActionHit { index: 1 });
@@ -1675,17 +1698,10 @@ mod tests {
             Some("master"),
         );
         assert_eq!(on_home.len(), 2);
-        assert_eq!(
-            on_home[1].0.width as usize,
-            width("[ commit and push ]")
-        );
+        assert_eq!(on_home[1].0.width as usize, width("[ commit and push ]"));
         crate::tui::set_origin(false);
-        let no_origin = paint_action_bar(
-            &mut Buffer::new(80, 24),
-            area,
-            Some("master"),
-            Some("feat"),
-        );
+        let no_origin =
+            paint_action_bar(&mut Buffer::new(80, 24), area, Some("master"), Some("feat"));
         assert_eq!(no_origin.len(), 2);
         crate::tui::set_git(false);
         let no_git = paint_action_bar(&mut Buffer::new(80, 24), area, Some("master"), None);

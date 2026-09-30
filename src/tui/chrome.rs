@@ -1,6 +1,6 @@
 use super::*;
 use crate::ui::{Block, Buffer, Rect, Style};
-use fun_core::agent::{tool_counts, tool_summary, ToolRun};
+use fun_core::agent::{ToolRun, tool_counts, tool_summary};
 use fun_core::config::{ActionColor, ActionWhen};
 use unicode_width::UnicodeWidthStr;
 
@@ -71,12 +71,13 @@ pub(super) fn status_rows(
     if let Some(branch) = &bar.branch {
         push_item(&mut ident, branch, user_col());
     }
-    let add_stat = |out: &mut Vec<(String, Style)>, label: &str, value: &str, color: fun_core::config::Rgb| {
-        if value.is_empty() {
-            return;
-        }
-        push_item(out, &format!("{label} {value}"), pal_col(color));
-    };
+    let add_stat =
+        |out: &mut Vec<(String, Style)>, label: &str, value: &str, color: fun_core::config::Rgb| {
+            if value.is_empty() {
+                return;
+            }
+            push_item(out, &format!("{label} {value}"), pal_col(color));
+        };
     add_stat(&mut stats, "input tokens", &bar.input, pal().text);
     add_stat(&mut stats, "output tokens", &bar.output, pal().ok);
     add_stat(&mut stats, "reasoning tokens", &bar.reasoning, pal().agent);
@@ -93,13 +94,7 @@ pub(super) fn status_rows(
     let ident_w = segs_width(&ident);
     let stats_w = segs_width(&stats);
     let right_w = segs_width(&right);
-    let gap = |a: usize, b: usize| -> usize {
-        if a > 0 && b > 0 {
-            2
-        } else {
-            0
-        }
-    };
+    let gap = |a: usize, b: usize| -> usize { if a > 0 && b > 0 { 2 } else { 0 } };
     let one = ident_w + gap(ident_w, stats_w) + stats_w + gap(ident_w + stats_w, right_w) + right_w;
     if one <= inner {
         let mut line = ident;
@@ -301,7 +296,10 @@ pub(super) fn paint_ask(buf: &mut Buffer, screen: Rect, ask: &AskDialog) -> (u16
     if inner.is_empty() {
         return (box_area.x.saturating_add(1), box_area.y.saturating_add(1));
     }
-    let field_y = inner.y.saturating_add(1).min(inner.bottom().saturating_sub(1));
+    let field_y = inner
+        .y
+        .saturating_add(1)
+        .min(inner.bottom().saturating_sub(1));
     let field = Rect::new(
         inner.x.saturating_add(1),
         field_y,
@@ -335,10 +333,7 @@ pub(super) fn paint_ask(buf: &mut Buffer, screen: Rect, ask: &AskDialog) -> (u16
     cursor
 }
 
-pub(super) fn order_sel(
-    start: (u16, usize),
-    end: (u16, usize),
-) -> ((u16, usize), (u16, usize)) {
+pub(super) fn order_sel(start: (u16, usize), end: (u16, usize)) -> ((u16, usize), (u16, usize)) {
     if (start.1, start.0) <= (end.1, end.0) {
         (start, end)
     } else {
@@ -346,7 +341,10 @@ pub(super) fn order_sel(
     }
 }
 
-pub(super) fn action_items(home: Option<&str>, branch: Option<&str>) -> Vec<(String, ActionHit, ActionColor)> {
+pub(super) fn action_items(
+    home: Option<&str>,
+    branch: Option<&str>,
+) -> Vec<(String, ActionHit, ActionColor)> {
     actions()
         .into_iter()
         .enumerate()
@@ -376,7 +374,12 @@ pub(super) fn action_style(color: ActionColor) -> Style {
     }
 }
 
-pub(super) fn action_bar_height(width: u16, home: Option<&str>, branch: Option<&str>, room: u16) -> u16 {
+pub(super) fn action_bar_height(
+    width: u16,
+    home: Option<&str>,
+    branch: Option<&str>,
+    room: u16,
+) -> u16 {
     if room == 0 || width < 8 || action_items(home, branch).is_empty() {
         0
     } else {
@@ -444,7 +447,11 @@ pub(super) fn paint_copied(buf: &mut Buffer, screen: Rect, composer: Rect) {
     if w > screen.width || h > screen.height {
         return;
     }
-    let anchor = if composer.is_empty() { screen } else { composer };
+    let anchor = if composer.is_empty() {
+        screen
+    } else {
+        composer
+    };
     let x = anchor
         .x
         .saturating_add(anchor.width.saturating_sub(w) / 2)
@@ -454,7 +461,10 @@ pub(super) fn paint_copied(buf: &mut Buffer, screen: Rect, composer: Rect) {
     } else if !composer.is_empty() && composer.height > 1 {
         composer.y
     } else {
-        screen.bottom().saturating_sub(h.saturating_add(1)).max(screen.y)
+        screen
+            .bottom()
+            .saturating_sub(h.saturating_add(1))
+            .max(screen.y)
     };
     let toast = Rect::new(x, y, w, h);
     let mut ty = toast.top();
@@ -580,7 +590,9 @@ pub(super) fn overlay_above(screen: Rect, composer: Rect, height: u16) -> Rect {
     } else if !composer.is_empty() && composer.y > screen.y {
         screen.y
     } else {
-        screen.bottom().saturating_sub(h.saturating_add(composer.height.max(1)))
+        screen
+            .bottom()
+            .saturating_sub(h.saturating_add(composer.height.max(1)))
             .max(screen.y)
     };
     Rect::new(screen.x, y, screen.width, h)
@@ -600,8 +612,7 @@ pub(super) fn paint_select(
         return;
     }
     let vis_top = body_start;
-    let vis_bot = body_start
-        .saturating_add(area.height.saturating_sub(1) as usize);
+    let vis_bot = body_start.saturating_add(area.height.saturating_sub(1) as usize);
     let row0 = a.1.max(vis_top);
     let row1 = b.1.min(vis_bot);
     if row0 > row1 {
@@ -670,7 +681,10 @@ pub(super) fn indent_lines(lines: Vec<Line>, pad: &str) -> Vec<Line> {
         .collect()
 }
 
-pub(super) fn layout_items(items: &[Item], width: usize) -> (Vec<Line>, Vec<(usize, usize, usize)>) {
+pub(super) fn layout_items(
+    items: &[Item],
+    width: usize,
+) -> (Vec<Line>, Vec<(usize, usize, usize)>) {
     let mut rows = Vec::new();
     let mut map = Vec::with_capacity(items.len());
     for (i, item) in items.iter().enumerate() {
@@ -704,13 +718,15 @@ pub(super) fn layout_item(item: &Item, width: usize) -> (usize, Vec<Line>) {
             (lines.len(), lines)
         }
         Item::Note { text, inspect } => {
-            let style = if inspect.as_ref().is_some_and(|l| !l.is_empty()) || is_prune_note(text)
-            {
+            let style = if inspect.as_ref().is_some_and(|l| !l.is_empty()) || is_prune_note(text) {
                 muted().underline()
             } else {
                 muted()
             };
-            let lines = indent_lines(wrap_lines(&[Line::plain(text.clone(), style)], body_w), "  ");
+            let lines = indent_lines(
+                wrap_lines(&[Line::plain(text.clone(), style)], body_w),
+                "  ",
+            );
             (lines.len(), lines)
         }
         Item::Tools { runs, open } => tool_block(runs, *open, width.max(1)),
@@ -772,7 +788,10 @@ pub(super) fn tool_block(runs: &[ToolRun], open: bool, width: usize) -> (usize, 
         if r.is_error {
             for line in r.detail.lines() {
                 lines.extend(wrap_lines(
-                    &[Line::plain(format!("{detail_pad}{line}"), err_col()).with_hang(detail_hang)],
+                    &[
+                        Line::plain(format!("{detail_pad}{line}"), err_col())
+                            .with_hang(detail_hang),
+                    ],
                     width,
                 ));
             }
@@ -925,7 +944,13 @@ pub(super) fn queue_hit(area: Rect, queue: &[Queued], x: u16, y: u16) -> Option<
     Some(QueueHit::Drag(row))
 }
 
-pub(super) fn notice_strip(buf: &mut Buffer, area: Rect, label: &str, label_style: Style, items: &[String]) {
+pub(super) fn notice_strip(
+    buf: &mut Buffer,
+    area: Rect,
+    label: &str,
+    label_style: Style,
+    items: &[String],
+) {
     if area.is_empty() || items.is_empty() {
         return;
     }
@@ -966,7 +991,10 @@ pub(super) fn write_notice_line(
         .saturating_sub(1) as usize;
     buf.write(area, x, y, &clip_width(&preview, max), pal_col(pal().text));
     if !count.is_empty() {
-        let cx = area.right().saturating_sub(count_w as u16).saturating_sub(1);
+        let cx = area
+            .right()
+            .saturating_sub(count_w as u16)
+            .saturating_sub(1);
         if cx > x {
             buf.write(area, cx, y, &count, count_style);
         }
@@ -1065,7 +1093,11 @@ pub(super) fn queue_panel(
         let later_style = if i + 1 == n { muted() } else { tool_col() };
         for (k, (label, kind)) in QUEUE_CTRLS.iter().enumerate() {
             let gap = if k == 0 { " " } else { "  " };
-            let gap_style = if hot { muted().bg(rgb_color(pal().queue)) } else { muted() };
+            let gap_style = if hot {
+                muted().bg(rgb_color(pal().queue))
+            } else {
+                muted()
+            };
             cx = buf.write(inner, cx, y, gap, gap_style);
             let style = match kind {
                 QueueCtrl::Steer => accent(),
@@ -1074,7 +1106,11 @@ pub(super) fn queue_panel(
                 QueueCtrl::Edit => user_col(),
                 QueueCtrl::Remove => err_col(),
             };
-            let style = if hot { style.bold().bg(rgb_color(pal().queue)) } else { style };
+            let style = if hot {
+                style.bold().bg(rgb_color(pal().queue))
+            } else {
+                style
+            };
             cx = buf.write(inner, cx, y, label, style);
         }
     }
@@ -1201,7 +1237,11 @@ pub(super) fn slice_line(line: &Line, origin_x: u16, x0: u16, x1: u16) -> String
 
 pub(super) fn body_window(len: usize, height: usize, follow: bool, start: usize) -> (usize, usize) {
     let max_start = len.saturating_sub(height);
-    let start = if follow { max_start } else { start.min(max_start) };
+    let start = if follow {
+        max_start
+    } else {
+        start.min(max_start)
+    };
     (max_start.saturating_sub(start), start)
 }
 
@@ -1295,7 +1335,10 @@ pub(super) fn composer_view(atoms: &[ComposerAtom], cursor: usize, max: usize) -
                 if cw == 0 {
                     continue;
                 }
-                if lines.last().is_some_and(|l| l.width + cw > max && l.width > 0) {
+                if lines
+                    .last()
+                    .is_some_and(|l| l.width + cw > max && l.width > 0)
+                {
                     newline(&mut lines);
                 }
                 let Some(line) = lines.last_mut() else {
@@ -1319,7 +1362,10 @@ pub(super) fn composer_view(atoms: &[ComposerAtom], cursor: usize, max: usize) -
             ComposerAtom::Chip { index, label } => {
                 let text = chip_text(label, max);
                 let tw = width(&text).min(max).max(1);
-                if lines.last().is_some_and(|l| l.width + tw > max && l.width > 0) {
+                if lines
+                    .last()
+                    .is_some_and(|l| l.width + tw > max && l.width > 0)
+                {
                     newline(&mut lines);
                 }
                 let Some(line) = lines.last_mut() else {
@@ -1384,7 +1430,10 @@ pub(super) fn composer(
             }
         }
     }
-    let vis = view.cursor_line.saturating_sub(start).min(h.saturating_sub(1));
+    let vis = view
+        .cursor_line
+        .saturating_sub(start)
+        .min(h.saturating_sub(1));
     let y = inner.y.saturating_add(vis as u16);
     let x = inner
         .x
@@ -1472,29 +1521,32 @@ pub(super) fn wrap_row(spans: &[Span], max: usize, hang: usize) -> Vec<Line> {
         }
     };
 
-    let push_span = |rows: &mut Vec<Vec<Span>>, text: String, style: Style, link: Option<String>| {
-        if rows.is_empty() {
-            rows.push(Vec::new());
-        }
-        let Some(row) = rows.last_mut() else {
-            return;
+    let push_span =
+        |rows: &mut Vec<Vec<Span>>, text: String, style: Style, link: Option<String>| {
+            if rows.is_empty() {
+                rows.push(Vec::new());
+            }
+            let Some(row) = rows.last_mut() else {
+                return;
+            };
+            if let Some(prev) = row.last_mut()
+                && prev.style == style
+                && prev.link == link
+            {
+                prev.text.push_str(&text);
+                return;
+            }
+            row.push(Span::linked(text, style, link));
         };
-        if let Some(prev) = row.last_mut()
-            && prev.style == style
-            && prev.link == link
-        {
-            prev.text.push_str(&text);
-            return;
-        }
-        row.push(Span::linked(text, style, link));
-    };
     let trim_trailing = |row: &mut Vec<Span>, w: &mut usize| {
         while let Some(last) = row.last_mut() {
             if last.text.is_empty() {
                 row.pop();
                 continue;
             }
-            let trimmed = last.text.trim_end_matches(|c: char| c.is_whitespace() && c != '\n');
+            let trimmed = last
+                .text
+                .trim_end_matches(|c: char| c.is_whitespace() && c != '\n');
             if trimmed.len() == last.text.len() {
                 break;
             }
@@ -1743,4 +1795,3 @@ pub(super) fn sanitize(s: &str) -> String {
     }
     out
 }
-

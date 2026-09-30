@@ -15,9 +15,8 @@ wrote N bytes to <path>
 
 Prefer `write` for new files or wholesale replacement. Prefer `edit`
 when changing a unique snippet — `write` of a whole file on every
-tweak burns context and makes later prunes more likely to hide the
-body (the latest write per path is Keep, but the *content* of old
-writes is still large until hidden).
+tweak burns context. Later prunes may hide that body; the next
+payload then gets a path-only [restore stub](ch15-09-restore.md).
 
 `write` is not append. To add a line, `read` then `edit`, or `write`
 the whole new file.
