@@ -22,6 +22,7 @@ mtime. `fun list-sessions` prints them.
 ```json
 {"type":"header","version":1,"id":"…","cwd":"/home/you/proj","createdAt":…}
 {"type":"user","text":"fix the tests"}
+{"type":"user","text":"what is this","images":[{"media":"png","data":"…","name":"shot.png"}]}
 {"type":"assistant","text":"I’ll read…","thinking":"…","calls":[…]}
 {"type":"tool","id":"…","name":"read","content":"…","is_error":false}
 {"type":"prune","hidden":[3,4],"dropped":2,"added":[3,4],"keep":[0,1,2,5,6],"restored":[]}
@@ -33,7 +34,7 @@ Entries you care about as a reader:
 | `type` | Role |
 | --- | --- |
 | `header` | Once, at the top. Workspace cwd, id, created time. |
-| `user` | A prompt. Index = number of entries before this line. |
+| `user` | A prompt. Optional `images` (png / jpeg / gif / webp, base64). Index = number of entries before this line. |
 | `assistant` | Text, optional thinking, optional `calls`. |
 | `tool` | One result, matched to a call by `id`. |
 | `prune` | Ledger update. Not an index. |

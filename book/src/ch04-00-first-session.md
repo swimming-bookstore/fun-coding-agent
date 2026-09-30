@@ -57,7 +57,7 @@ You do not have to wait for the spinner to finish.
 | You press | Fun does |
 | --- | --- |
 | Enter | Queue this composer text for **after** the turn |
-| Ctrl+Enter | **Interrupt**: stop tools, inject the text, restart the loop |
+| Ctrl+Enter | **Interrupt**: stop tools, inject the text and any attached images, restart the loop |
 | Esc | **Abort**: stop without sending text. Transcript gets `(aborted)` |
 
 The composer stays editable the whole time. See

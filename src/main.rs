@@ -7,10 +7,14 @@ use crossterm::event::{
     self, Event as CEvent, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use fun_core::agent::{
-    Agent, LogLine, MailboxTx, ToolRun, mailbox, print_log, prompt, tool_fail, tool_ok,
+    Agent, LogLine, MailboxTx, ToolRun, UserTurn, mailbox, print_log, prompt_user, tool_fail,
+    tool_ok,
 };
 use fun_core::grok::{Grok, login, logout};
-use fun_core::session::{Call, Entry, Session, Usage, empty_args, list_sessions};
+use fun_core::session::{
+    Call, Entry, Image, Session, Usage, empty_args, image_label, list_sessions, load_image,
+    user_display,
+};
 use fun_core::tool::get_tools;
 use std::env;
 use std::fs;
@@ -39,7 +43,9 @@ enum KeyAction {
     QueueEdit(usize),
     QueueDrop(usize),
     QueueMove { from: usize, to: usize },
+    ImageError(String),
     DropChip(usize),
+    DropImage(usize),
     Action(usize),
     AskSubmit,
     OpenPrune(Vec<String>),
@@ -49,6 +55,7 @@ enum KeyAction {
 struct LineEdit {
     atoms: Vec<ComposerAtom>,
     chips: Vec<String>,
+    images: Vec<Image>,
     cursor: usize,
     history: Vec<String>,
     idx: usize,
@@ -65,7 +72,7 @@ impl LineEdit {
             .entries
             .iter()
             .filter_map(|e| match e {
-                Entry::User { text } if !text.is_empty() => Some(text.clone()),
+                Entry::User { text, .. } if !text.is_empty() => Some(text.clone()),
                 _ => None,
             })
             .collect();
@@ -73,6 +80,7 @@ impl LineEdit {
         Self {
             atoms: Vec::new(),
             chips: Vec::new(),
+            images: Vec::new(),
             cursor: 0,
             history,
             idx,
@@ -83,7 +91,26 @@ impl LineEdit {
 
     fn set_input(&mut self, text: String) {
         self.chips.clear();
+        self.images.clear();
         self.atoms = text.chars().map(ComposerAtom::Char).collect();
+        self.cursor = self.atoms.len();
+    }
+
+    fn load_turn(&mut self, turn: UserTurn) {
+        self.set_input(turn.text);
+        for image in turn.images {
+            let label = if image.name.is_empty() {
+                format!("image {}", image.media)
+            } else {
+                format!("image {}", image.name)
+            };
+            self.images.push(image);
+            self.atoms.push(ComposerAtom::Chip {
+                index: self.images.len() - 1,
+                label,
+                image: true,
+            });
+        }
         self.cursor = self.atoms.len();
     }
 
@@ -115,6 +142,7 @@ impl LineEdit {
                 ComposerAtom::Chip {
                     index,
                     label: paste_chip_label(&cleaned),
+                    image: false,
                 },
             );
             self.cursor += 1;
@@ -123,6 +151,24 @@ impl LineEdit {
         for c in cleaned.chars() {
             self.insert(c);
         }
+    }
+
+    fn attach_image(&mut self, path: &Path) -> Result<()> {
+        let mut image = load_image(path)?;
+        let label = image_label(&path.display().to_string());
+        image.name = label.strip_prefix("image ").unwrap_or("image").to_string();
+        let index = self.images.len();
+        self.images.push(image);
+        self.atoms.insert(
+            self.cursor,
+            ComposerAtom::Chip {
+                index,
+                label,
+                image: true,
+            },
+        );
+        self.cursor += 1;
+        Ok(())
     }
 
     fn backspace(&mut self) {
@@ -148,17 +194,42 @@ impl LineEdit {
     }
 
     fn drop_chip(&mut self, index: usize) {
+        self.drop_marked(index, false);
+    }
+
+    fn drop_image(&mut self, index: usize) {
+        self.drop_marked(index, true);
+    }
+
+    fn drop_marked(&mut self, index: usize, image: bool) {
         let removed_before = self
             .atoms
             .iter()
             .take(self.cursor)
-            .filter(|atom| matches!(atom, ComposerAtom::Chip { index: n, .. } if *n == index))
+            .filter(|atom| {
+                matches!(
+                    atom,
+                    ComposerAtom::Chip {
+                        index: n,
+                        image: kind,
+                        ..
+                    } if *n == index && *kind == image
+                )
+            })
             .count();
         self.atoms.retain(|atom| match atom {
-            ComposerAtom::Chip { index: n, .. } => *n != index,
+            ComposerAtom::Chip {
+                index: n,
+                image: kind,
+                ..
+            } => !(*n == index && *kind == image),
             _ => true,
         });
-        self.chips = remaining_chips(&self.atoms, &self.chips);
+        if image {
+            self.images = remaining_images(&self.atoms, &self.images);
+        } else {
+            self.chips = remaining_chips(&self.atoms, &self.chips);
+        }
         reindex_chips(&mut self.atoms);
         self.cursor = self
             .cursor
@@ -168,7 +239,13 @@ impl LineEdit {
 
     fn remove_at(&mut self, i: usize) {
         match self.atoms.get(i) {
-            Some(ComposerAtom::Chip { index, .. }) => self.drop_chip(*index),
+            Some(ComposerAtom::Chip { index, image, .. }) => {
+                if *image {
+                    self.drop_image(*index);
+                } else {
+                    self.drop_chip(*index);
+                }
+            }
             Some(ComposerAtom::Char(_)) => {
                 self.atoms.remove(i);
             }
@@ -181,7 +258,7 @@ impl LineEdit {
         for atom in &self.atoms {
             match atom {
                 ComposerAtom::Char(c) => out.push(*c),
-                ComposerAtom::Chip { index, .. } => {
+                ComposerAtom::Chip { index, image, .. } if !image => {
                     if let Some(body) = self.chips.get(*index) {
                         if !out.is_empty() && !out.ends_with('\n') && !body.starts_with('\n') {
                             out.push('\n');
@@ -192,6 +269,7 @@ impl LineEdit {
                         }
                     }
                 }
+                ComposerAtom::Chip { .. } => {}
             }
         }
         out
@@ -215,6 +293,17 @@ impl LineEdit {
         out
     }
 
+    fn take_images(&mut self) -> Vec<Image> {
+        let images = std::mem::take(&mut self.images);
+        self.atoms
+            .retain(|atom| !matches!(atom, ComposerAtom::Chip { image: true, .. }));
+        reindex_chips(&mut self.atoms);
+        if self.cursor > self.atoms.len() {
+            self.cursor = self.atoms.len();
+        }
+        images
+    }
+
     fn is_empty(&self) -> bool {
         self.atoms.is_empty()
     }
@@ -222,6 +311,7 @@ impl LineEdit {
     fn clear(&mut self) {
         self.atoms.clear();
         self.chips.clear();
+        self.images.clear();
         self.cursor = 0;
     }
 }
@@ -238,6 +328,15 @@ fn paste_chip_label(s: &str) -> String {
     } else {
         format!("paste {chars} chars")
     }
+}
+
+fn clipboard_text() -> Option<String> {
+    arboard::Clipboard::new().ok()?.get_text().ok()
+}
+
+fn looks_like_image_path(path: &str) -> bool {
+    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp")
 }
 
 fn word_left_atoms(atoms: &[ComposerAtom], mut i: usize) -> usize {
@@ -384,8 +483,12 @@ fn on_mouse(ui: &mut Ui, mouse: crossterm::event::MouseEvent) -> KeyAction {
         MouseEventKind::ScrollUp => KeyAction::Scroll(3),
         MouseEventKind::ScrollDown => KeyAction::Scroll(-3),
         MouseEventKind::Down(MouseButton::Left) => {
-            if let Some(index) = ui.chip_hit(mouse.column, mouse.row) {
-                return KeyAction::DropChip(index);
+            if let Some((index, image)) = ui.chip_hit(mouse.column, mouse.row) {
+                return if image {
+                    KeyAction::DropImage(index)
+                } else {
+                    KeyAction::DropChip(index)
+                };
             }
             match ui.action_hit(mouse.column, mouse.row) {
                 Some(hit) => KeyAction::Action(hit.index),
@@ -486,7 +589,19 @@ fn on_key(edit: &mut LineEdit, ev: CEvent) -> KeyAction {
                 }
                 return KeyAction::Skip;
             }
-            KeyCode::Char('p') => return KeyAction::Skip,
+            KeyCode::Char('v') => {
+                if let Some(text) = clipboard_text() {
+                    let path = text.trim().trim_matches('"').trim();
+                    if looks_like_image_path(path) && Path::new(path).is_file() {
+                        if let Err(err) = edit.attach_image(Path::new(path)) {
+                            return KeyAction::ImageError(err.to_string());
+                        }
+                    } else {
+                        edit.paste(&text);
+                    }
+                }
+                return KeyAction::Skip;
+            }
             KeyCode::Char('a') => {
                 edit.cursor = 0;
                 return KeyAction::Skip;
@@ -494,6 +609,7 @@ fn on_key(edit: &mut LineEdit, ev: CEvent) -> KeyAction {
             KeyCode::Char('u') => {
                 edit.atoms.drain(..edit.cursor);
                 edit.chips = remaining_chips(&edit.atoms, &edit.chips);
+                edit.images = remaining_images(&edit.atoms, &edit.images);
                 reindex_chips(&mut edit.atoms);
                 edit.cursor = 0;
                 return KeyAction::Skip;
@@ -614,7 +730,10 @@ fn apply_log(
             ui.note_inspect(&text, inspect)
         }
         LogLine::User(text) => {
-            if let Some(i) = pending.iter().position(|p| p.text() == text) {
+            if let Some(i) = pending
+                .iter()
+                .position(|p| p.turn().display() == text || p.text() == text)
+            {
                 pending.remove(i);
             }
             ui.user(&text)
@@ -924,26 +1043,37 @@ struct Status {
 }
 
 enum Pending {
-    Interrupt(String),
-    Steer(String),
-    Idle(String),
+    Interrupt(UserTurn),
+    Steer(UserTurn),
+    Idle(UserTurn),
 }
 
 impl Pending {
-    fn text(&self) -> &str {
+    fn turn(&self) -> &UserTurn {
         match self {
             Self::Interrupt(t) | Self::Steer(t) | Self::Idle(t) => t,
         }
     }
+
+    fn text(&self) -> &str {
+        &self.turn().text
+    }
 }
 
-fn idle_texts(pending: &[Pending]) -> Vec<String> {
+fn idle_turns(pending: &[Pending]) -> Vec<UserTurn> {
     pending
         .iter()
         .filter_map(|p| match p {
             Pending::Idle(t) => Some(t.clone()),
             _ => None,
         })
+        .collect()
+}
+
+fn idle_texts(pending: &[Pending]) -> Vec<String> {
+    idle_turns(pending)
+        .into_iter()
+        .map(|t| t.display())
         .collect()
 }
 
@@ -954,8 +1084,8 @@ fn idle_queue(pending: &[Pending]) -> Vec<Queued> {
         .collect()
 }
 
-fn idle_mailbox(pending: &[Pending], skip: Option<usize>) -> Vec<String> {
-    idle_texts(pending)
+fn idle_mailbox(pending: &[Pending], skip: Option<usize>) -> Vec<UserTurn> {
+    idle_turns(pending)
         .into_iter()
         .enumerate()
         .filter(|(i, _)| Some(*i) != skip)
@@ -967,7 +1097,7 @@ fn steer_list(pending: &[Pending]) -> Vec<String> {
     pending
         .iter()
         .filter_map(|p| match p {
-            Pending::Steer(t) => Some(t.clone()),
+            Pending::Steer(t) => Some(t.display()),
             _ => None,
         })
         .collect()
@@ -977,7 +1107,7 @@ fn interrupt_list(pending: &[Pending]) -> Vec<String> {
     pending
         .iter()
         .filter_map(|p| match p {
-            Pending::Interrupt(t) => Some(t.clone()),
+            Pending::Interrupt(t) => Some(t.display()),
             _ => None,
         })
         .collect()
@@ -993,47 +1123,95 @@ fn remaining_chips(atoms: &[ComposerAtom], chips: &[String]) -> Vec<String> {
     atoms
         .iter()
         .filter_map(|atom| match atom {
-            ComposerAtom::Chip { index, .. } => chips.get(*index).cloned(),
+            ComposerAtom::Chip {
+                index,
+                image: false,
+                ..
+            } => chips.get(*index).cloned(),
+            _ => None,
+        })
+        .collect()
+}
+
+fn remaining_images(atoms: &[ComposerAtom], images: &[Image]) -> Vec<Image> {
+    atoms
+        .iter()
+        .filter_map(|atom| match atom {
+            ComposerAtom::Chip {
+                index, image: true, ..
+            } => images.get(*index).cloned(),
             _ => None,
         })
         .collect()
 }
 
 fn reindex_chips(atoms: &mut [ComposerAtom]) {
-    let mut n = 0usize;
+    let mut paste = 0usize;
+    let mut image = 0usize;
     for atom in atoms {
-        if let ComposerAtom::Chip { index, .. } = atom {
-            *index = n;
-            n += 1;
+        if let ComposerAtom::Chip {
+            index, image: kind, ..
+        } = atom
+        {
+            if *kind {
+                *index = image;
+                image += 1;
+            } else {
+                *index = paste;
+                paste += 1;
+            }
         }
     }
 }
 
-fn take_composer(edit: &mut LineEdit) -> Option<String> {
+fn take_composer(edit: &mut LineEdit) -> Option<UserTurn> {
+    let images = edit.take_images();
     let text = edit.text().trim().to_string();
-    if text.is_empty() {
+    if text.is_empty() && images.is_empty() {
         return None;
     }
     edit.clear();
-    edit.remember(&text);
-    Some(text)
+    let remembered = if text.is_empty() {
+        match images.len() {
+            1 => "image".to_string(),
+            n => format!("{n} images"),
+        }
+    } else {
+        text.clone()
+    };
+    edit.remember(&remembered);
+    Some(UserTurn { text, images })
 }
 
-fn enqueue(tx: &MailboxTx, pending: &mut Vec<Pending>, text: String, slot: &mut Option<usize>) {
-    if let Some(slot) = slot.take() {
-        if !set_idle_text(pending, slot, text.clone()) {
-            insert_idle(pending, Some(slot), text);
-        }
-        tx.set_idle(idle_texts(pending));
-    } else {
-        pending.push(Pending::Idle(text.clone()));
-        tx.idle(text);
+fn start_prompt(
+    agent: &mut Agent,
+    turn: UserTurn,
+) -> impl std::future::Future<Output = Result<()>> + '_ {
+    prompt_user(agent, turn)
+}
+
+fn composer_turn(edit: &LineEdit) -> UserTurn {
+    UserTurn {
+        text: edit.text().trim().to_string(),
+        images: edit.images.clone(),
     }
 }
 
-fn insert_idle(pending: &mut Vec<Pending>, slot: Option<usize>, text: String) {
+fn enqueue(tx: &MailboxTx, pending: &mut Vec<Pending>, turn: UserTurn, slot: &mut Option<usize>) {
+    if let Some(slot) = slot.take() {
+        if !set_idle_text(pending, slot, turn.clone()) {
+            insert_idle(pending, Some(slot), turn);
+        }
+        tx.set_idle(idle_turns(pending));
+    } else {
+        pending.push(Pending::Idle(turn.clone()));
+        tx.idle(turn);
+    }
+}
+
+fn insert_idle(pending: &mut Vec<Pending>, slot: Option<usize>, turn: UserTurn) {
     let Some(display) = slot else {
-        pending.push(Pending::Idle(text));
+        pending.push(Pending::Idle(turn));
         return;
     };
     let positions: Vec<usize> = pending
@@ -1047,14 +1225,14 @@ fn insert_idle(pending: &mut Vec<Pending>, slot: Option<usize>, text: String) {
     } else {
         positions[display]
     };
-    pending.insert(at, Pending::Idle(text));
+    pending.insert(at, Pending::Idle(turn));
 }
 
-fn set_idle_text(pending: &mut [Pending], display: usize, text: String) -> bool {
+fn set_idle_text(pending: &mut [Pending], display: usize, turn: UserTurn) -> bool {
     let Some(idx) = idle_index(pending, display) else {
         return false;
     };
-    pending[idx] = Pending::Idle(text);
+    pending[idx] = Pending::Idle(turn);
     true
 }
 
@@ -1139,9 +1317,9 @@ fn apply_queue(
                 edit.queue_slot = Some(slot - 1);
             }
             idle_index(pending, i).is_some_and(|idx| {
-                let text = pending.remove(idx).text().to_string();
-                pending.push(Pending::Steer(text.clone()));
-                tx.steer(text);
+                let turn = pending.remove(idx).turn().clone();
+                pending.push(Pending::Steer(turn.clone()));
+                tx.steer(turn);
                 true
             })
         }
@@ -1164,12 +1342,12 @@ fn apply_queue(
                 false
             } else if let Some(idx) = idle_index(pending, i) {
                 if let Some(slot) = edit.queue_slot.take() {
-                    let draft = edit.text().trim().to_string();
-                    if !draft.is_empty() {
+                    let draft = composer_turn(edit);
+                    if !draft.text.trim().is_empty() || !draft.images.is_empty() {
                         set_idle_text(pending, slot, draft);
                     }
                 }
-                edit.set_input(pending[idx].text().to_string());
+                edit.load_turn(pending[idx].turn().clone());
                 edit.queue_slot = Some(i);
                 true
             } else {
@@ -1279,10 +1457,10 @@ fn replay(ui: &mut Ui, session: &Session) -> Result<()> {
     let mut notes = session.prune_notes.iter().peekable();
     for (i, e) in session.entries.iter().enumerate() {
         match e {
-            Entry::User { text } => {
+            Entry::User { text, images } => {
                 flush(ui, &mut runs)?;
                 pending.clear();
-                paint(ui, &LogLine::User(text.clone()))?;
+                paint(ui, &LogLine::User(user_display(text, images)))?;
             }
             Entry::Assistant {
                 text,
@@ -1470,7 +1648,7 @@ fn apply_ui(
             }
             Ok(KeyAction::Skip)
         }
-        KeyAction::DropChip(_) => {
+        KeyAction::DropChip(_) | KeyAction::DropImage(_) | KeyAction::ImageError(_) => {
             if !ui.asking() && !ui.pruning() {
                 paint_composer(ui, edit)?;
             }
@@ -1562,6 +1740,12 @@ async fn run_tui(agent: &mut Agent, tx: MailboxTx, log_rx: Receiver<LogLine>) ->
                 if let KeyAction::DropChip(i) = action {
                     edit.drop_chip(i);
                 }
+                if let KeyAction::DropImage(i) = action {
+                    edit.drop_image(i);
+                }
+                if let KeyAction::ImageError(ref err) = action {
+                    let _ = ui.note(&format!("(image: {err})"));
+                }
                 if apply_queue(&tx, &mut ui, &mut edit, &mut pending, &action)? {
                     continue;
                 }
@@ -1596,7 +1780,7 @@ async fn run_tui(agent: &mut Agent, tx: MailboxTx, log_rx: Receiver<LogLine>) ->
                             &mut pending,
                             &mut events,
                             &mut tick,
-                            prompt(agent, text),
+                            start_prompt(agent, UserTurn::text(text)),
                         )
                         .await?
                         {
@@ -1618,7 +1802,8 @@ async fn run_tui(agent: &mut Agent, tx: MailboxTx, log_rx: Receiver<LogLine>) ->
                             )?;
                             continue;
                         }
-                        let Some(text) = action_prompt(&action, &status)
+                        let Some(turn) = action_prompt(&action, &status)
+                            .map(UserTurn::text)
                             .or_else(|| take_composer(&mut edit))
                         else {
                             continue;
@@ -1628,7 +1813,7 @@ async fn run_tui(agent: &mut Agent, tx: MailboxTx, log_rx: Receiver<LogLine>) ->
                         sync_queue(&mut ui, &pending)?;
                         paint_composer(&mut ui, &edit)?;
                         ui.set_working(true)?;
-                        paint(&mut ui, &LogLine::User(text.clone()))?;
+                        paint(&mut ui, &LogLine::User(turn.display()))?;
                         if run_turn(
                             &tx,
                             &log_rx,
@@ -1638,7 +1823,7 @@ async fn run_tui(agent: &mut Agent, tx: MailboxTx, log_rx: Receiver<LogLine>) ->
                             &mut pending,
                             &mut events,
                             &mut tick,
-                            prompt(agent, text),
+                            start_prompt(agent, turn),
                         )
                         .await?
                         {
@@ -1690,6 +1875,12 @@ async fn run_turn(
                 if let KeyAction::DropChip(i) = action {
                     edit.drop_chip(i);
                 }
+                if let KeyAction::DropImage(i) = action {
+                    edit.drop_image(i);
+                }
+                if let KeyAction::ImageError(ref err) = action {
+                    let _ = ui.note(&format!("(image: {err})"));
+                }
                 if apply_queue(tx, ui, edit, pending, &action)? {
                     continue;
                 }
@@ -1707,7 +1898,7 @@ async fn run_turn(
                                 status.branch.as_deref(),
                                 Some(&origin),
                             ) {
-                                enqueue(tx, pending, text, &mut None);
+                                enqueue(tx, pending, UserTurn::text(text), &mut None);
                                 sync_queue(ui, pending)?;
                             }
                         } else {
@@ -1723,7 +1914,7 @@ async fn run_turn(
                                 "git@github.com:org/repo.git",
                             )?;
                         } else if let Some(text) = action_prompt(&action, status) {
-                            enqueue(tx, pending, text, &mut None);
+                            enqueue(tx, pending, UserTurn::text(text), &mut None);
                             sync_queue(ui, pending)?;
                         }
                     }
@@ -1736,18 +1927,18 @@ async fn run_turn(
                         tx.abort();
                     }
                     KeyAction::Confirm => {
-                        if let Some(text) = take_composer(edit) {
-                            enqueue(tx, pending, text, &mut edit.queue_slot);
+                        if let Some(turn) = take_composer(edit) {
+                            enqueue(tx, pending, turn, &mut edit.queue_slot);
                             ui.set_queue_edit(None);
                             sync_queue(ui, pending)?;
                             paint_composer(ui, edit)?;
                         }
                     }
                     KeyAction::Interrupt => {
-                        if let Some(text) = take_composer(edit) {
+                        if let Some(turn) = take_composer(edit) {
                             take_idle_slot(pending, edit.queue_slot.take());
-                            pending.push(Pending::Interrupt(text.clone()));
-                            tx.interrupt(text);
+                            pending.push(Pending::Interrupt(turn.clone()));
+                            tx.interrupt(turn);
                             ui.set_queue_edit(None);
                             sync_queue(ui, pending)?;
                             paint_composer(ui, edit)?;
@@ -1767,7 +1958,7 @@ fn restore_pending(edit: &mut LineEdit, pending: &mut Vec<Pending>) {
     }
     let restored = pending
         .drain(..)
-        .map(|p| p.text().to_string())
+        .map(|p| p.turn().display())
         .collect::<Vec<_>>()
         .join("\n");
     if edit.is_empty() {
@@ -1786,6 +1977,9 @@ struct Cli {
     new: bool,
     #[arg(long, global = true, value_name = "PATH")]
     session: Option<PathBuf>,
+    /// Attach a png, jpeg, gif, or webp to this prompt (repeatable, headless)
+    #[arg(long = "image", global = true, value_name = "PATH")]
+    images: Vec<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -1866,7 +2060,13 @@ async fn main() -> Result<()> {
                 print_log(&line);
             }
         });
-        let result = prompt(&mut agent, asked.join(" ")).await;
+        let mut images = Vec::new();
+        for path in &cli.images {
+            images.push(load_image(path).with_context(|| format!("--image {}", path.display()))?);
+        }
+        let mut turn = UserTurn::text(asked.join(" "));
+        turn.images = images;
+        let result = prompt_user(&mut agent, turn).await;
         drop(agent);
         let _ = printer.join();
         return result;
@@ -1882,7 +2082,14 @@ mod tests {
     use super::*;
 
     fn idle_only(texts: &[&str]) -> Vec<Pending> {
-        texts.iter().map(|t| Pending::Idle((*t).into())).collect()
+        texts
+            .iter()
+            .map(|t| Pending::Idle(UserTurn::text(*t)))
+            .collect()
+    }
+
+    fn turn(text: &str) -> UserTurn {
+        UserTurn::text(text)
     }
 
     #[test]
@@ -1890,6 +2097,7 @@ mod tests {
         let mut edit = LineEdit {
             atoms: Vec::new(),
             chips: Vec::new(),
+            images: Vec::new(),
             cursor: 0,
             history: Vec::new(),
             idx: 0,
@@ -1904,7 +2112,7 @@ mod tests {
         edit.paste("one\ntwo");
         assert_eq!(edit.text(), "one\ntwo");
         let text = take_composer(&mut edit).unwrap();
-        assert_eq!(text, "one\ntwo");
+        assert_eq!(text.text, "one\ntwo");
         assert!(edit.is_empty());
     }
 
@@ -1913,6 +2121,7 @@ mod tests {
         let mut edit = LineEdit {
             atoms: Vec::new(),
             chips: Vec::new(),
+            images: Vec::new(),
             cursor: 0,
             history: Vec::new(),
             idx: 0,
@@ -1932,40 +2141,40 @@ mod tests {
         assert!(edit.chips.is_empty());
         assert_eq!(edit.text(), "hi ");
         let sent = take_composer(&mut edit).unwrap();
-        assert_eq!(sent, "hi");
+        assert_eq!(sent.text, "hi");
     }
 
     #[test]
     fn insert_idle_restores_original_slot() {
         let mut pending = idle_only(&["a", "c"]);
-        insert_idle(&mut pending, Some(1), "b".into());
+        insert_idle(&mut pending, Some(1), UserTurn::text("b"));
         assert_eq!(idle_texts(&pending), vec!["a", "b", "c"]);
 
         let mut pending = idle_only(&["b", "c"]);
-        insert_idle(&mut pending, Some(0), "a".into());
+        insert_idle(&mut pending, Some(0), UserTurn::text("a"));
         assert_eq!(idle_texts(&pending), vec!["a", "b", "c"]);
 
         let mut pending = idle_only(&["a", "b"]);
-        insert_idle(&mut pending, Some(2), "c".into());
+        insert_idle(&mut pending, Some(2), UserTurn::text("c"));
         assert_eq!(idle_texts(&pending), vec!["a", "b", "c"]);
     }
 
     #[test]
     fn insert_idle_keeps_display_order_with_other_kinds() {
         let mut pending = vec![
-            Pending::Interrupt("stop".into()),
-            Pending::Idle("a".into()),
-            Pending::Steer("nudge".into()),
-            Pending::Idle("c".into()),
+            Pending::Interrupt(UserTurn::text("stop")),
+            Pending::Idle(UserTurn::text("a")),
+            Pending::Steer(UserTurn::text("nudge")),
+            Pending::Idle(UserTurn::text("c")),
         ];
-        insert_idle(&mut pending, Some(1), "b".into());
+        insert_idle(&mut pending, Some(1), UserTurn::text("b"));
         assert_eq!(idle_texts(&pending), vec!["a", "b", "c"]);
     }
 
     #[test]
     fn insert_idle_appends_without_slot() {
         let mut pending = idle_only(&["a"]);
-        insert_idle(&mut pending, None, "b".into());
+        insert_idle(&mut pending, None, UserTurn::text("b"));
         assert_eq!(idle_texts(&pending), vec!["a", "b"]);
     }
 
@@ -1981,7 +2190,7 @@ mod tests {
     #[test]
     fn set_idle_text_updates_display_slot() {
         let mut pending = idle_only(&["a", "b", "c"]);
-        assert!(set_idle_text(&mut pending, 1, "B".into()));
+        assert!(set_idle_text(&mut pending, 1, UserTurn::text("B")));
         assert_eq!(idle_texts(&pending), vec!["a", "B", "c"]);
     }
 
@@ -1989,7 +2198,7 @@ mod tests {
     fn steer_promotes_idle_item() {
         let mut pending = idle_only(&["a", "b", "c"]);
         assert_eq!(idle_index(&pending, 1), Some(1));
-        let text = pending.remove(1).text().to_string();
+        let text = pending.remove(1).turn().clone();
         pending.push(Pending::Steer(text));
         assert_eq!(idle_texts(&pending), vec!["a", "c"]);
         assert_eq!(steer_list(&pending), vec!["b"]);

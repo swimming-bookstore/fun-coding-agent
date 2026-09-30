@@ -75,7 +75,7 @@ Nothing is running. The composer is a normal prompt.
 
 | Key | Action |
 | --- | --- |
-| Enter | Send the composer as a user turn |
+| Enter | Send the composer as a user turn (text and any image chips) |
 | Esc | Close a prune overlay if one is open |
 | Ctrl+C | Quit. Shift+Ctrl+C copies a selection instead |
 | PageUp / PageDown | Scroll the transcript (8 lines) |
@@ -87,7 +87,7 @@ Nothing is running. The composer is a normal prompt.
 | Key | Action |
 | --- | --- |
 | Enter | Queue the composer for after this turn |
-| Ctrl+Enter | Interrupt: stop tools and the stream, inject the text, restart |
+| Ctrl+Enter | Interrupt: stop tools and the stream, inject the text and images, restart |
 | Esc | Abort. Tools stop. Composer stays. Transcript gets `(aborted)` |
 
 Abort and interrupt both set an abort flag the tools poll. Bash is
@@ -101,15 +101,16 @@ These work whether a turn is running or not.
 
 | Key | Action |
 | --- | --- |
-| Left / Right | Move by one atom (a character or a whole paste chip) |
+| Left / Right | Move by one atom (a character, a paste chip, or an image chip) |
 | Home / Ctrl+A | Start of the line |
 | Backspace / Ctrl+H | Delete backward |
 | Delete | Delete forward |
 | Ctrl+W | Kill the word before the cursor |
 | Ctrl+U | Kill from the start of the line to the cursor |
+| Ctrl+V | Attach a clipboard image path, or paste clipboard text |
 
 Mouse: click to place the cursor, drag to select transcript text,
-click a paste chip to drop it, click queue controls, click a prune
+click a paste or image chip to drop it, click queue controls, click a prune
 note, click action chips.
 
 ## Mouse selection

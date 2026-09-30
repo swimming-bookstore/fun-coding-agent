@@ -15,6 +15,7 @@ it.
 | `--dir DIR` | Workspace root. Created if missing, then canonicalized. Tools and session lookup use this path. |
 | `--new` | Create a session instead of opening the latest jsonl for this workspace. |
 | `--session PATH` | Load that jsonl. Error if the file is missing. |
+| `--image PATH` | Attach a png, jpeg, gif, or webp to a headless prompt. Repeatable. |
 
 `--new` and `--session` together: `--session` wins if the file exists;
 you do not create a second file by accident.
@@ -39,7 +40,8 @@ fun --new add a failing test first
 ```
 
 The prompt is the remaining arguments, joined with spaces. Quotes are
-for the shell, not for Fun.
+for the shell, not for Fun. `--image` attaches a picture to that
+prompt; it is not part of the words.
 
 ## Examples
 

@@ -1,6 +1,6 @@
 use crate::grok::Grok;
 use crate::prune::{PRUNE_MIN_CANDIDATES, parse_drop_ids, prune_inspect_note};
-use crate::session::{Call, Entry, Session, ToolResult, Usage};
+use crate::session::{Call, Entry, Image, Session, ToolResult, Usage};
 use crate::tool::{Abort, Tool, clip_utf8, execute_tool, is_abort};
 use anyhow::Result;
 use serde_json::Value;
@@ -9,6 +9,26 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 
 const MAX_TOOL_ROUNDS: usize = 200;
+
+/// Text plus optional images for one user injection.
+#[derive(Clone, Debug)]
+pub struct UserTurn {
+    pub text: String,
+    pub images: Vec<Image>,
+}
+
+impl UserTurn {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            images: Vec::new(),
+        }
+    }
+
+    pub fn display(&self) -> String {
+        crate::session::user_display(&self.text, &self.images)
+    }
+}
 const PRUNE_SYSTEM: &str = "\
 You prune a coding-agent transcript. Reply with JSON only: {\"drop\":[ids]}.\n\
 Live and Keep messages must never appear in drop. User messages are Keep.\n\
@@ -48,10 +68,10 @@ pub enum LogLine {
 }
 
 enum MailCmd {
-    Interrupt(String),
-    Steer(String),
-    Idle(String),
-    SetIdle(Vec<String>),
+    Interrupt(UserTurn),
+    Steer(UserTurn),
+    Idle(UserTurn),
+    SetIdle(Vec<UserTurn>),
     Adopt {
         session: Session,
         workspace: PathBuf,
@@ -69,9 +89,9 @@ pub struct Mailbox {
     cmd: Receiver<MailCmd>,
     abort: Arc<Abort>,
     cancel: Arc<std::sync::atomic::AtomicBool>,
-    interrupt: Vec<String>,
-    steer: Vec<String>,
-    idle: Vec<String>,
+    interrupt: Vec<UserTurn>,
+    steer: Vec<UserTurn>,
+    idle: Vec<UserTurn>,
     adopt: Option<(Session, PathBuf)>,
 }
 
@@ -98,17 +118,17 @@ pub fn mailbox() -> (MailboxTx, Mailbox) {
 }
 
 impl MailboxTx {
-    pub fn interrupt(&self, text: String) {
-        let _ = self.cmd.send(MailCmd::Interrupt(text));
+    pub fn interrupt(&self, turn: UserTurn) {
+        let _ = self.cmd.send(MailCmd::Interrupt(turn));
         self.abort.abort();
     }
-    pub fn steer(&self, text: String) {
-        let _ = self.cmd.send(MailCmd::Steer(text));
+    pub fn steer(&self, turn: UserTurn) {
+        let _ = self.cmd.send(MailCmd::Steer(turn));
     }
-    pub fn idle(&self, text: String) {
-        let _ = self.cmd.send(MailCmd::Idle(text));
+    pub fn idle(&self, turn: UserTurn) {
+        let _ = self.cmd.send(MailCmd::Idle(turn));
     }
-    pub fn set_idle(&self, items: Vec<String>) {
+    pub fn set_idle(&self, items: Vec<UserTurn>) {
         let _ = self.cmd.send(MailCmd::SetIdle(items));
     }
     pub fn adopt(&self, session: Session, workspace: PathBuf) {
@@ -145,7 +165,7 @@ impl Mailbox {
             }
         }
     }
-    fn take_interrupt(&mut self) -> Option<String> {
+    fn take_interrupt(&mut self) -> Option<UserTurn> {
         self.drain();
         if self.interrupt.is_empty() {
             None
@@ -153,7 +173,7 @@ impl Mailbox {
             Some(self.interrupt.remove(0))
         }
     }
-    fn take_steer(&mut self) -> Option<String> {
+    fn take_steer(&mut self) -> Option<UserTurn> {
         self.drain();
         if self.steer.is_empty() {
             None
@@ -161,7 +181,7 @@ impl Mailbox {
             Some(self.steer.remove(0))
         }
     }
-    fn take_idle(&mut self) -> Option<String> {
+    fn take_idle(&mut self) -> Option<UserTurn> {
         self.drain();
         if self.idle.is_empty() {
             None
@@ -227,6 +247,7 @@ impl Agent {
             "You are Fun coding agent. Tools: read, write, edit, bash.\n\
              Read a file before editing it. Prefer edit for small changes.\n\
              Paths are relative to this workspace unless absolute. read, write, and edit may use paths outside the workspace.\n\
+             User messages may include images (png, jpeg, gif, webp). Look at them when the user asks about a picture.\n\
              bash times out after 30s; pass timeout (seconds, max 600) for longer commands. Verify with tools before claiming done. Keep replies short.\n\
              workspace: {}",
             self.workspace.display()
@@ -235,8 +256,15 @@ impl Agent {
 }
 
 pub async fn prompt(a: &mut Agent, text: String) -> Result<()> {
+    prompt_user(a, UserTurn::text(text)).await
+}
+
+pub async fn prompt_user(a: &mut Agent, turn: UserTurn) -> Result<()> {
     a.mailbox.clear_cancel();
-    a.session.add(Entry::User { text })?;
+    a.session.add(Entry::User {
+        text: turn.text,
+        images: turn.images,
+    })?;
     let result = match agent_loop(a).await {
         Err(e) if is_abort(&e) => Ok(()),
         other => other,
@@ -479,12 +507,15 @@ fn inject_idle(a: &mut Agent) -> Result<bool> {
     inject_user(a, text)
 }
 
-fn inject_user(a: &mut Agent, text: Option<String>) -> Result<bool> {
-    let Some(text) = text else {
+fn inject_user(a: &mut Agent, turn: Option<UserTurn>) -> Result<bool> {
+    let Some(turn) = turn else {
         return Ok(false);
     };
-    a.emit(LogLine::User(text.clone()));
-    a.session.add(Entry::User { text })?;
+    a.emit(LogLine::User(turn.display()));
+    a.session.add(Entry::User {
+        text: turn.text,
+        images: turn.images,
+    })?;
     Ok(true)
 }
 
@@ -534,7 +565,10 @@ async fn run_prune(a: &mut Agent) -> Result<(Vec<usize>, Vec<usize>)> {
         .complete_with_effort(
             &a.model,
             PRUNE_SYSTEM,
-            &[Entry::User { text: prompt }],
+            &[Entry::User {
+                text: prompt,
+                images: Vec::new(),
+            }],
             &[],
             &abort,
             "low",
@@ -731,40 +765,55 @@ mod tests {
     #[test]
     fn interrupt_then_steer_then_idle() {
         let (tx, mut mb) = mailbox();
-        tx.idle("i1".into());
-        tx.steer("s1".into());
-        tx.interrupt("x1".into());
-        tx.steer("s2".into());
-        assert_eq!(mb.take_interrupt().as_deref(), Some("x1"));
-        assert_eq!(mb.take_steer().as_deref(), Some("s1"));
-        assert_eq!(mb.take_steer().as_deref(), Some("s2"));
-        assert_eq!(mb.take_idle().as_deref(), Some("i1"));
+        tx.idle(UserTurn::text("i1"));
+        tx.steer(UserTurn::text("s1"));
+        tx.interrupt(UserTurn::text("x1"));
+        tx.steer(UserTurn::text("s2"));
+        assert_eq!(
+            mb.take_interrupt().as_ref().map(|t| t.text.as_str()),
+            Some("x1")
+        );
+        assert_eq!(
+            mb.take_steer().as_ref().map(|t| t.text.as_str()),
+            Some("s1")
+        );
+        assert_eq!(
+            mb.take_steer().as_ref().map(|t| t.text.as_str()),
+            Some("s2")
+        );
+        assert_eq!(mb.take_idle().as_ref().map(|t| t.text.as_str()), Some("i1"));
         assert!(mb.take_interrupt().is_none());
-        tx.steer("s3".into());
-        tx.idle("i2".into());
-        tx.interrupt("x2".into());
-        assert_eq!(mb.take_idle().as_deref(), Some("i2"));
-        assert_eq!(mb.take_interrupt().as_deref(), Some("x2"));
-        assert_eq!(mb.take_steer().as_deref(), Some("s3"));
+        tx.steer(UserTurn::text("s3"));
+        tx.idle(UserTurn::text("i2"));
+        tx.interrupt(UserTurn::text("x2"));
+        assert_eq!(mb.take_idle().as_ref().map(|t| t.text.as_str()), Some("i2"));
+        assert_eq!(
+            mb.take_interrupt().as_ref().map(|t| t.text.as_str()),
+            Some("x2")
+        );
+        assert_eq!(
+            mb.take_steer().as_ref().map(|t| t.text.as_str()),
+            Some("s3")
+        );
     }
 
     #[test]
     fn set_idle_replaces_queue() {
         let (tx, mut mb) = mailbox();
-        tx.idle("a".into());
-        tx.idle("b".into());
-        tx.set_idle(vec!["b".into(), "c".into()]);
-        assert_eq!(mb.take_idle().as_deref(), Some("b"));
-        assert_eq!(mb.take_idle().as_deref(), Some("c"));
+        tx.idle(UserTurn::text("a"));
+        tx.idle(UserTurn::text("b"));
+        tx.set_idle(vec![UserTurn::text("b"), UserTurn::text("c")]);
+        assert_eq!(mb.take_idle().as_ref().map(|t| t.text.as_str()), Some("b"));
+        assert_eq!(mb.take_idle().as_ref().map(|t| t.text.as_str()), Some("c"));
         assert!(mb.take_idle().is_none());
     }
 
     #[test]
     fn discard_clears_all_queues() {
         let (tx, mut mb) = mailbox();
-        tx.interrupt("x".into());
-        tx.steer("s".into());
-        tx.idle("i".into());
+        tx.interrupt(UserTurn::text("x"));
+        tx.steer(UserTurn::text("s"));
+        tx.idle(UserTurn::text("i"));
         mb.discard();
         assert!(mb.take_interrupt().is_none());
         assert!(mb.take_steer().is_none());
