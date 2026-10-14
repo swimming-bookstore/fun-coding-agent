@@ -6,9 +6,11 @@
 | `~/.local/share/fun/auth.json` | xAI OAuth tokens |
 | `~/.local/share/fun/sessions/<encoded-cwd>/*.jsonl` | Transcript, usage, prune ledger |
 
-Override config with `FUN_CODING_AGENT_CONFIG`. Override auth with
-`PROVIDER_GROK_AUTH` or `"auth"` in config. `XDG_CONFIG_HOME` and
-`XDG_DATA_HOME` move the parents.
+Override config with `FUN_CODING_AGENT_CONFIG`. Override xAI auth with
+`PROVIDER_GROK_AUTH` or `"auth"` in config. Vertex uses
+`~/.config/gcloud/application_default_credentials.json`, or
+`GOOGLE_APPLICATION_CREDENTIALS`. `XDG_CONFIG_HOME` and
+`XDG_DATA_HOME` move the Fun parents.
 
 Workspace for tools is `--dir` or the current directory. Session files
 are keyed by that **canonical** path, not by git remote. Two clones in

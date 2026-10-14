@@ -22,7 +22,8 @@ do not share a transcript.
   messages from the next API call. It does not summarize the
   transcript into new prose.
 
-There is one model provider: xAI Grok. Tokens stay on this machine.
+There are two model providers: xAI Grok and Google Cloud Vertex AI.
+Tokens and keys stay on this machine.
 
 ## Two views of the same session
 

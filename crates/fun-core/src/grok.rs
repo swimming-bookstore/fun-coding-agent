@@ -21,7 +21,7 @@ fn env_or(name: &str, default: &str) -> String {
     env::var(name).unwrap_or_else(|_| default.into())
 }
 
-fn reasoning_effort() -> String {
+pub fn reasoning_effort() -> String {
     match env_or("FUN_CODING_AGENT_EFFORT", "medium")
         .to_ascii_lowercase()
         .as_str()
@@ -221,9 +221,26 @@ fn user_content(text: &str, images: &[crate::session::Image]) -> WireContent {
         });
     }
     for image in images {
-        parts.push(WirePartOut::InputImage {
-            image_url: format!("data:{};base64,{}", image.media_type(), image.data),
-        });
+        if image.kind() == "text"
+            && let Some(plain) = image.decode_utf8()
+        {
+            let name = if image.name.is_empty() {
+                "file.txt"
+            } else {
+                image.name.as_str()
+            };
+            parts.push(WirePartOut::InputText {
+                text: format!("--- {name} ---\n{plain}"),
+            });
+        } else if image.kind() == "image" {
+            parts.push(WirePartOut::InputImage {
+                image_url: format!("data:{};base64,{}", image.media_type(), image.data),
+            });
+        } else {
+            parts.push(WirePartOut::InputText {
+                text: format!("[{}]", image.chip_label()),
+            });
+        }
     }
     if parts.is_empty() {
         return WireContent::Text(String::new());
@@ -293,6 +310,7 @@ impl Grok {
         Self::client().await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn complete(
         &self,
         model: &str,
@@ -495,6 +513,7 @@ impl Grok {
                     id: c.call_id,
                     name: c.name,
                     args: serde_json::from_str(&c.arguments).unwrap_or_else(|_| empty_args()),
+                    ..Call::default()
                 })
                 .collect(),
             truncated,
@@ -758,6 +777,7 @@ fn parse_response(v: WireResponse) -> Reply {
                 name: item.name.unwrap_or_default(),
                 args: serde_json::from_str(item.arguments.as_deref().unwrap_or("{}"))
                     .unwrap_or_else(|_| empty_args()),
+                ..Call::default()
             }),
             Some("message") => {
                 if let Some(parts) = item.content {
@@ -778,16 +798,18 @@ fn parse_response(v: WireResponse) -> Reply {
     }
     let (input_tokens, output_tokens, cached_tokens, reasoning_tokens) =
         v.usage.map_or((0, 0, 0, 0), |u| {
-            let input = u.input_tokens;
+            let prompt = u.input_tokens;
+            let cached = u.input_tokens_details.cached_tokens;
+            let input = prompt.saturating_sub(cached);
             let output = if u.output_tokens > 0 {
                 u.output_tokens
             } else {
-                u.total_tokens.saturating_sub(input)
+                u.total_tokens.saturating_sub(prompt)
             };
             (
                 input,
                 output,
-                u.input_tokens_details.cached_tokens,
+                cached,
                 u.output_tokens_details.reasoning_tokens,
             )
         });
@@ -801,6 +823,12 @@ fn parse_response(v: WireResponse) -> Reply {
         cached_tokens,
         reasoning_tokens,
     }
+}
+
+pub fn logged_in() -> bool {
+    provider_grok::auth_path()
+        .ok()
+        .is_some_and(|path| path.is_file())
 }
 
 pub async fn login() -> Result<()> {
@@ -857,6 +885,7 @@ mod tests {
                 media: "png".into(),
                 data: "AAAA".into(),
                 name: String::new(),
+                kind: "image".into(),
             }],
         };
         let wire = to_input(&entry);
@@ -872,6 +901,30 @@ mod tests {
         });
         let plain_json = serde_json::to_value(&plain).unwrap();
         assert_eq!(plain_json[0]["content"], "hi");
+
+        let mixed = to_input(&Entry::User {
+            text: String::new(),
+            images: vec![
+                Image {
+                    media: "txt".into(),
+                    data: "aGVsbG8=".into(),
+                    name: "notes.txt".into(),
+                    kind: "text".into(),
+                },
+                Image {
+                    media: "pdf".into(),
+                    data: "JVBERg==".into(),
+                    name: "spec.pdf".into(),
+                    kind: "pdf".into(),
+                },
+            ],
+        });
+        let mixed_json = serde_json::to_value(&mixed).unwrap();
+        let mcontent = &mixed_json[0]["content"];
+        assert_eq!(mcontent[0]["type"], "input_text");
+        assert_eq!(mcontent[0]["text"], "--- notes.txt ---\nhello");
+        assert_eq!(mcontent[1]["type"], "input_text");
+        assert_eq!(mcontent[1]["text"], "[pdf spec.pdf]");
     }
 
     #[test]

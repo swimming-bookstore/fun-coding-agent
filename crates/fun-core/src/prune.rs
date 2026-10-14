@@ -363,6 +363,7 @@ fn compact_call(c: &Call) -> Call {
         id: c.id.clone(),
         name: c.name.clone(),
         args: Value::Object(args),
+        thought_signature: c.thought_signature.clone(),
     }
 }
 
@@ -808,6 +809,7 @@ mod tests {
                 id: id.into(),
                 name: name.into(),
                 args: empty_args(),
+                ..Call::default()
             }],
         }
     }
@@ -820,6 +822,7 @@ mod tests {
                 id: id.into(),
                 name: "read".into(),
                 args: serde_json::json!({"path": path}),
+                ..Call::default()
             }],
         }
     }
@@ -888,6 +891,7 @@ mod tests {
                 id: id.into(),
                 name: "write".into(),
                 args: serde_json::json!({"path": path, "content": content}),
+                ..Call::default()
             }],
         }
     }
@@ -1133,6 +1137,7 @@ mod tests {
                 id: id.into(),
                 name: "edit".into(),
                 args: serde_json::json!({"path": path, "old": "a", "new": "b"}),
+                ..Call::default()
             }],
         }
     }
@@ -1469,7 +1474,7 @@ mod tests {
         assert!(turn.keep.contains(&0));
         assert!(turn.keep.contains(&2));
         assert!(turn.keep.contains(&10));
-        let send = send_ids(entries.len(), &[turn.clone()]);
+        let send = send_ids(entries.len(), std::slice::from_ref(&turn));
         assert!(!send.contains(&1));
         assert!(!send.contains(&8));
         assert!(send.contains(&0));
@@ -1558,7 +1563,7 @@ mod tests {
         assert!(!restored.contains_key(&3));
         let turn = record_turn(entries.len(), &hidden, vec![1, 2, 3, 4], restored);
         assert_eq!(turn.restored, vec![1, 2]);
-        let listing = PruneView::with_ledger(&entries, &hidden, &[turn.clone()])
+        let listing = PruneView::with_ledger(&entries, &hidden, std::slice::from_ref(&turn))
             .listing()
             .1;
         assert!(listing.contains("drop 3,4"));

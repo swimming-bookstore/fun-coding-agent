@@ -202,6 +202,35 @@ pub(super) fn wrap_status(
     rows
 }
 
+/// Screen rect of the model label: x, y, width, height. None when the label is empty.
+pub(super) fn model_click_rect(
+    area: Rect,
+    bar: &Bar,
+    working: bool,
+    spinner: usize,
+    scroll: usize,
+) -> Option<(u16, u16, u16, u16)> {
+    let label = bar.model.trim();
+    if label.is_empty() || area.is_empty() {
+        return None;
+    }
+    let rows = status_rows(bar, working, spinner, scroll, area.width);
+    let want = width(label);
+    for (i, row) in rows.iter().enumerate() {
+        let mut x = 0usize;
+        for (text, _) in row {
+            let w = width(text);
+            if text.trim() == label && w == want {
+                let sx = area.x.saturating_add(1).saturating_add(x as u16);
+                let sy = area.y.saturating_add(i as u16);
+                return Some((sx, sy, w as u16, 1));
+            }
+            x += w;
+        }
+    }
+    None
+}
+
 pub(super) fn status(
     buf: &mut Buffer,
     area: Rect,
@@ -491,6 +520,76 @@ pub(super) fn paint_copied(buf: &mut Buffer, screen: Rect, composer: Rect) {
     } else {
         buf.write(toast, toast.x, toast.y, label, ok_col().bold());
     }
+}
+
+pub(super) fn paint_model_picker(buf: &mut Buffer, screen: Rect, current: &str) -> Vec<(Rect, String)> {
+    if screen.is_empty() {
+        return Vec::new();
+    }
+    let choices = fun_core::provider::model_catalog();
+    let title = "model";
+    let hint = "click a model · Esc close";
+    let rows: Vec<String> = choices
+        .iter()
+        .map(|c| {
+            let on = if c.id == current.trim() { ">" } else { " " };
+            format!("{on} {}", c.id)
+        })
+        .collect();
+    let inner_w = width(title)
+        .max(width(hint))
+        .max(rows.iter().map(|s| width(s)).max().unwrap_or(24))
+        .saturating_add(2)
+        .min(screen.width.saturating_sub(4) as usize)
+        .max(28);
+    let w = (inner_w as u16).saturating_add(4).min(screen.width).max(20);
+    let h = ((rows.len() as u16).saturating_add(4))
+        .min(screen.height.saturating_sub(2).max(6))
+        .max(6);
+    let x = screen
+        .x
+        .saturating_add(screen.width.saturating_sub(w) / 2);
+    let y = screen
+        .y
+        .saturating_add(screen.height.saturating_sub(h) / 2);
+    let box_area = Rect::new(x, y, w, h);
+    fill_rect(buf, box_area, Style::new());
+    Block::new()
+        .border(agent_col())
+        .title(title, agent_col().bold())
+        .render(buf, box_area);
+    let inner = Block::inner(box_area);
+    if inner.is_empty() {
+        return Vec::new();
+    }
+    let clip = inner.width.saturating_sub(1).max(1) as usize;
+    let mut hits = Vec::new();
+    for (row, (line, choice)) in rows.iter().zip(choices.iter()).enumerate() {
+        if row as u16 >= inner.height.saturating_sub(1) {
+            break;
+        }
+        let style = if choice.id == current.trim() {
+            pal_col(pal().text).bold()
+        } else {
+            pal_col(pal().text)
+        };
+        let y = inner.y.saturating_add(row as u16);
+        buf.write(inner, inner.x, y, &clip_width(line, clip), style);
+        hits.push((
+            Rect::new(inner.x, y, inner.width, 1),
+            choice.id.to_string(),
+        ));
+    }
+    if inner.height > 1 {
+        buf.write(
+            inner,
+            inner.x,
+            inner.bottom().saturating_sub(1),
+            &clip_width(hint, clip),
+            muted(),
+        );
+    }
+    hits
 }
 
 pub(super) fn next_prune_scroll(scroll: usize, delta: i32, max: usize) -> usize {

@@ -9,6 +9,9 @@ done.
 ```sh
 fun "fix the tests"
 fun --image shot.png "what is wrong in this screenshot"
+fun --image notes.pdf "summarize this"
+fun --file clip.mp4 "what happens in this video"
+fun --file voice.mp3 "transcribe this"
 fun --new "add a failing test first"
 fun --dir ~/src/my-project --new "run cargo test and fix failures"
 ```

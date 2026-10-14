@@ -14,7 +14,16 @@ while reading a session file.
 | `session` | jsonl, usage, hidden set, ledger load/save |
 | `prune` | Buckets, listing, apply, restore stubs |
 | `grok` | Streaming complete against xAI |
+| `vertex` | Streaming complete against Google Cloud Vertex AI |
+| `provider` | `Grok` or `Vertex` behind one complete API |
 | `config` | Palette, actions, auth path, home branch |
 
-`provider-grok` holds the OAuth tokens. `fun-core::grok` wraps it for
-chat completions and maps “not logged in” to `fun login`.
+`provider-grok` holds the xAI OAuth tokens. `fun-core::grok` wraps it
+for chat completions and maps “not logged in” to `fun login`.
+`fun-core::vertex` calls Vertex with Application Default Credentials
+(`gcloud auth application-default login`, plus `GOOGLE_CLOUD_PROJECT`
+and `GOOGLE_CLOUD_LOCATION`). There is no Fun-side Vertex login. The same
+project and location can be set as `google_cloud_project` and
+`google_cloud_location` in `~/.config/fun/config.json`; environment variables
+win. A Gemini model id selects Vertex. Click the model name in the TUI, or set
+`FUN_CODING_AGENT_MODEL=gemini-4-argon`.

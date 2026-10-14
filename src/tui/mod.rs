@@ -312,6 +312,9 @@ pub struct Ui {
     ask: Option<AskDialog>,
     prune: Option<Vec<String>>,
     prune_scroll: usize,
+    model_picker: bool,
+    model_hits: Vec<(Rect, String)>,
+    model_hit: Option<(u16, u16, u16, u16)>,
 }
 
 struct AskDialog {
@@ -363,6 +366,9 @@ impl Ui {
             ask: None,
             prune: None,
             prune_scroll: 0,
+            model_picker: false,
+            model_hits: Vec::new(),
+            model_hit: None,
         };
         ui.redraw()?;
         Ok(ui)
@@ -388,6 +394,18 @@ impl Ui {
         }
         self.bar = bar;
         self.redraw()
+    }
+
+    pub fn model_clicked(&self, x: u16, y: u16) -> bool {
+        self.model_hit
+            .is_some_and(|(hx, hy, hw, _)| x >= hx && y == hy && x < hx.saturating_add(hw))
+    }
+
+    pub fn model_pick(&self, x: u16, y: u16) -> Option<String> {
+        self.model_hits
+            .iter()
+            .find(|(r, _)| r.contains(x, y))
+            .map(|(_, id)| id.clone())
     }
 
     pub fn set_composer(&mut self, atoms: Vec<ComposerAtom>, cursor: usize) -> Result<()> {
@@ -645,6 +663,20 @@ impl Ui {
 
     pub fn pruning(&self) -> bool {
         self.prune.is_some()
+    }
+
+    pub fn picking_model(&self) -> bool {
+        self.model_picker
+    }
+
+    pub fn open_model_picker(&mut self) -> Result<()> {
+        self.model_picker = true;
+        self.redraw()
+    }
+
+    pub fn close_model_picker(&mut self) -> Result<()> {
+        self.model_picker = false;
+        self.redraw()
     }
 
     pub fn open_prune(&mut self, lines: Vec<String>) -> Result<()> {
@@ -1027,6 +1059,8 @@ impl Ui {
         let ask = self.ask.as_ref();
         let prune = self.prune.as_ref();
         let prune_scroll = self.prune_scroll;
+        let model_picker = self.model_picker;
+        let model_now = bar.model.clone();
         let mut used_scroll = 0usize;
         let mut body_start = self.body_start;
         let mut body_area = Rect::new(0, 0, 0, 0);
@@ -1035,6 +1069,8 @@ impl Ui {
         let mut composer_area = Rect::new(0, 0, 0, 0);
         let mut chip_hits = Vec::new();
         let mut actions = Vec::new();
+        let mut model_hit = None;
+        let mut model_hits = Vec::new();
 
         self.term.draw_with_cursor(|buf, area| {
             let status_wanted = status_rows(bar, working, spinner, scroll, area.width)
@@ -1127,6 +1163,7 @@ impl Ui {
             };
             if status_h > 0 {
                 status(buf, parts[i], bar, working, spinner, used_scroll);
+                model_hit = model_click_rect(parts[i], bar, working, spinner, used_scroll);
             }
             if let Some(url) = hover_url.filter(|u| !u.is_empty()) {
                 link_area = overlay_above(area, composer_area, 3);
@@ -1148,6 +1185,10 @@ impl Ui {
             if let Some(ask) = ask {
                 return paint_ask(buf, area, ask);
             }
+            if model_picker {
+                model_hits = paint_model_picker(buf, area, &model_now);
+                return cursor_pos;
+            }
             if let Some(lines) = prune {
                 paint_prune(buf, area, lines, prune_scroll);
             }
@@ -1159,6 +1200,8 @@ impl Ui {
         self.composer_area = composer_area;
         self.chip_hits = chip_hits;
         self.actions = actions;
+        self.model_hit = model_hit;
+        self.model_hits = model_hits;
         self.scroll = used_scroll;
         self.body_start = body_start;
         self.follow = used_scroll == 0;

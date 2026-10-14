@@ -225,6 +225,8 @@ pub struct Config {
     pub actions: Vec<Action>,
     pub home: String,
     pub auth: Option<PathBuf>,
+    pub google_cloud_project: Option<String>,
+    pub google_cloud_location: Option<String>,
 }
 
 impl Default for Config {
@@ -234,6 +236,8 @@ impl Default for Config {
             actions: Action::defaults(),
             home: "master".into(),
             auth: None,
+            google_cloud_project: None,
+            google_cloud_location: None,
         }
     }
 }
@@ -265,6 +269,8 @@ struct File {
     actions: Option<Vec<ActionFile>>,
     home: Option<String>,
     auth: Option<String>,
+    google_cloud_project: Option<String>,
+    google_cloud_location: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -349,6 +355,8 @@ fn load_from(path: &Path) -> Result<Config> {
         },
         home: parse_home(file.home),
         auth: parse_auth(file.auth),
+        google_cloud_project: trim_opt(file.google_cloud_project),
+        google_cloud_location: trim_opt(file.google_cloud_location),
     })
 }
 
@@ -564,12 +572,18 @@ mod tests {
             assert_eq!(cfg.actions, Action::defaults());
             assert_eq!(cfg.home, "master");
             assert!(cfg.auth.is_none());
+            assert!(cfg.google_cloud_project.is_none());
+            assert!(cfg.google_cloud_location.is_none());
         }
         let file = serde_json::from_value::<File>(json!({
-            "auth": "  ~/shared/auth.json  "
+            "auth": "  ~/shared/auth.json  ",
+            "google_cloud_project": "  your-project  ",
+            "google_cloud_location": " us-central1 "
         }))
         .expect("parse auth");
         let auth = parse_auth(file.auth);
+        assert_eq!(trim_opt(file.google_cloud_project).as_deref(), Some("your-project"));
+        assert_eq!(trim_opt(file.google_cloud_location).as_deref(), Some("us-central1"));
         assert!(auth.is_some());
         if let (Ok(home), Some(path)) = (env::var("HOME"), auth) {
             assert_eq!(path, PathBuf::from(home).join("shared/auth.json"));

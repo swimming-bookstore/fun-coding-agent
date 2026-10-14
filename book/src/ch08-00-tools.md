@@ -15,7 +15,7 @@ The system prompt tells the model:
 - bash times out after 30s unless `timeout` is passed (max 600)
 - verify with tools before claiming done
 - keep replies short
-- the workspace path
+- user messages may include images, and on Vertex also audio, video, PDF, and text files
 
 You do not edit that prompt. Changing behavior is changing the
 workspace, the session, or the model/effort env vars.
