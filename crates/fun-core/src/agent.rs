@@ -1,4 +1,4 @@
-use crate::grok::Grok;
+use crate::provider::{CompleteReq, Provider};
 use crate::prune::{PRUNE_MIN_CANDIDATES, parse_drop_ids, prune_inspect_note};
 use crate::session::{Call, Entry, Image, Session, ToolResult, Usage};
 use crate::tool::{Abort, Tool, clip_utf8, execute_tool, is_abort};
@@ -206,7 +206,7 @@ pub struct Agent {
     pub workspace: PathBuf,
     pub model: String,
     pub effort: String,
-    provider: Grok,
+    provider: Provider,
     tools: Vec<Tool>,
     pub session: Session,
     mailbox: Mailbox,
@@ -216,10 +216,16 @@ pub struct Agent {
 }
 
 impl Agent {
+    pub fn set_model(&mut self, model: String, provider: Provider) {
+        self.model = model;
+        self.effort = provider.effort().to_string();
+        self.provider = provider;
+    }
+
     pub fn new(
         workspace: PathBuf,
         model: String,
-        provider: Grok,
+        provider: Provider,
         tools: Vec<Tool>,
         session: Session,
         mailbox: Mailbox,
@@ -228,7 +234,7 @@ impl Agent {
         Self {
             workspace,
             model,
-            effort: provider.effort.clone(),
+            effort: provider.effort().to_string(),
             provider,
             tools,
             session,
@@ -247,7 +253,7 @@ impl Agent {
             "You are Fun coding agent. Tools: read, write, edit, bash.\n\
              Read a file before editing it. Prefer edit for small changes.\n\
              Paths are relative to this workspace unless absolute. read, write, and edit may use paths outside the workspace.\n\
-             User messages may include images (png, jpeg, gif, webp). Look at them when the user asks about a picture.\n\
+             User messages may include images, audio, video, PDF, and text files. Look at them when the user asks about an attachment. On Vertex, Gemini 4 Argon accepts those inputs.\n\
              bash times out after 30s; pass timeout (seconds, max 600) for longer commands. Verify with tools before claiming done. Keep replies short.\n\
              workspace: {}",
             self.workspace.display()
@@ -323,11 +329,13 @@ async fn agent_loop(a: &mut Agent) -> Result<()> {
         let reply = match a
             .provider
             .complete(
-                &a.model,
-                &system,
-                &model_entries,
-                &a.tools,
-                &abort,
+                CompleteReq {
+                    model: &a.model,
+                    system: &system,
+                    entries: &model_entries,
+                    tools: &a.tools,
+                    abort: &abort,
+                },
                 |d| a.emit(LogLine::Delta(d.into())),
                 |d| a.emit(LogLine::Think(d.into())),
             )
@@ -563,14 +571,16 @@ async fn run_prune(a: &mut Agent) -> Result<(Vec<usize>, Vec<usize>)> {
     let reply = a
         .provider
         .complete_with_effort(
-            &a.model,
-            PRUNE_SYSTEM,
-            &[Entry::User {
-                text: prompt,
-                images: Vec::new(),
-            }],
-            &[],
-            &abort,
+            CompleteReq {
+                model: &a.model,
+                system: PRUNE_SYSTEM,
+                entries: &[Entry::User {
+                    text: prompt,
+                    images: Vec::new(),
+                }],
+                tools: &[],
+                abort: &abort,
+            },
             "low",
             |_| {},
             |_| {},

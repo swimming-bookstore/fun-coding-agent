@@ -51,7 +51,9 @@ them. The TUI notes:
 ```
 
 `--session PATH` opens a specific file (error if missing). `--new`
-creates a new id in the same workspace folder.
+creates a new id in the same workspace folder. The file is not written
+until the first message. Quitting an empty chat, including a header-only
+file from an older build, removes it instead of leaving a blank session.
 
 Deleting a jsonl is how you throw a session away. Fun does not garbage
 collect.

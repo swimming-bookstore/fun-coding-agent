@@ -10,10 +10,11 @@ use fun_core::agent::{
     Agent, LogLine, MailboxTx, ToolRun, UserTurn, mailbox, print_log, prompt_user, tool_fail,
     tool_ok,
 };
-use fun_core::grok::{Grok, login, logout};
+use fun_core::grok::{self, login as grok_login, logout as grok_logout};
+use fun_core::provider::Provider;
 use fun_core::session::{
-    Call, Entry, Image, Session, Usage, empty_args, image_label, list_sessions, load_image,
-    user_display,
+    Call, Entry, Image, Session, Usage, empty_args, list_sessions, load_media,
+    looks_like_media_path, media_label, user_display,
 };
 use fun_core::tool::get_tools;
 use std::env;
@@ -50,6 +51,9 @@ enum KeyAction {
     AskSubmit,
     OpenPrune(Vec<String>),
     ClosePrune,
+    OpenModels,
+    CloseModels,
+    PickModel(String),
 }
 
 struct LineEdit {
@@ -99,11 +103,7 @@ impl LineEdit {
     fn load_turn(&mut self, turn: UserTurn) {
         self.set_input(turn.text);
         for image in turn.images {
-            let label = if image.name.is_empty() {
-                format!("image {}", image.media)
-            } else {
-                format!("image {}", image.name)
-            };
+            let label = image.chip_label();
             self.images.push(image);
             self.atoms.push(ComposerAtom::Chip {
                 index: self.images.len() - 1,
@@ -154,9 +154,13 @@ impl LineEdit {
     }
 
     fn attach_image(&mut self, path: &Path) -> Result<()> {
-        let mut image = load_image(path)?;
-        let label = image_label(&path.display().to_string());
-        image.name = label.strip_prefix("image ").unwrap_or("image").to_string();
+        let mut image = load_media(path)?;
+        let label = media_label(&path.display().to_string(), image.kind());
+        image.name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(image.kind())
+            .to_string();
         let index = self.images.len();
         self.images.push(image);
         self.atoms.insert(
@@ -335,8 +339,7 @@ fn clipboard_text() -> Option<String> {
 }
 
 fn looks_like_image_path(path: &str) -> bool {
-    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-    matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp")
+    looks_like_media_path(path)
 }
 
 fn word_left_atoms(atoms: &[ComposerAtom], mut i: usize) -> usize {
@@ -365,6 +368,9 @@ fn on_event(ui: &mut Ui, edit: &mut LineEdit, ev: CEvent) -> KeyAction {
     if ui.asking() {
         return on_ask(ui, ev);
     }
+    if ui.picking_model() {
+        return on_models(ui, ev);
+    }
     if ui.pruning() {
         return on_prune(ui, ev);
     }
@@ -376,6 +382,34 @@ fn on_event(ui: &mut Ui, edit: &mut LineEdit, ev: CEvent) -> KeyAction {
         return on_mouse(ui, mouse);
     }
     on_key(edit, ev)
+}
+
+fn on_models(ui: &mut Ui, ev: CEvent) -> KeyAction {
+    if let CEvent::Mouse(mouse) = ev {
+        return match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => ui
+                .model_pick(mouse.column, mouse.row)
+                .map(KeyAction::PickModel)
+                .unwrap_or(KeyAction::CloseModels),
+            _ => KeyAction::Skip,
+        };
+    }
+    let CEvent::Key(key) = ev else {
+        return KeyAction::Skip;
+    };
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c' | 'C'))
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
+    {
+        return KeyAction::Quit;
+    }
+    if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
+        return KeyAction::Skip;
+    }
+    match key.code {
+        KeyCode::Esc => KeyAction::CloseModels,
+        _ => KeyAction::Skip,
+    }
 }
 
 fn on_prune(ui: &mut Ui, ev: CEvent) -> KeyAction {
@@ -483,6 +517,9 @@ fn on_mouse(ui: &mut Ui, mouse: crossterm::event::MouseEvent) -> KeyAction {
         MouseEventKind::ScrollUp => KeyAction::Scroll(3),
         MouseEventKind::ScrollDown => KeyAction::Scroll(-3),
         MouseEventKind::Down(MouseButton::Left) => {
+            if ui.model_clicked(mouse.column, mouse.row) {
+                return KeyAction::OpenModels;
+            }
             if let Some((index, image)) = ui.chip_hit(mouse.column, mouse.row) {
                 return if image {
                     KeyAction::DropImage(index)
@@ -1007,17 +1044,88 @@ fn fmt_compact(n: u64) -> String {
     }
 }
 
-const INPUT_PER_M: f64 = 3.0;
-const CACHED_PER_M: f64 = 0.75;
-const OUTPUT_PER_M: f64 = 15.0;
-const CONTEXT_WINDOW: u64 = 500_000;
+/// USD per million tokens. `input_tokens_above` is the prompt size that selects
+/// the tier; the whole request uses that tier, same as pi's `calculateCost`.
+struct Tier {
+    input_tokens_above: u64,
+    input_per_m: f64,
+    cache_read_per_m: f64,
+    output_per_m: f64,
+}
 
-fn estimate_cost(input: u64, cached: u64, output: u64) -> f64 {
-    let cached = cached.min(input);
-    let uncached = input.saturating_sub(cached);
-    (uncached as f64 / 1_000_000.0) * INPUT_PER_M
-        + (cached as f64 / 1_000_000.0) * CACHED_PER_M
-        + (output as f64 / 1_000_000.0) * OUTPUT_PER_M
+struct Rates {
+    input_per_m: f64,
+    cache_read_per_m: f64,
+    output_per_m: f64,
+    tiers: &'static [Tier],
+    window: u64,
+}
+
+fn rates_for(model: &str) -> Rates {
+    let m = model.to_ascii_lowercase();
+    // grok-4.7 catalog card. Above 200k prompt tokens the higher tier applies
+    // to the whole request.
+    if m.contains("grok") {
+        return Rates {
+            input_per_m: 2.0,
+            cache_read_per_m: 0.5,
+            output_per_m: 6.0,
+            tiers: &[Tier {
+                input_tokens_above: 200_000,
+                input_per_m: 4.0,
+                cache_read_per_m: 1.0,
+                output_per_m: 12.0,
+            }],
+            window: 500_000,
+        };
+    }
+    // Gemini 4 Argon is not in the catalog yet. Vertex list price, per 1M
+    // tokens: $2.50 / $0.25 / $15 up to 200k prompt tokens, then $4.50 / $0.45
+    // / $27 for the whole request.
+    Rates {
+        input_per_m: 2.50,
+        cache_read_per_m: 0.25,
+        output_per_m: 15.0,
+        tiers: &[Tier {
+            input_tokens_above: 200_000,
+            input_per_m: 4.50,
+            cache_read_per_m: 0.45,
+            output_per_m: 27.0,
+        }],
+        window: 1_000_000,
+    }
+}
+
+/// `input` is uncached prompt tokens. `cached` is cache-read tokens, billed on
+/// their own rate and not subtracted from `input`. Output already includes
+/// reasoning tokens.
+#[cfg(test)]
+fn estimate_cost(input: u64, cached: u64, output: u64, rates: &Rates) -> f64 {
+    estimate_cost_for_prompt(input, cached, output, input.saturating_add(cached), rates)
+}
+
+fn estimate_cost_for_prompt(
+    input: u64,
+    cached: u64,
+    output: u64,
+    prompt: u64,
+    rates: &Rates,
+) -> f64 {
+    let mut input_per_m = rates.input_per_m;
+    let mut cache_read_per_m = rates.cache_read_per_m;
+    let mut output_per_m = rates.output_per_m;
+    let mut matched = 0u64;
+    for tier in rates.tiers {
+        if prompt > tier.input_tokens_above && tier.input_tokens_above >= matched {
+            input_per_m = tier.input_per_m;
+            cache_read_per_m = tier.cache_read_per_m;
+            output_per_m = tier.output_per_m;
+            matched = tier.input_tokens_above;
+        }
+    }
+    (input as f64 / 1_000_000.0) * input_per_m
+        + (cached as f64 / 1_000_000.0) * cache_read_per_m
+        + (output as f64 / 1_000_000.0) * output_per_m
 }
 
 fn fmt_window(n: u64) -> String {
@@ -1173,8 +1281,8 @@ fn take_composer(edit: &mut LineEdit) -> Option<UserTurn> {
     edit.clear();
     let remembered = if text.is_empty() {
         match images.len() {
-            1 => "image".to_string(),
-            n => format!("{n} images"),
+            1 => images[0].chip_label(),
+            n => format!("{n} files"),
         }
     } else {
         text.clone()
@@ -1407,16 +1515,21 @@ fn refresh_bar(ui: &mut Ui, status: &Status) -> Result<()> {
     let cached = usage.cached_tokens;
     let reasoning = usage.reasoning_tokens;
     let last = usage.last_input_tokens;
-    let hit = if inn == 0 {
+    // Cache reads are split out of the prompt for pricing. The hit rate is
+    // still cached / full prompt.
+    let prompt = inn.saturating_add(cached);
+    let hit = if prompt == 0 {
         0.0
     } else {
-        (cached.min(inn) as f64 / inn as f64) * 100.0
+        (cached as f64 / prompt as f64) * 100.0
     };
-    let cost = estimate_cost(inn, cached, out);
+    let rates = rates_for(&status.model);
+    let tier_prompt = if last > 0 { last } else { prompt };
+    let cost = estimate_cost_for_prompt(inn, cached, out, tier_prompt, &rates);
     let ctx = if last == 0 {
         0.0
     } else {
-        (last as f64 / CONTEXT_WINDOW as f64) * 100.0
+        (last as f64 / rates.window as f64) * 100.0
     };
     ui.set_bar(Bar {
         workspace: short_path(&status.workspace),
@@ -1427,7 +1540,7 @@ fn refresh_bar(ui: &mut Ui, status: &Status) -> Result<()> {
         reasoning: fmt_compact(reasoning),
         cache_hit: format!("{hit:.1}%"),
         cost: format!("${cost:.3}"),
-        context: format!("{ctx:.1}%/{}", fmt_window(CONTEXT_WINDOW)),
+        context: format!("{ctx:.1}%/{}", fmt_window(rates.window)),
         model: status.model.clone(),
         effort: status.effort.clone(),
     })
@@ -1603,7 +1716,7 @@ fn apply_ui(
 ) -> Result<KeyAction> {
     match action {
         KeyAction::Skip => {
-            if !ui.asking() && !ui.pruning() {
+            if !ui.asking() && !ui.pruning() && !ui.picking_model() {
                 paint_composer(ui, edit)?;
             }
             Ok(KeyAction::Skip)
@@ -1649,7 +1762,7 @@ fn apply_ui(
             Ok(KeyAction::Skip)
         }
         KeyAction::DropChip(_) | KeyAction::DropImage(_) | KeyAction::ImageError(_) => {
-            if !ui.asking() && !ui.pruning() {
+            if !ui.asking() && !ui.pruning() && !ui.picking_model() {
                 paint_composer(ui, edit)?;
             }
             Ok(KeyAction::Skip)
@@ -1660,6 +1773,14 @@ fn apply_ui(
         }
         KeyAction::ClosePrune => {
             ui.close_prune()?;
+            Ok(KeyAction::Skip)
+        }
+        KeyAction::OpenModels => {
+            ui.open_model_picker()?;
+            Ok(KeyAction::Skip)
+        }
+        KeyAction::CloseModels => {
+            ui.close_model_picker()?;
             Ok(KeyAction::Skip)
         }
         other => Ok(other),
@@ -1752,6 +1873,21 @@ async fn run_tui(agent: &mut Agent, tx: MailboxTx, log_rx: Receiver<LogLine>) ->
                 match apply_ui(&mut ui, &edit, action, &status)? {
                     KeyAction::Quit => return Ok(()),
                     KeyAction::Abort => return Ok(()),
+                    KeyAction::PickModel(id) => {
+                        ui.close_model_picker()?;
+                        match switch_model(agent, &id).await {
+                            Ok(()) => {
+                                status.model = agent.model.clone();
+                                status.effort = agent.effort.clone();
+                                let _ = ui.note(&format!("(model {})", agent.model));
+                            }
+                            Err(err) => {
+                                let _ = ui.note(&format!("(model: {err:#})"));
+                            }
+                        }
+                        refresh_bar(&mut ui, &status)?;
+                        paint_composer(&mut ui, &edit)?;
+                    }
                     KeyAction::AskSubmit => {
                         let Some((template, origin)) = ui.take_ask() else {
                             ui.close_ask()?;
@@ -1772,14 +1908,16 @@ async fn run_tui(agent: &mut Agent, tx: MailboxTx, log_rx: Receiver<LogLine>) ->
                         ui.set_working(true)?;
                         paint(&mut ui, &LogLine::User(text.clone()))?;
                         if run_turn(
-                            &tx,
-                            &log_rx,
-                            &mut ui,
-                            &mut edit,
-                            &mut status,
-                            &mut pending,
-                            &mut events,
-                            &mut tick,
+                            &mut TurnLoop {
+                                tx: &tx,
+                                log_rx: &log_rx,
+                                ui: &mut ui,
+                                edit: &mut edit,
+                                status: &mut status,
+                                pending: &mut pending,
+                                events: &mut events,
+                                tick: &mut tick,
+                            },
                             start_prompt(agent, UserTurn::text(text)),
                         )
                         .await?
@@ -1815,14 +1953,16 @@ async fn run_tui(agent: &mut Agent, tx: MailboxTx, log_rx: Receiver<LogLine>) ->
                         ui.set_working(true)?;
                         paint(&mut ui, &LogLine::User(turn.display()))?;
                         if run_turn(
-                            &tx,
-                            &log_rx,
-                            &mut ui,
-                            &mut edit,
-                            &mut status,
-                            &mut pending,
-                            &mut events,
-                            &mut tick,
+                            &mut TurnLoop {
+                                tx: &tx,
+                                log_rx: &log_rx,
+                                ui: &mut ui,
+                                edit: &mut edit,
+                                status: &mut status,
+                                pending: &mut pending,
+                                events: &mut events,
+                                tick: &mut tick,
+                            },
                             start_prompt(agent, turn),
                         )
                         .await?
@@ -1840,18 +1980,31 @@ async fn run_tui(agent: &mut Agent, tx: MailboxTx, log_rx: Receiver<LogLine>) ->
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+struct TurnLoop<'a> {
+    tx: &'a MailboxTx,
+    log_rx: &'a Receiver<LogLine>,
+    ui: &'a mut Ui,
+    edit: &'a mut LineEdit,
+    status: &'a mut Status,
+    pending: &'a mut Vec<Pending>,
+    events: &'a mut tokio::sync::mpsc::UnboundedReceiver<CEvent>,
+    tick: &'a mut tokio::time::Interval,
+}
+
 async fn run_turn(
-    tx: &MailboxTx,
-    log_rx: &Receiver<LogLine>,
-    ui: &mut Ui,
-    edit: &mut LineEdit,
-    status: &mut Status,
-    pending: &mut Vec<Pending>,
-    events: &mut tokio::sync::mpsc::UnboundedReceiver<CEvent>,
-    tick: &mut tokio::time::Interval,
+    loop_: &mut TurnLoop<'_>,
     fut: impl std::future::Future<Output = Result<()>>,
 ) -> Result<bool> {
+    let TurnLoop {
+        tx,
+        log_rx,
+        ui,
+        edit,
+        status,
+        pending,
+        events,
+        tick,
+    } = loop_;
     tokio::pin!(fut);
     ui.set_working(true)?;
     loop {
@@ -1968,6 +2121,33 @@ fn restore_pending(edit: &mut LineEdit, pending: &mut Vec<Pending>) {
     }
 }
 
+#[cfg(test)]
+mod cost_tests {
+    use super::{estimate_cost, rates_for};
+
+    #[test]
+    fn cost_follows_catalog_formula() {
+        let grok = rates_for("grok-4.7");
+        // 100 uncached + 50 cache-read + 20 output, under the 200k tier.
+        let low = estimate_cost(100, 50, 20, &grok);
+        let expect = 100.0 / 1e6 * 2.0 + 50.0 / 1e6 * 0.5 + 20.0 / 1e6 * 6.0;
+        assert!((low - expect).abs() < 1e-12);
+        // Above 200k prompt tokens the higher tier covers the whole request.
+        let high = estimate_cost(200_000, 1, 10, &grok);
+        let expect = 200_000.0 / 1e6 * 4.0 + 1.0 / 1e6 * 1.0 + 10.0 / 1e6 * 12.0;
+        assert!((high - expect).abs() < 1e-12);
+
+        let argon = rates_for("gemini-4-argon");
+        let low = estimate_cost(100_000, 0, 0, &argon);
+        assert!((low - 0.25).abs() < 1e-12);
+        let cached = estimate_cost(0, 100_000, 0, &argon);
+        assert!((cached - 0.025).abs() < 1e-12);
+        let high = estimate_cost(200_000, 1, 1_000_000, &argon);
+        let expect = 200_000.0 / 1e6 * 4.50 + 1.0 / 1e6 * 0.45 + 27.0;
+        assert!((high - expect).abs() < 1e-9);
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "fun", version, about = "Fun coding agent")]
 struct Cli {
@@ -1977,8 +2157,9 @@ struct Cli {
     new: bool,
     #[arg(long, global = true, value_name = "PATH")]
     session: Option<PathBuf>,
-    /// Attach a png, jpeg, gif, or webp to this prompt (repeatable, headless)
-    #[arg(long = "image", global = true, value_name = "PATH")]
+    /// Attach an image, audio, video, PDF, or text file (repeatable, headless).
+    /// Gemini 4 Argon on Vertex reads all of these. xAI still only sends images.
+    #[arg(long = "image", visible_alias = "file", global = true, value_name = "PATH")]
     images: Vec<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
@@ -1986,15 +2167,39 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Sign in with xAI device flow
+    /// Sign in to xAI. Vertex uses gcloud Application Default Credentials, not this command.
     Login,
-    /// Delete stored xAI tokens
+    /// Delete stored xAI tokens.
     Logout,
     /// List sessions for this workspace
     ListSessions,
     /// One-shot prompt (any other first word is treated as the prompt)
     #[command(external_subcommand)]
     Prompt(Vec<String>),
+}
+
+async fn login_cmd() -> Result<()> {
+    grok_login().await
+}
+
+async fn logout_cmd() -> Result<()> {
+    grok_logout().await
+}
+
+async fn open_provider(model: &str) -> Result<(Provider, String)> {
+    let effort = grok::reasoning_effort();
+    let provider = Provider::open(model, &effort).await?;
+    Ok((provider, model.to_string()))
+}
+
+async fn switch_model(agent: &mut Agent, model: &str) -> Result<()> {
+    if agent.model == model {
+        return Ok(());
+    }
+    let effort = agent.effort.clone();
+    let provider = Provider::open(model, &effort).await?;
+    agent.set_model(model.to_string(), provider);
+    Ok(())
 }
 
 fn workspace(cli: &Cli) -> Result<PathBuf> {
@@ -2033,8 +2238,8 @@ async fn main() -> Result<()> {
         provider_grok::set_auth_path(path);
     }
     match &cli.command {
-        Some(Command::Login) => return login().await,
-        Some(Command::Logout) => return logout().await,
+        Some(Command::Login) => return login_cmd().await,
+        Some(Command::Logout) => return logout_cmd().await,
         Some(Command::ListSessions) => {
             list_sessions(&workspace(&cli)?)?;
             return Ok(());
@@ -2050,7 +2255,12 @@ async fn main() -> Result<()> {
     let (tx, mb) = mailbox();
     let (log_tx, log_rx) = mpsc::channel();
     let interactive = asked.is_empty();
-    let (provider, model) = Grok::from_env().await?;
+    let model = std::env::var("FUN_CODING_AGENT_MODEL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "grok-4.7".into());
+    let (provider, model) = open_provider(&model).await?;
     let session = open_session(&cli, &workspace)?;
     let mut agent = Agent::new(workspace, model, provider, get_tools(), session, mb, log_tx);
 
@@ -2062,7 +2272,7 @@ async fn main() -> Result<()> {
         });
         let mut images = Vec::new();
         for path in &cli.images {
-            images.push(load_image(path).with_context(|| format!("--image {}", path.display()))?);
+            images.push(load_media(path).with_context(|| format!("--image {}", path.display()))?);
         }
         let mut turn = UserTurn::text(asked.join(" "));
         turn.images = images;
@@ -2073,7 +2283,11 @@ async fn main() -> Result<()> {
     }
     let path = agent.session.path.clone();
     run_tui(&mut agent, tx, log_rx).await?;
-    println!("(session saved to {})", path.display());
+    if agent.session.discard_if_empty()? {
+        println!("(empty session discarded)");
+    } else {
+        println!("(session saved to {})", path.display());
+    }
     Ok(())
 }
 
@@ -2086,10 +2300,6 @@ mod tests {
             .iter()
             .map(|t| Pending::Idle(UserTurn::text(*t)))
             .collect()
-    }
-
-    fn turn(text: &str) -> UserTurn {
-        UserTurn::text(text)
     }
 
     #[test]

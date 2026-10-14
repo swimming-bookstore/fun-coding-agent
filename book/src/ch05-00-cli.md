@@ -15,7 +15,7 @@ it.
 | `--dir DIR` | Workspace root. Created if missing, then canonicalized. Tools and session lookup use this path. |
 | `--new` | Create a session instead of opening the latest jsonl for this workspace. |
 | `--session PATH` | Load that jsonl. Error if the file is missing. |
-| `--image PATH` | Attach a png, jpeg, gif, or webp to a headless prompt. Repeatable. |
+| `--image PATH` / `--file PATH` | Attach a file to a headless prompt. Repeatable. Images work on every provider. Audio, video, PDF, and plain text are sent when the provider is Vertex (Gemini 4 Argon). |
 
 `--new` and `--session` together: `--session` wins if the file exists;
 you do not create a second file by accident.
@@ -26,7 +26,7 @@ you do not create a second file by accident.
 | --- | --- |
 | `fun` | Interactive TUI. |
 | `fun login` | xAI device flow. Writes the token file. |
-| `fun logout` | Delete the token file. |
+| `fun logout` | Delete the xAI token file. |
 | `fun list-sessions` | Print session files for this workspace, newest first. |
 | `fun <words…>` | Headless prompt. Any first word that is not a known command is the start of the prompt. |
 

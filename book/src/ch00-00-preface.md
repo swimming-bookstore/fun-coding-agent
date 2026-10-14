@@ -1,15 +1,15 @@
 # Preface
 
 Fun is a coding agent for a project directory. You type a task. Fun
-calls Grok, which answers with text or with tool calls. The tools
+calls a model, which answers with text or with tool calls. The tools
 read files, write them, patch them, or run a shell command. Results go
-back to Grok until the work is done, you stop it, or a round cap
+back to the model until the work is done, you stop it, or a round cap
 fires.
 
 The workspace is the current directory, or `--dir`. Sessions are jsonl
 files keyed by that path. Resume is opening the latest file for this
-workspace. There is one provider: xAI Grok. Tokens stay on this
-machine.
+workspace. Providers are xAI Grok and Google Cloud Vertex AI. Tokens
+and keys stay on this machine.
 
 Four tools are the whole surface: `read`, `write`, `edit`, `bash`.
 There is no search tool and no browser. If Grok needs a directory

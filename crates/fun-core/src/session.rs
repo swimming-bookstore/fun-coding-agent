@@ -14,7 +14,11 @@ pub use crate::prune::{
 };
 
 /// Largest image Fun will attach to a user message (decoded bytes).
-pub const MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_IMAGE_BYTES: usize = 7 * 1024 * 1024;
+/// Largest PDF or plain-text file Fun will attach (decoded bytes).
+pub const MAX_DOCUMENT_BYTES: usize = 50 * 1024 * 1024;
+/// Largest audio or video file Fun will attach (decoded bytes).
+pub const MAX_MEDIA_BYTES: usize = 20 * 1024 * 1024;
 
 pub fn empty_args() -> Value {
     Value::Object(serde_json::Map::default())
@@ -26,6 +30,20 @@ pub struct Call {
     pub name: String,
     #[serde(default = "empty_args")]
     pub args: Value,
+    /// Gemini thought signature. Required on later turns when the model used tools.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub thought_signature: String,
+}
+
+impl Default for Call {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            args: empty_args(),
+            thought_signature: String::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -36,20 +54,91 @@ pub struct ToolResult {
     pub is_error: bool,
 }
 
-/// One picture attached to a user message. Bytes are base64 on disk.
+/// One file attached to a user message. Bytes are base64 on disk.
+/// Older sessions stored pictures only; `kind` defaults to `image`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Image {
-    /// `png`, `jpeg`, `gif`, or `webp`.
+    /// Short type: `png`, `pdf`, `mp3`, `mp4`, …
     pub media: String,
     pub data: String,
     /// Basename shown in the transcript. Empty on older files.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
+    /// `image`, `audio`, `video`, `pdf`, or `text`.
+    #[serde(default = "default_media_kind", skip_serializing_if = "is_image_kind")]
+    pub kind: String,
+}
+
+fn default_media_kind() -> String {
+    "image".into()
+}
+
+fn is_image_kind(kind: &str) -> bool {
+    kind.is_empty() || kind == "image"
 }
 
 impl Image {
+    pub fn kind(&self) -> &str {
+        if self.kind.is_empty() {
+            "image"
+        } else {
+            &self.kind
+        }
+    }
+
     pub fn media_type(&self) -> String {
-        format!("image/{}", self.media)
+        match self.kind() {
+            "audio" => match self.media.as_str() {
+                "aac" => "audio/x-aac".into(),
+                "mp3" => "audio/mp3".into(),
+                "m4a" | "mp4" => "audio/mp4".into(),
+                "mpeg" | "mpga" => "audio/mpeg".into(),
+                "ogg" => "audio/ogg".into(),
+                "pcm" => "audio/pcm".into(),
+                "wav" => "audio/wav".into(),
+                "webm" => "audio/webm".into(),
+                "flac" => "audio/flac".into(),
+                other => format!("audio/{other}"),
+            },
+            "video" => match self.media.as_str() {
+                "mov" => "video/quicktime".into(),
+                "mpeg" | "mpg" | "mpegs" => "video/mpeg".into(),
+                "flv" => "video/x-flv".into(),
+                "wmv" => "video/wmv".into(),
+                "3gp" | "3gpp" => "video/3gpp".into(),
+                "webm" => "video/webm".into(),
+                "mp4" => "video/mp4".into(),
+                other => format!("video/{other}"),
+            },
+            "pdf" => "application/pdf".into(),
+            "text" => "text/plain".into(),
+            "image" | "" => match self.media.as_str() {
+                "jpg" | "jpeg" => "image/jpeg".into(),
+                "png" => "image/png".into(),
+                "gif" => "image/gif".into(),
+                "webp" => "image/webp".into(),
+                "heic" => "image/heic".into(),
+                "heif" => "image/heif".into(),
+                other => format!("image/{other}"),
+            },
+            "heic" => "image/heic".into(),
+            "heif" => "image/heif".into(),
+            other => format!("image/{other}"),
+        }
+    }
+
+    pub fn chip_label(&self) -> String {
+        let name = if self.name.is_empty() {
+            self.media.as_str()
+        } else {
+            self.name.as_str()
+        };
+        format!("{} {name}", self.kind())
+    }
+
+    pub fn decode_utf8(&self) -> Option<String> {
+        let bytes = base64_decode(&self.data)?;
+        String::from_utf8(bytes).ok()
     }
 }
 
@@ -59,24 +148,25 @@ pub fn user_display(text: &str, images: &[Image]) -> String {
         if !out.is_empty() {
             out.push('\n');
         }
-        let name = if image.name.is_empty() {
-            image.media.as_str()
-        } else {
-            image.name.as_str()
-        };
-        out.push_str(&format!("[image {name}]"));
+        out.push('[');
+        out.push_str(&image.chip_label());
+        out.push(']');
     }
     out
 }
 
-/// Display name for a transcript chip. Path basename, or `image`.
+/// Display name for a transcript chip. Path basename, or the kind.
 pub fn image_label(path: &str) -> String {
+    media_label(path, "image")
+}
+
+pub fn media_label(path: &str, kind: &str) -> String {
     let name = path
         .rsplit(['/', '\\'])
         .next()
         .filter(|s| !s.is_empty())
-        .unwrap_or("image");
-    format!("image {name}")
+        .unwrap_or(kind);
+    format!("{kind} {name}")
 }
 
 fn image_media(ext: &str) -> Option<&'static str> {
@@ -129,7 +219,87 @@ pub fn load_image(path: &Path) -> Result<Image> {
         media: media.into(),
         data: base64_encode(&bytes),
         name: String::new(),
+        kind: "image".into(),
     })
+}
+
+/// Load a local file Gemini 4 Argon can take: image, audio, video, PDF, or plain text.
+pub fn load_media(path: &Path) -> Result<Image> {
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    if bytes.is_empty() {
+        bail!("empty file {}", path.display());
+    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let (kind, media) = classify_media(&ext, &bytes).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unsupported file {} — want image, audio, video, pdf, or txt",
+            path.display()
+        )
+    })?;
+    let max = match kind {
+        "image" => MAX_IMAGE_BYTES,
+        "pdf" | "text" => MAX_DOCUMENT_BYTES,
+        _ => MAX_MEDIA_BYTES,
+    };
+    if bytes.len() > max {
+        bail!(
+            "{} {} is {} bytes (max {max})",
+            kind,
+            path.display(),
+            bytes.len()
+        );
+    }
+    Ok(Image {
+        media: media.into(),
+        data: base64_encode(&bytes),
+        name: String::new(),
+        kind: kind.into(),
+    })
+}
+
+fn classify_media(ext: &str, bytes: &[u8]) -> Option<(&'static str, &'static str)> {
+    if let Some(media) = sniff_media(bytes) {
+        return Some(("image", media));
+    }
+    if bytes.starts_with(b"%PDF-") {
+        return Some(("pdf", "pdf"));
+    }
+    match ext {
+        "png" => Some(("image", "png")),
+        "jpg" | "jpeg" => Some(("image", "jpeg")),
+        "gif" => Some(("image", "gif")),
+        "webp" => Some(("image", "webp")),
+        "heic" => Some(("image", "heic")),
+        "heif" => Some(("image", "heif")),
+        "pdf" => Some(("pdf", "pdf")),
+        "txt" | "text" | "md" => Some(("text", "txt")),
+        "mp3" => Some(("audio", "mp3")),
+        "wav" => Some(("audio", "wav")),
+        "flac" => Some(("audio", "flac")),
+        "aac" => Some(("audio", "aac")),
+        "ogg" => Some(("audio", "ogg")),
+        "m4a" => Some(("audio", "m4a")),
+        "mpga" => Some(("audio", "mpga")),
+        "pcm" => Some(("audio", "pcm")),
+        "mp4" => Some(("video", "mp4")),
+        "mov" => Some(("video", "mov")),
+        "webm" => Some(("video", "webm")),
+        "mpeg" | "mpg" | "mpegs" => Some(("video", "mpeg")),
+        "flv" => Some(("video", "flv")),
+        "wmv" => Some(("video", "wmv")),
+        "3gp" | "3gpp" => Some(("video", "3gpp")),
+        _ => None,
+    }
+}
+
+/// True when a dropped path is a supported attachment.
+pub fn looks_like_media_path(path: &str) -> bool {
+    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    classify_media(&ext, &[]).is_some()
 }
 
 fn base64_encode(bytes: &[u8]) -> String {
@@ -163,6 +333,38 @@ fn base64_encode(bytes: &[u8]) -> String {
         _ => {}
     }
     out
+}
+
+pub(crate) fn base64_decode(data: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let bytes = data.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+    let mut i = 0;
+    while i + 4 <= bytes.len() {
+        let (a, b, c, d) = (bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]);
+        let av = val(a)?;
+        let bv = val(b)?;
+        out.push((av << 2) | (bv >> 4));
+        if c != b'=' {
+            let cv = val(c)?;
+            out.push((bv << 4) | (cv >> 2));
+            if d != b'=' {
+                let dv = val(d)?;
+                out.push((cv << 6) | dv);
+            }
+        }
+        i += 4;
+    }
+    Some(out)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -286,9 +488,10 @@ impl Usage {
     ) {
         if input > 0 {
             self.input_tokens += input;
-            if set_last_input {
-                self.last_input_tokens = input;
-            }
+        }
+        let prompt = input.saturating_add(cached);
+        if set_last_input && prompt > 0 {
+            self.last_input_tokens = prompt;
         }
         if output > 0 {
             self.output_tokens += output;
@@ -390,6 +593,24 @@ fn append_json(path: &Path, value: &impl Serialize) -> Result<()> {
         .with_context(|| format!("write session {}", path.display()))
 }
 
+fn write_header(path: &Path, workspace: &Path, id: &str) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).context("create session dir")?;
+    }
+    let header = DiskHeader {
+        kind: "header".into(),
+        version: 1,
+        id: id.to_string(),
+        cwd: workspace.display().to_string(),
+        created_at: now_ms(),
+    };
+    fs::write(
+        path,
+        serde_json::to_string(&header).context("encode session header")? + "\n",
+    )
+    .with_context(|| format!("write session {}", path.display()))
+}
+
 #[derive(Clone)]
 pub struct Session {
     pub entries: Vec<Entry>,
@@ -402,6 +623,8 @@ pub struct Session {
     pub prune_notes: Vec<(usize, Vec<usize>)>,
     /// Per-turn keep/drop. The next send is last keep plus later messages, minus later drop.
     pub ledger: Vec<PruneTurn>,
+    /// Workspace for a session that has not been written yet.
+    pending_cwd: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -419,23 +642,11 @@ pub struct WorkspaceGroup {
 }
 
 impl Session {
+    /// New chat. The file is written on the first entry, not at startup.
     pub fn create(workspace: &Path) -> Result<Self> {
         let dir = sessions_dir(workspace)?;
-        fs::create_dir_all(&dir).context("create session dir")?;
         let id = hex_id();
         let path = dir.join(format!("{}_{}.jsonl", now_ms(), &id[..8]));
-        let header = DiskHeader {
-            kind: "header".into(),
-            version: 1,
-            id,
-            cwd: workspace.display().to_string(),
-            created_at: now_ms(),
-        };
-        fs::write(
-            &path,
-            serde_json::to_string(&header).context("encode session header")? + "\n",
-        )
-        .with_context(|| format!("write session {}", path.display()))?;
         Ok(Self {
             entries: Vec::new(),
             path,
@@ -444,7 +655,62 @@ impl Session {
             restored: BTreeSet::new(),
             prune_notes: Vec::new(),
             ledger: Vec::new(),
+            pending_cwd: Some(workspace.to_path_buf()),
         })
+    }
+
+    fn ensure_file(&mut self) -> Result<()> {
+        let Some(cwd) = self.pending_cwd.take() else {
+            return Ok(());
+        };
+        let id = self
+            .path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.split('_').nth(1))
+            .unwrap_or("session");
+        if let Err(err) = write_header(&self.path, &cwd, id) {
+            self.pending_cwd = Some(cwd);
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// True when nothing was said. A header-only file still counts as empty.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Drop a session that never got a message, including one created before this rule.
+    ///
+    /// A missing file is already discarded. Only a non-empty transcript is kept.
+    pub fn discard_if_empty(&self) -> Result<bool> {
+        if !self.is_empty() {
+            return Ok(false);
+        }
+        if !self.path.exists() {
+            return Ok(true);
+        }
+        let text = fs::read_to_string(&self.path)
+            .with_context(|| format!("read session {}", self.path.display()))?;
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<Value>(line) else {
+                return Ok(false);
+            };
+            match v.get("type").and_then(|t| t.as_str()) {
+                Some("header") | None => {}
+                _ => return Ok(false),
+            }
+            if v.get("role").is_some() || v.get("text").is_some() {
+                return Ok(false);
+            }
+        }
+        fs::remove_file(&self.path)
+            .with_context(|| format!("remove empty session {}", self.path.display()))?;
+        Ok(true)
     }
 
     pub fn load(path: PathBuf) -> Result<Self> {
@@ -527,6 +793,7 @@ impl Session {
             restored,
             prune_notes,
             ledger,
+            pending_cwd: None,
         })
     }
 
@@ -593,13 +860,12 @@ impl Session {
                 let mut n = 0usize;
                 if let Ok(text) = fs::read_to_string(&path) {
                     for line in text.lines() {
-                        if workspace.as_os_str().is_empty() {
-                            if let Ok(h) = serde_json::from_str::<DiskHeader>(line)
-                                && (h.kind == "header" || h.kind.is_empty())
-                                && !h.cwd.is_empty()
-                            {
-                                workspace = PathBuf::from(&h.cwd);
-                            }
+                        if workspace.as_os_str().is_empty()
+                            && let Ok(h) = serde_json::from_str::<DiskHeader>(line)
+                            && (h.kind == "header" || h.kind.is_empty())
+                            && !h.cwd.is_empty()
+                        {
+                            workspace = PathBuf::from(&h.cwd);
                         }
                         if let Ok(e) = serde_json::from_str::<Entry>(line) {
                             n += 1;
@@ -663,6 +929,7 @@ impl Session {
     }
 
     pub fn add(&mut self, e: Entry) -> Result<()> {
+        self.ensure_file()?;
         append_json(&self.path, &e)?;
         self.entries.push(e);
         Ok(())
@@ -670,6 +937,9 @@ impl Session {
 
     pub fn save_usage(&mut self, usage: Usage) -> Result<()> {
         self.usage = usage;
+        if self.pending_cwd.is_some() {
+            return Ok(());
+        }
         append_json(
             &self.path,
             &DiskUsage {
@@ -687,19 +957,21 @@ impl Session {
             prune_restored(&self.entries, &hidden).into_keys().collect();
         let mut newly: Vec<usize> = restored.difference(&self.restored).copied().collect();
         newly.sort_unstable();
-        append_json(
-            &self.path,
-            &DiskPrune {
-                kind: "prune".into(),
-                hidden: hidden.iter().copied().collect(),
-                dropped,
-                added: added.clone(),
-                keep: (0..self.entries.len())
-                    .filter(|i| !hidden.contains(i))
-                    .collect(),
-                restored: restored.iter().copied().collect(),
-            },
-        )?;
+        if self.pending_cwd.is_none() {
+            append_json(
+                &self.path,
+                &DiskPrune {
+                    kind: "prune".into(),
+                    hidden: hidden.iter().copied().collect(),
+                    dropped,
+                    added: added.clone(),
+                    keep: (0..self.entries.len())
+                        .filter(|i| !hidden.contains(i))
+                        .collect(),
+                    restored: restored.iter().copied().collect(),
+                },
+            )?;
+        }
         if dropped > 0 {
             self.prune_notes.push((self.entries.len(), added.clone()));
         }
@@ -813,6 +1085,7 @@ mod tests {
             restored: BTreeSet::new(),
             prune_notes: Vec::new(),
             ledger: Vec::new(),
+            pending_cwd: None,
         };
         assert!(
             s.add(Entry::User {
@@ -881,13 +1154,18 @@ mod tests {
         let mut u = Usage::default();
         u.add(12, 3, 4, 5);
         assert_eq!(u.input_tokens, 12);
-        assert_eq!(u.last_input_tokens, 12);
+        assert_eq!(u.cached_tokens, 4);
+        assert_eq!(u.last_input_tokens, 16);
         u.add(8, 1, 0, 0);
         assert_eq!(u.input_tokens, 20);
         assert_eq!(u.last_input_tokens, 8);
+        u.add(0, 1, 10, 0);
+        assert_eq!(u.input_tokens, 20);
+        assert_eq!(u.cached_tokens, 14);
+        assert_eq!(u.last_input_tokens, 10);
         u.add_prune(40_000, 20, 0, 0);
         assert_eq!(u.input_tokens, 40_020);
-        assert_eq!(u.last_input_tokens, 8);
+        assert_eq!(u.last_input_tokens, 10);
     }
 
     fn user(s: &str) -> Entry {
@@ -908,6 +1186,7 @@ mod tests {
         .unwrap();
         let image = load_image(&png).expect("png");
         assert_eq!(image.media, "png");
+        assert_eq!(image.kind(), "image");
         assert_eq!(
             user_display("see", std::slice::from_ref(&image)),
             "see\n[image png]"
@@ -921,6 +1200,7 @@ mod tests {
             restored: BTreeSet::new(),
             prune_notes: Vec::new(),
             ledger: Vec::new(),
+            pending_cwd: None,
         };
         s.add(Entry::User {
             text: "see this".into(),
@@ -939,6 +1219,19 @@ mod tests {
         let parsed: Entry = serde_json::from_str(old).unwrap();
         assert!(matches!(parsed, Entry::User { images, .. } if images.is_empty()));
         assert!(load_image(&dir.join("missing.png")).is_err());
+        let pdf = dir.join("note.pdf");
+        fs::write(&pdf, b"%PDF-1.4 hello").unwrap();
+        let doc = load_media(&pdf).expect("pdf");
+        assert_eq!(doc.kind(), "pdf");
+        assert_eq!(doc.media_type(), "application/pdf");
+        let mp3 = dir.join("clip.mp3");
+        fs::write(&mp3, b"ID3fake").unwrap();
+        assert_eq!(load_media(&mp3).unwrap().kind(), "audio");
+        let mp4 = dir.join("clip.mp4");
+        fs::write(&mp4, b"....ftyp").unwrap();
+        assert_eq!(load_media(&mp4).unwrap().media_type(), "video/mp4");
+        assert!(looks_like_media_path("notes.txt"));
+        assert!(!looks_like_media_path("main.rs"));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -950,6 +1243,7 @@ mod tests {
                 id: id.into(),
                 name: name.into(),
                 args: empty_args(),
+                ..Call::default()
             }],
         }
     }
@@ -971,6 +1265,7 @@ mod tests {
                 id: id.into(),
                 name: "write".into(),
                 args: serde_json::json!({"path": path, "content": content}),
+                ..Call::default()
             }],
         }
     }
@@ -996,6 +1291,7 @@ mod tests {
             restored: BTreeSet::new(),
             prune_notes: Vec::new(),
             ledger: Vec::new(),
+            pending_cwd: None,
         };
         assert!(s.add(user("one")).is_ok());
         assert!(s.add(assistant_call("c1", "bash")).is_ok());
@@ -1030,6 +1326,7 @@ mod tests {
             restored: BTreeSet::new(),
             prune_notes: Vec::new(),
             ledger: Vec::new(),
+            pending_cwd: None,
         };
         assert!(s.add(user("make okta")).is_ok());
         assert!(s.add(assistant_write("w1", "src/login.rs", "okta")).is_ok());
@@ -1091,6 +1388,44 @@ mod tests {
             prune_inspect_ids(&loaded.entries, loaded.prune_notes[0].1.iter().copied()).len(),
             2
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_session_is_not_written_until_first_message() {
+        let dir = tmp();
+        let s = Session::create(&dir).expect("create");
+        assert!(s.is_empty());
+        assert!(!s.path.exists(), "empty session must not hit disk");
+        assert!(s.discard_if_empty().unwrap());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exit_removes_header_only_session() {
+        let dir = tmp();
+        let mut s = Session::create(&dir).expect("create");
+        s.ensure_file().expect("header");
+        assert!(s.path.exists());
+        assert!(s.discard_if_empty().unwrap());
+        assert!(!s.path.exists());
+        assert!(s.discard_if_empty().unwrap());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn first_message_writes_session() {
+        let dir = tmp();
+        let mut s = Session::create(&dir).expect("create");
+        s.add(Entry::User {
+            text: "hi".into(),
+            images: Vec::new(),
+        })
+        .expect("add");
+        assert!(s.path.exists());
+        assert!(!s.discard_if_empty().unwrap());
+        let loaded = Session::load(s.path.clone()).expect("reload");
+        assert_eq!(loaded.entries.len(), 1);
         let _ = fs::remove_dir_all(&dir);
     }
 }
