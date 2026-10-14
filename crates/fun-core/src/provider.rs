@@ -4,6 +4,23 @@ use crate::tool::{Abort, Tool};
 use crate::vertex::Vertex;
 use anyhow::Result;
 
+/// Shared inputs for one completion. Callbacks stay outside so each retry can
+/// reborrow them.
+pub struct CompleteReq<'a> {
+    pub model: &'a str,
+    pub system: &'a str,
+    pub entries: &'a [Entry],
+    pub tools: &'a [Tool],
+    pub abort: &'a Abort,
+}
+
+/// Stream progress shared by a completion and its retries.
+pub struct StreamSink<'a> {
+    pub started: &'a mut bool,
+    pub on_delta: &'a mut dyn FnMut(&str),
+    pub on_think: &'a mut dyn FnMut(&str),
+}
+
 /// Chat backend. The agent loop talks only to this.
 /// The model id picks the backend. There is no provider environment variable.
 #[derive(Clone)]
@@ -54,54 +71,28 @@ impl Provider {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn complete(
         &self,
-        model: &str,
-        system: &str,
-        entries: &[Entry],
-        tools: &[Tool],
-        abort: &Abort,
+        req: CompleteReq<'_>,
         on_delta: impl FnMut(&str),
         on_think: impl FnMut(&str),
     ) -> Result<crate::grok::Reply> {
         match self {
-            Self::Grok(g) => {
-                g.complete(model, system, entries, tools, abort, on_delta, on_think)
-                    .await
-            }
-            Self::Vertex(v) => {
-                v.complete(model, system, entries, tools, abort, on_delta, on_think)
-                    .await
-            }
+            Self::Grok(g) => g.complete(req, on_delta, on_think).await,
+            Self::Vertex(v) => v.complete(req, on_delta, on_think).await,
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn complete_with_effort(
         &self,
-        model: &str,
-        system: &str,
-        entries: &[Entry],
-        tools: &[Tool],
-        abort: &Abort,
+        req: CompleteReq<'_>,
         effort: &str,
         on_delta: impl FnMut(&str),
         on_think: impl FnMut(&str),
     ) -> Result<crate::grok::Reply> {
         match self {
-            Self::Grok(g) => {
-                g.complete_with_effort(
-                    model, system, entries, tools, abort, effort, on_delta, on_think,
-                )
-                .await
-            }
-            Self::Vertex(v) => {
-                v.complete_with_effort(
-                    model, system, entries, tools, abort, effort, on_delta, on_think,
-                )
-                .await
-            }
+            Self::Grok(g) => g.complete_with_effort(req, effort, on_delta, on_think).await,
+            Self::Vertex(v) => v.complete_with_effort(req, effort, on_delta, on_think).await,
         }
     }
 }

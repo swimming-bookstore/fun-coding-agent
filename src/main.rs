@@ -1908,14 +1908,16 @@ async fn run_tui(agent: &mut Agent, tx: MailboxTx, log_rx: Receiver<LogLine>) ->
                         ui.set_working(true)?;
                         paint(&mut ui, &LogLine::User(text.clone()))?;
                         if run_turn(
-                            &tx,
-                            &log_rx,
-                            &mut ui,
-                            &mut edit,
-                            &mut status,
-                            &mut pending,
-                            &mut events,
-                            &mut tick,
+                            &mut TurnLoop {
+                                tx: &tx,
+                                log_rx: &log_rx,
+                                ui: &mut ui,
+                                edit: &mut edit,
+                                status: &mut status,
+                                pending: &mut pending,
+                                events: &mut events,
+                                tick: &mut tick,
+                            },
                             start_prompt(agent, UserTurn::text(text)),
                         )
                         .await?
@@ -1951,14 +1953,16 @@ async fn run_tui(agent: &mut Agent, tx: MailboxTx, log_rx: Receiver<LogLine>) ->
                         ui.set_working(true)?;
                         paint(&mut ui, &LogLine::User(turn.display()))?;
                         if run_turn(
-                            &tx,
-                            &log_rx,
-                            &mut ui,
-                            &mut edit,
-                            &mut status,
-                            &mut pending,
-                            &mut events,
-                            &mut tick,
+                            &mut TurnLoop {
+                                tx: &tx,
+                                log_rx: &log_rx,
+                                ui: &mut ui,
+                                edit: &mut edit,
+                                status: &mut status,
+                                pending: &mut pending,
+                                events: &mut events,
+                                tick: &mut tick,
+                            },
                             start_prompt(agent, turn),
                         )
                         .await?
@@ -1976,18 +1980,31 @@ async fn run_tui(agent: &mut Agent, tx: MailboxTx, log_rx: Receiver<LogLine>) ->
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+struct TurnLoop<'a> {
+    tx: &'a MailboxTx,
+    log_rx: &'a Receiver<LogLine>,
+    ui: &'a mut Ui,
+    edit: &'a mut LineEdit,
+    status: &'a mut Status,
+    pending: &'a mut Vec<Pending>,
+    events: &'a mut tokio::sync::mpsc::UnboundedReceiver<CEvent>,
+    tick: &'a mut tokio::time::Interval,
+}
+
 async fn run_turn(
-    tx: &MailboxTx,
-    log_rx: &Receiver<LogLine>,
-    ui: &mut Ui,
-    edit: &mut LineEdit,
-    status: &mut Status,
-    pending: &mut Vec<Pending>,
-    events: &mut tokio::sync::mpsc::UnboundedReceiver<CEvent>,
-    tick: &mut tokio::time::Interval,
+    loop_: &mut TurnLoop<'_>,
     fut: impl std::future::Future<Output = Result<()>>,
 ) -> Result<bool> {
+    let TurnLoop {
+        tx,
+        log_rx,
+        ui,
+        edit,
+        status,
+        pending,
+        events,
+        tick,
+    } = loop_;
     tokio::pin!(fut);
     ui.set_working(true)?;
     loop {

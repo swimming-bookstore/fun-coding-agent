@@ -1,5 +1,6 @@
+use crate::provider::{CompleteReq, StreamSink};
 use crate::session::{Call, Entry, empty_args};
-use crate::tool::{Abort, Tool, aborted, is_abort};
+use crate::tool::{Tool, aborted, is_abort};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -310,38 +311,19 @@ impl Grok {
         Self::client().await
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn complete(
         &self,
-        model: &str,
-        system: &str,
-        entries: &[Entry],
-        tools: &[Tool],
-        abort: &Abort,
+        req: CompleteReq<'_>,
         on_delta: impl FnMut(&str),
         on_think: impl FnMut(&str),
     ) -> Result<Reply> {
-        self.complete_with_effort(
-            model,
-            system,
-            entries,
-            tools,
-            abort,
-            &self.effort,
-            on_delta,
-            on_think,
-        )
-        .await
+        self.complete_with_effort(req, &self.effort.clone(), on_delta, on_think)
+            .await
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn complete_with_effort(
         &self,
-        model: &str,
-        system: &str,
-        entries: &[Entry],
-        tools: &[Tool],
-        abort: &Abort,
+        req: CompleteReq<'_>,
         effort: &str,
         mut on_delta: impl FnMut(&str),
         mut on_think: impl FnMut(&str),
@@ -350,20 +332,12 @@ impl Grok {
         let mut started = false;
         let mut attempt = 0u32;
         loop {
-            match self
-                .stream_once(
-                    model,
-                    system,
-                    entries,
-                    tools,
-                    abort,
-                    effort,
-                    &mut started,
-                    &mut on_delta,
-                    &mut on_think,
-                )
-                .await
-            {
+            let mut sink = StreamSink {
+                started: &mut started,
+                on_delta: &mut on_delta,
+                on_think: &mut on_think,
+            };
+            match self.stream_once(&req, effort, &mut sink).await {
                 Ok(r) => return Ok(r),
                 Err(e) if is_abort(&e) => return Err(e),
                 Err(e) => {
@@ -373,7 +347,7 @@ impl Grok {
                     }
                     tokio::select! {
                         _ = tokio::time::sleep(delay) => {}
-                        _ = abort.wait() => return Err(aborted()),
+                        _ = req.abort.wait() => return Err(aborted()),
                     }
                     delay *= 2;
                 }
@@ -381,25 +355,18 @@ impl Grok {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn stream_once(
         &self,
-        model: &str,
-        system: &str,
-        entries: &[Entry],
-        tools: &[Tool],
-        abort: &Abort,
+        req: &CompleteReq<'_>,
         effort: &str,
-        started: &mut bool,
-        on_delta: &mut impl FnMut(&str),
-        on_think: &mut impl FnMut(&str),
+        sink: &mut StreamSink<'_>,
     ) -> Result<Reply> {
         let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
-        let input: Vec<WireInput> = entries.iter().flat_map(to_input).collect();
-        let defs: Vec<WireTool> = tools.iter().map(tool_def).collect();
+        let input: Vec<WireInput> = req.entries.iter().flat_map(to_input).collect();
+        let defs: Vec<WireTool> = req.tools.iter().map(tool_def).collect();
         let body = WireRequest {
-            model,
-            instructions: system,
+            model: req.model,
+            instructions: req.system,
             input: &input,
             tools: &defs,
             stream: true,
@@ -416,7 +383,7 @@ impl Grok {
             .send();
         let mut resp = tokio::select! {
             r = send => r.context("grok request")?,
-            _ = abort.wait() => return Err(aborted()),
+            _ = req.abort.wait() => return Err(aborted()),
         };
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
             let refreshed = provider_grok::force_refresh(Some(&token))
@@ -440,7 +407,7 @@ impl Grok {
                 .send();
             resp = tokio::select! {
                 r = retry => r.context("grok request")?,
-                _ = abort.wait() => return Err(aborted()),
+                _ = req.abort.wait() => return Err(aborted()),
             };
         }
         let status = resp.status();
@@ -452,7 +419,7 @@ impl Grok {
         let mut thinking = String::new();
         let mut think_cb = |d: &str| {
             thinking.push_str(d);
-            on_think(d);
+            (sink.on_think)(d);
         };
         let mut calls: Vec<PartialCall> = Vec::new();
         let mut truncated = false;
@@ -460,7 +427,7 @@ impl Grok {
         loop {
             let chunk = tokio::select! {
                 c = resp.chunk() => c,
-                _ = abort.wait() => return Err(aborted()),
+                _ = req.abort.wait() => return Err(aborted()),
             };
             let chunk = match chunk {
                 Ok(c) => c,
@@ -483,8 +450,8 @@ impl Grok {
                     calls: &mut calls,
                     truncated: &mut truncated,
                     final_reply: &mut final_reply,
-                    started,
-                    on_delta,
+                    started: sink.started,
+                    on_delta: sink.on_delta,
                     on_think: &mut think_cb,
                 },
             );
@@ -498,8 +465,8 @@ impl Grok {
                     calls: &mut calls,
                     truncated: &mut truncated,
                     final_reply: &mut final_reply,
-                    started,
-                    on_delta,
+                    started: sink.started,
+                    on_delta: sink.on_delta,
                     on_think: &mut think_cb,
                 },
             );

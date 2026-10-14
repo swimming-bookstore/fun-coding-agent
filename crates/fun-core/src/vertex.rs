@@ -10,8 +10,9 @@
 //! | `GOOGLE_APPLICATION_CREDENTIALS` | Service-account JSON. Else `~/.config/gcloud/application_default_credentials.json`. |
 //! | `FUN_CODING_AGENT_MODEL` | Starting model. `gemini-*` uses Vertex. Default `grok-4.7`. |
 
+use crate::provider::{CompleteReq, StreamSink};
 use crate::session::{Call, Entry, Image, ToolResult};
-use crate::tool::{Abort, Tool, aborted, is_abort};
+use crate::tool::{Tool, aborted, is_abort};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -935,31 +936,19 @@ impl Vertex {
         Ok((client, default_model()))
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn complete(
         &self,
-        model: &str,
-        system: &str,
-        entries: &[Entry],
-        tools: &[Tool],
-        abort: &Abort,
+        req: CompleteReq<'_>,
         on_delta: impl FnMut(&str),
         on_think: impl FnMut(&str),
     ) -> Result<crate::grok::Reply> {
-        self.complete_with_effort(
-            model, system, entries, tools, abort, &self.effort, on_delta, on_think,
-        )
-        .await
+        self.complete_with_effort(req, &self.effort.clone(), on_delta, on_think)
+            .await
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn complete_with_effort(
         &self,
-        model: &str,
-        system: &str,
-        entries: &[Entry],
-        tools: &[Tool],
-        abort: &Abort,
+        req: CompleteReq<'_>,
         effort: &str,
         mut on_delta: impl FnMut(&str),
         mut on_think: impl FnMut(&str),
@@ -968,20 +957,12 @@ impl Vertex {
         let mut started = false;
         let mut attempt = 0u32;
         loop {
-            match self
-                .stream_once(
-                    model,
-                    system,
-                    entries,
-                    tools,
-                    abort,
-                    effort,
-                    &mut started,
-                    &mut on_delta,
-                    &mut on_think,
-                )
-                .await
-            {
+            let mut sink = StreamSink {
+                started: &mut started,
+                on_delta: &mut on_delta,
+                on_think: &mut on_think,
+            };
+            match self.stream_once(&req, effort, &mut sink).await {
                 Ok(r) => return Ok(r),
                 Err(e) if is_abort(&e) => return Err(e),
                 Err(e) => {
@@ -991,7 +972,7 @@ impl Vertex {
                     }
                     tokio::select! {
                         _ = tokio::time::sleep(delay) => {}
-                        _ = abort.wait() => return Err(aborted()),
+                        _ = req.abort.wait() => return Err(aborted()),
                     }
                     delay *= 2;
                 }
@@ -999,34 +980,27 @@ impl Vertex {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn stream_once(
         &self,
-        model: &str,
-        system: &str,
-        entries: &[Entry],
-        tools: &[Tool],
-        abort: &Abort,
+        req: &CompleteReq<'_>,
         effort: &str,
-        started: &mut bool,
-        on_delta: &mut impl FnMut(&str),
-        on_think: &mut impl FnMut(&str),
+        sink: &mut StreamSink<'_>,
     ) -> Result<crate::grok::Reply> {
         let cred = resolve_credential(&self.http, &self.token_cache).await?;
-        let url = endpoint(&cred, model);
-        let body = build_body(model, system, entries, tools, effort);
-        let mut req = self
+        let url = endpoint(&cred, req.model);
+        let body = build_body(req.model, req.system, req.entries, req.tools, effort);
+        let mut http = self
             .http
             .post(&url)
             .header("Accept", "text/event-stream")
             .header("Content-Type", "application/json");
-        req = req.bearer_auth(match &cred {
+        http = http.bearer_auth(match &cred {
             Credential::AccessToken { token, .. } => token,
         });
-        let send = req.json(&body).send();
+        let send = http.json(&body).send();
         let mut resp = tokio::select! {
             r = send => r.context("vertex request")?,
-            _ = abort.wait() => return Err(aborted()),
+            _ = req.abort.wait() => return Err(aborted()),
         };
         let status = resp.status();
         if !status.is_success() {
@@ -1044,54 +1018,55 @@ impl Vertex {
         let mut reasoning_tokens = 0u64;
         let mut call_n = 0u64;
         let mut pending_sig = String::new();
-        let mut apply = |data: &str| -> Result<()> {
-            for obj in split_json_objects(data) {
-                if obj.is_empty() || obj == "[DONE]" {
-                    continue;
+        let started = {
+            let mut acc = ChunkAcc {
+                text: &mut text,
+                thinking: &mut thinking,
+                calls: &mut calls,
+                finish: &mut finish,
+                input_tokens: &mut input_tokens,
+                output_tokens: &mut output_tokens,
+                cached_tokens: &mut cached_tokens,
+                reasoning_tokens: &mut reasoning_tokens,
+                call_n: &mut call_n,
+                pending_sig: &mut pending_sig,
+                sink,
+            };
+            let mut apply = |data: &str| -> Result<()> {
+                for obj in split_json_objects(data) {
+                    if obj.is_empty() || obj == "[DONE]" {
+                        continue;
+                    }
+                    apply_chunk(obj, &mut acc)?;
                 }
-                apply_chunk(
-                    obj,
-                    &mut text,
-                    &mut thinking,
-                    &mut calls,
-                    &mut finish,
-                    &mut input_tokens,
-                    &mut output_tokens,
-                    &mut cached_tokens,
-                    &mut reasoning_tokens,
-                    &mut call_n,
-                    &mut pending_sig,
-                    started,
-                    on_delta,
-                    on_think,
-                )?;
+                Ok(())
+            };
+            loop {
+                let chunk = tokio::select! {
+                    c = resp.chunk() => c,
+                    _ = req.abort.wait() => return Err(aborted()),
+                };
+                let Some(chunk) = chunk.context("vertex stream")? else {
+                    break;
+                };
+                buf.push_str(&String::from_utf8_lossy(&chunk));
+                // Vertex streamGenerateContent?alt=sse is newline-delimited JSON
+                // (one object per line), not SSE blocks separated by blank lines.
+                while let Some(idx) = buf.find('\n') {
+                    let line = buf[..idx].trim().trim_end_matches('\r').to_string();
+                    buf.drain(..idx + 1);
+                    if line.is_empty() {
+                        continue;
+                    }
+                    apply(&line_payload(&line))?;
+                }
             }
-            Ok(())
+            if !buf.trim().is_empty() {
+                apply(&line_payload(buf.trim()))?;
+            }
+            *acc.sink.started
         };
-        loop {
-            let chunk = tokio::select! {
-                c = resp.chunk() => c,
-                _ = abort.wait() => return Err(aborted()),
-            };
-            let Some(chunk) = chunk.context("vertex stream")? else {
-                break;
-            };
-            buf.push_str(&String::from_utf8_lossy(&chunk));
-            // Vertex streamGenerateContent?alt=sse is newline-delimited JSON
-            // (one object per line), not SSE blocks separated by blank lines.
-            while let Some(idx) = buf.find('\n') {
-                let line = buf[..idx].trim().trim_end_matches('\r').to_string();
-                buf.drain(..idx + 1);
-                if line.is_empty() {
-                    continue;
-                }
-                apply(&line_payload(&line))?;
-            }
-        }
-        if !buf.trim().is_empty() {
-            apply(&line_payload(buf.trim()))?;
-        }
-        if finish.is_empty() && text.is_empty() && calls.is_empty() && !*started {
+        if finish.is_empty() && text.is_empty() && calls.is_empty() && !started {
             bail!("vertex stream ended without a finish reason");
         }
         let truncated = finish.eq_ignore_ascii_case("MAX_TOKENS");
@@ -1174,23 +1149,21 @@ fn split_json_objects(data: &str) -> Vec<&str> {
     out
 }
 
-#[allow(clippy::too_many_arguments)]
-fn apply_chunk(
-    data: &str,
-    text: &mut String,
-    thinking: &mut String,
-    calls: &mut Vec<Call>,
-    finish: &mut String,
-    input_tokens: &mut u64,
-    output_tokens: &mut u64,
-    cached_tokens: &mut u64,
-    reasoning_tokens: &mut u64,
-    call_n: &mut u64,
-    pending_sig: &mut String,
-    started: &mut bool,
-    on_delta: &mut impl FnMut(&str),
-    on_think: &mut impl FnMut(&str),
-) -> Result<()> {
+struct ChunkAcc<'sink, 'acc> {
+    text: &'acc mut String,
+    thinking: &'acc mut String,
+    calls: &'acc mut Vec<Call>,
+    finish: &'acc mut String,
+    input_tokens: &'acc mut u64,
+    output_tokens: &'acc mut u64,
+    cached_tokens: &'acc mut u64,
+    reasoning_tokens: &'acc mut u64,
+    call_n: &'acc mut u64,
+    pending_sig: &'acc mut String,
+    sink: &'acc mut StreamSink<'sink>,
+}
+
+fn apply_chunk(data: &str, acc: &mut ChunkAcc<'_, '_>) -> Result<()> {
     let v: Value = serde_json::from_str(data).with_context(|| format!("vertex chunk: {data}"))?;
     if let Some(err) = v.get("error") {
         let msg = err
@@ -1203,7 +1176,7 @@ fn apply_chunk(
         && let Some(cand) = cands.first()
     {
         if let Some(reason) = cand.get("finishReason").and_then(|r| r.as_str()) {
-            *finish = reason.to_string();
+            *acc.finish = reason.to_string();
         }
         if let Some(parts) = cand
             .pointer("/content/parts")
@@ -1217,26 +1190,26 @@ fn apply_chunk(
                     .map(str::to_string);
                 let is_thought = part.get("thought").and_then(|t| t.as_bool()).unwrap_or(false);
                 if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
-                    *started = true;
+                    *acc.sink.started = true;
                     if is_thought {
-                        thinking.push_str(t);
-                        on_think(t);
+                        acc.thinking.push_str(t);
+                        (acc.sink.on_think)(t);
                     } else if !t.is_empty() {
-                        text.push_str(t);
-                        on_delta(t);
+                        acc.text.push_str(t);
+                        (acc.sink.on_delta)(t);
                     }
                 }
                 if let Some(fc) = part.get("functionCall") {
-                    *started = true;
+                    *acc.sink.started = true;
                     let name = fc.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
                     let args = fc.get("args").cloned().unwrap_or_else(|| json!({}));
-                    *call_n += 1;
+                    *acc.call_n += 1;
                     let id = fc
                         .get("id")
                         .and_then(|i| i.as_str())
                         .filter(|s| !s.is_empty())
                         .map(str::to_string)
-                        .unwrap_or_else(|| format!("{name}_{call_n}"));
+                        .unwrap_or_else(|| format!("{name}_{}", acc.call_n));
                     let thought_signature = sig
                         .clone()
                         .or_else(|| {
@@ -1245,22 +1218,22 @@ fn apply_chunk(
                                 .filter(|s| !s.is_empty())
                                 .map(str::to_string)
                         })
-                        .or_else(|| (!pending_sig.is_empty()).then(|| std::mem::take(pending_sig)))
+                        .or_else(|| (!acc.pending_sig.is_empty()).then(|| std::mem::take(acc.pending_sig)))
                         .unwrap_or_default();
                     if !thought_signature.is_empty() {
-                        pending_sig.clear();
+                        acc.pending_sig.clear();
                     }
-                    calls.push(Call {
+                    acc.calls.push(Call {
                         id,
                         name,
                         args,
                         thought_signature,
                     });
                 } else if let Some(sig) = sig {
-                    if let Some(last) = calls.last_mut().filter(|c| c.thought_signature.is_empty()) {
+                    if let Some(last) = acc.calls.last_mut().filter(|c| c.thought_signature.is_empty()) {
                         last.thought_signature = sig;
                     } else {
-                        *pending_sig = sig;
+                        *acc.pending_sig = sig;
                     }
                 }
             }
@@ -1280,13 +1253,13 @@ fn apply_chunk(
             .get("thoughtsTokenCount")
             .and_then(|n| n.as_u64())
             .unwrap_or(0);
-        *cached_tokens = cached;
+        *acc.cached_tokens = cached;
         // promptTokenCount includes cachedContentTokenCount. Cost prices the
         // uncached remainder at the input rate and the cached part at the
         // cache-read rate, so split them here.
-        *input_tokens = prompt.saturating_sub(cached);
-        *reasoning_tokens = thoughts;
-        *output_tokens = candidates + thoughts;
+        *acc.input_tokens = prompt.saturating_sub(cached);
+        *acc.reasoning_tokens = thoughts;
+        *acc.output_tokens = candidates + thoughts;
     }
     Ok(())
 }
@@ -1385,19 +1358,23 @@ mod tests {
         let mut started = false;
         apply_chunk(
             data,
-            &mut text,
-            &mut thinking,
-            &mut calls,
-            &mut finish,
-            &mut input,
-            &mut output,
-            &mut cached,
-            &mut reasoning,
-            &mut n,
-            &mut pending_sig,
-            &mut started,
-            &mut |_| {},
-            &mut |_| {},
+            &mut ChunkAcc {
+                text: &mut text,
+                thinking: &mut thinking,
+                calls: &mut calls,
+                finish: &mut finish,
+                input_tokens: &mut input,
+                output_tokens: &mut output,
+                cached_tokens: &mut cached,
+                reasoning_tokens: &mut reasoning,
+                call_n: &mut n,
+                pending_sig: &mut pending_sig,
+                sink: &mut StreamSink {
+                    started: &mut started,
+                    on_delta: &mut (|_| {}),
+                    on_think: &mut (|_| {}),
+                },
+            },
         )
         .unwrap();
         assert_eq!(calls.len(), 1);
@@ -1425,24 +1402,25 @@ mod tests {
         let mut n = 0;
         let mut pending = String::new();
         let mut started = false;
+        let mut acc = ChunkAcc {
+            text: &mut text,
+            thinking: &mut thinking,
+            calls: &mut calls,
+            finish: &mut finish,
+            input_tokens: &mut input,
+            output_tokens: &mut output,
+            cached_tokens: &mut cached,
+            reasoning_tokens: &mut reasoning,
+            call_n: &mut n,
+            pending_sig: &mut pending,
+            sink: &mut StreamSink {
+                started: &mut started,
+                on_delta: &mut (|_| {}),
+                on_think: &mut (|_| {}),
+            },
+        };
         for data in [first, second] {
-            apply_chunk(
-                data,
-                &mut text,
-                &mut thinking,
-                &mut calls,
-                &mut finish,
-                &mut input,
-                &mut output,
-                &mut cached,
-                &mut reasoning,
-                &mut n,
-                &mut pending,
-                &mut started,
-                &mut |_| {},
-                &mut |_| {},
-            )
-            .unwrap();
+            apply_chunk(data, &mut acc).unwrap();
         }
         assert_eq!(calls[0].thought_signature, "sig-1");
         let entry = Entry::Assistant {
@@ -1460,24 +1438,25 @@ mod tests {
         pending.clear();
         let pre_sig = r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"thinking","thought":true,"thoughtSignature":"sig-pre"}]}}]}"#;
         let post_fc = r#"{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"bash","args":{"cmd":"ls"}}}]},"finishReason":"STOP"}]}"#;
+        let mut acc = ChunkAcc {
+            text: &mut text,
+            thinking: &mut thinking,
+            calls: &mut calls,
+            finish: &mut finish,
+            input_tokens: &mut input,
+            output_tokens: &mut output,
+            cached_tokens: &mut cached,
+            reasoning_tokens: &mut reasoning,
+            call_n: &mut n,
+            pending_sig: &mut pending,
+            sink: &mut StreamSink {
+                started: &mut started,
+                on_delta: &mut (|_| {}),
+                on_think: &mut (|_| {}),
+            },
+        };
         for data in [pre_sig, post_fc] {
-            apply_chunk(
-                data,
-                &mut text,
-                &mut thinking,
-                &mut calls,
-                &mut finish,
-                &mut input,
-                &mut output,
-                &mut cached,
-                &mut reasoning,
-                &mut n,
-                &mut pending,
-                &mut started,
-                &mut |_| {},
-                &mut |_| {},
-            )
-            .unwrap();
+            apply_chunk(data, &mut acc).unwrap();
         }
         assert_eq!(calls[0].thought_signature, "sig-pre");
     }

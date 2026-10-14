@@ -1,4 +1,4 @@
-use crate::provider::Provider;
+use crate::provider::{CompleteReq, Provider};
 use crate::prune::{PRUNE_MIN_CANDIDATES, parse_drop_ids, prune_inspect_note};
 use crate::session::{Call, Entry, Image, Session, ToolResult, Usage};
 use crate::tool::{Abort, Tool, clip_utf8, execute_tool, is_abort};
@@ -329,11 +329,13 @@ async fn agent_loop(a: &mut Agent) -> Result<()> {
         let reply = match a
             .provider
             .complete(
-                &a.model,
-                &system,
-                &model_entries,
-                &a.tools,
-                &abort,
+                CompleteReq {
+                    model: &a.model,
+                    system: &system,
+                    entries: &model_entries,
+                    tools: &a.tools,
+                    abort: &abort,
+                },
                 |d| a.emit(LogLine::Delta(d.into())),
                 |d| a.emit(LogLine::Think(d.into())),
             )
@@ -569,14 +571,16 @@ async fn run_prune(a: &mut Agent) -> Result<(Vec<usize>, Vec<usize>)> {
     let reply = a
         .provider
         .complete_with_effort(
-            &a.model,
-            PRUNE_SYSTEM,
-            &[Entry::User {
-                text: prompt,
-                images: Vec::new(),
-            }],
-            &[],
-            &abort,
+            CompleteReq {
+                model: &a.model,
+                system: PRUNE_SYSTEM,
+                entries: &[Entry::User {
+                    text: prompt,
+                    images: Vec::new(),
+                }],
+                tools: &[],
+                abort: &abort,
+            },
             "low",
             |_| {},
             |_| {},
