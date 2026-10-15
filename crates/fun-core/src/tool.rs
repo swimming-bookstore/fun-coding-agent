@@ -584,7 +584,12 @@ fn edit_execute(workspace: &Path, raw: &Value, abort: &Abort) -> Result<String> 
     let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     let n = text.matches(&a.old).count();
     if n != 1 {
-        bail!("`old` must appear exactly once (found {n})");
+        let hint = if n == 0 {
+            edit_mismatch_hint(&text, &a.old)
+        } else {
+            edit_duplicate_hint(&text, &a.old)
+        };
+        bail!("`old` must appear exactly once (found {n}){hint}");
     }
     if abort.is_set() {
         return Err(aborted());
@@ -592,6 +597,84 @@ fn edit_execute(workspace: &Path, raw: &Value, abort: &Abort) -> Result<String> 
     fs::write(&path, text.replacen(&a.old, &a.new, 1))
         .with_context(|| format!("write {}", path.display()))?;
     Ok(format!("edited {}", path.display()))
+}
+
+fn edit_duplicate_hint(text: &str, old: &str) -> String {
+    let mut lines = Vec::new();
+    for (byte_idx, _) in text.match_indices(old).take(8) {
+        let line_no = text[..byte_idx].bytes().filter(|&b| b == b'\n').count() + 1;
+        lines.push(line_no.to_string());
+    }
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("; matches at lines {}", lines.join(", "))
+    }
+}
+
+fn edit_mismatch_hint(text: &str, old: &str) -> String {
+    if text.contains("\r\n") && !old.contains("\r\n") && text.replace("\r\n", "\n").contains(old) {
+        return "; file uses CRLF line endings while `old` uses LF".into();
+    }
+    let file_lines: Vec<&str> = text.lines().collect();
+    let old_lines: Vec<&str> = old.lines().collect();
+    if file_lines.is_empty() || old_lines.is_empty() {
+        return String::new();
+    }
+    let anchor = old_lines
+        .iter()
+        .enumerate()
+        .find(|(_, l)| !l.trim().is_empty())
+        .unwrap_or((0, &old_lines[0]));
+    let (anchor_idx, anchor_line) = (anchor.0, *anchor.1);
+    let mut best_start = None;
+    let mut best_score = 0usize;
+    for (fi, &fl) in file_lines.iter().enumerate() {
+        if fl != anchor_line && fl.trim() != anchor_line.trim() {
+            continue;
+        }
+        let start = fi.saturating_sub(anchor_idx);
+        let score = old_lines
+            .iter()
+            .enumerate()
+            .filter(|&(j, &ol)| {
+                file_lines
+                    .get(start + j)
+                    .is_some_and(|&fl| fl == ol || fl.trim() == ol.trim())
+            })
+            .count();
+        if score > best_score {
+            best_score = score;
+            best_start = Some(start);
+        }
+    }
+    let Some(start) = best_start else {
+        return format!(
+            "; first non-empty line of `old` ({:?}) not found in file",
+            clip_utf8(anchor_line.trim(), 80)
+        );
+    };
+    for (j, &ol) in old_lines.iter().enumerate() {
+        let line_no = start + j + 1;
+        match file_lines.get(start + j) {
+            Some(&fl) if fl == ol => continue,
+            Some(&fl) => {
+                return format!(
+                    "; first mismatch at file line {line_no} (`old` line {}):\n  file: {}\n   old: {}",
+                    j + 1,
+                    clip_utf8(fl, 140),
+                    clip_utf8(ol, 140)
+                );
+            }
+            None => {
+                return format!(
+                    "; `old` extends past end of file at line {line_no} (`old` line {})",
+                    j + 1
+                );
+            }
+        }
+    }
+    String::new()
 }
 
 pub fn get_tools() -> Vec<Tool> {
@@ -811,6 +894,44 @@ mod tests {
         let out = write_execute(&root, &json!({"path": "nope.txt", "content": "x"}), &abort);
         assert!(is_abort(out.as_ref().unwrap_err()));
         assert!(!path.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn edit_mismatch_and_duplicate_hints_point_to_line() {
+        let root = workspace();
+        let abort = Abort::new();
+        write_execute(
+            &root,
+            &json!({"path": "draw.lua", "content": "local a = 1\nlocal b = 0.80\nlocal c = 3\nlocal a = 1\n"}),
+            &abort,
+        )
+        .unwrap();
+        let miss = edit_execute(
+            &root,
+            &json!({
+                "path": "draw.lua",
+                "old": "local a = 1\nlocal b = 0.82\nlocal c = 3",
+                "new": "local a = 2"
+            }),
+            &abort,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            miss.contains("first mismatch at file line 2")
+                && miss.contains("file: local b = 0.80")
+                && miss.contains("old: local b = 0.82"),
+            "{miss}"
+        );
+        let dup = edit_execute(
+            &root,
+            &json!({"path": "draw.lua", "old": "local a = 1", "new": "local a = 2"}),
+            &abort,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(dup.contains("matches at lines 1, 4"), "{dup}");
         let _ = fs::remove_dir_all(&root);
     }
 }
