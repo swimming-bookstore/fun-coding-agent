@@ -358,12 +358,12 @@ fn compact_call(c: &Call) -> Call {
     if let Some(path) = c.args.get("path").and_then(|v| v.as_str()) {
         args.insert("path".into(), Value::String(path.to_string()));
     }
-    args.insert("restored".into(), Value::Bool(true));
     Call {
         id: c.id.clone(),
         name: c.name.clone(),
         args: Value::Object(args),
         thought_signature: c.thought_signature.clone(),
+        restored: true,
     }
 }
 
@@ -383,6 +383,7 @@ fn compact_restored(e: &Entry, keep_ids: &HashSet<String>) -> Entry {
             name: t.name.clone(),
             content: clip_entry(&t.content, 160).to_string(),
             is_error: t.is_error,
+            restored: true,
         }),
         other => other.clone(),
     }
@@ -833,6 +834,7 @@ mod tests {
             name: "read".into(),
             content: content.into(),
             is_error: false,
+            restored: false,
         })
     }
 
@@ -902,6 +904,7 @@ mod tests {
             name: name.into(),
             content: content.into(),
             is_error: false,
+            restored: false,
         })
     }
 
@@ -929,7 +932,7 @@ mod tests {
         {
             assert!(thinking.is_empty());
             assert_eq!(calls[0].args["path"], "src/login.rs");
-            assert_eq!(calls[0].args["restored"], true);
+            assert!(calls[0].restored);
             assert!(calls[0].args.get("content").is_none());
         }
         assert!(matches!(&out[2], Entry::Tool(t) if t.name == "write"));
@@ -1233,7 +1236,7 @@ mod tests {
         assert_eq!(writes, vec!["src/catalog.rs"]);
         assert!(out.iter().any(|e| matches!(
             e,
-            Entry::Assistant { calls, .. } if calls.iter().any(|c| c.name == "edit" && c.args.get("restored") == Some(&Value::Bool(true)))
+            Entry::Assistant { calls, .. } if calls.iter().any(|c| c.name == "edit" && c.restored)
         )));
         assert!(!out.iter().any(|e| matches!(
             e,

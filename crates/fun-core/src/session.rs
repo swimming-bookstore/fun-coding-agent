@@ -33,6 +33,29 @@ pub struct Call {
     /// Gemini thought signature. Required on later turns when the model used tools.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub thought_signature: String,
+    /// Prune put this write/edit back as a path-only note. Not a call to replay.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub restored: bool,
+}
+
+impl Call {
+    pub fn restored_note(calls: &[&Call]) -> String {
+        let bits: Vec<String> = calls
+            .iter()
+            .map(|c| {
+                c.args
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|p| format!("{} {p}", c.name))
+                    .unwrap_or_else(|| c.name.clone())
+            })
+            .collect();
+        format!(
+            "(earlier {} already applied; file is on disk — read it, do not repeat this call)",
+            bits.join(", ")
+        )
+    }
 }
 
 impl Default for Call {
@@ -42,6 +65,7 @@ impl Default for Call {
             name: String::new(),
             args: empty_args(),
             thought_signature: String::new(),
+            restored: false,
         }
     }
 }
@@ -52,6 +76,9 @@ pub struct ToolResult {
     pub name: String,
     pub content: String,
     pub is_error: bool,
+    /// Compact prune stub, not a functionResponse the model is waiting on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub restored: bool,
 }
 
 /// One file attached to a user message. Bytes are base64 on disk.
@@ -1254,6 +1281,7 @@ mod tests {
             name: name.into(),
             content: content.into(),
             is_error: false,
+            restored: false,
         })
     }
 
@@ -1276,6 +1304,7 @@ mod tests {
             name: "read".into(),
             content: content.into(),
             is_error: false,
+            restored: false,
         })
     }
 
