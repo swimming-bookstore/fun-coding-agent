@@ -477,6 +477,7 @@ async fn run_tools(a: &mut Agent, calls: &[Call]) -> Result<ToolFlow> {
             name: c.name.clone(),
             content,
             is_error,
+            restored: false,
         }))?;
         if inject_interrupt(a)? {
             finish_skipped_tools(a, calls, i + 1)?;
@@ -636,6 +637,7 @@ fn finish_skipped_tools(a: &mut Agent, calls: &[Call], from: usize) -> Result<()
             name: c.name.clone(),
             content: "not run".into(),
             is_error: true,
+            restored: false,
         }))?;
     }
     Ok(())

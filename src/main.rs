@@ -1730,14 +1730,10 @@ fn apply_ui(
             Ok(KeyAction::Skip)
         }
         KeyAction::ClickTools(x, y) => {
-            if ui.open_clicked_link(x, y) {
-                Ok(KeyAction::Skip)
-            } else if ui.click_tools(x, y)? {
-                Ok(KeyAction::Skip)
-            } else {
+            if !ui.open_clicked_link(x, y) && !ui.click_tools(x, y)? {
                 ui.select_start(x, y)?;
-                Ok(KeyAction::Skip)
             }
+            Ok(KeyAction::Skip)
         }
         KeyAction::Hover(x, y) => {
             ui.hover_at(x, y)?;

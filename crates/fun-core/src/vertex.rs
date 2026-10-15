@@ -23,7 +23,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
-const STREAM_IDLE: Duration = Duration::from_secs(90);
+/// How long a stream may sit with no bytes before we give up. Thinking models
+/// often pause well past a minute before the first SSE chunk.
+const STREAM_IDLE: Duration = Duration::from_secs(10 * 60);
 const TOKEN_TTL: Duration = Duration::from_secs(3000);
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const TOKEN_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
@@ -800,12 +802,24 @@ fn push_user(out: &mut Vec<Value>, text: &str, images: &[Image]) {
     }));
 }
 
+/// Prune puts latest write/edit paths back as compact stubs (`restored`, no body).
+/// Those are history notes, not calls the model made. Replaying them as
+/// functionCall makes Gemini echo the same incomplete Write on the next turn
+/// (`write args: missing field content`).
+fn is_restore_stub(c: &Call) -> bool {
+    c.restored
+}
+
 fn push_model(out: &mut Vec<Value>, text: &str, calls: &[Call]) {
     let mut parts = Vec::new();
     if !text.is_empty() {
         parts.push(json!({ "text": text }));
     }
-    for c in calls {
+    let (stubs, live): (Vec<&Call>, Vec<&Call>) = calls.iter().partition(|c| is_restore_stub(c));
+    if !stubs.is_empty() {
+        parts.push(json!({ "text": Call::restored_note(&stubs) }));
+    }
+    for c in live {
         let mut function_call = serde_json::Map::new();
         function_call.insert("name".into(), json!(c.name));
         function_call.insert("args".into(), c.args.clone());
@@ -843,14 +857,20 @@ fn contents(entries: &[Entry]) -> Vec<Value> {
             }
             Entry::Assistant { text, calls, .. } => {
                 push_model(&mut out, text, calls);
-                let expected = calls.len();
+                let expected = calls.iter().filter(|c| !is_restore_stub(c)).count();
                 i += 1;
                 if expected == 0 {
+                    while i < entries.len()
+                        && matches!(&entries[i], Entry::Tool(t) if t.restored)
+                    {
+                        i += 1;
+                    }
                     continue;
                 }
                 let mut tools = Vec::new();
                 while tools.len() < expected && i < entries.len() {
                     match &entries[i] {
+                        Entry::Tool(t) if t.restored => i += 1,
                         Entry::Tool(t) => {
                             tools.push(t);
                             i += 1;
@@ -867,6 +887,7 @@ fn contents(entries: &[Entry]) -> Vec<Value> {
                 }
                 push_tool_turn(&mut out, &tools);
             }
+            Entry::Tool(t) if t.restored => i += 1,
             Entry::Tool(t) => {
                 push_tool_turn(&mut out, &[t]);
                 i += 1;
@@ -921,6 +942,13 @@ impl Vertex {
             http: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(15))
                 .tcp_nodelay(true)
+                .tcp_keepalive(Duration::from_secs(20))
+                .pool_idle_timeout(Duration::from_secs(90))
+                // Reqwest's default 30s request timeout covers the whole call,
+                // including idle gaps between SSE chunks. Thinking models often
+                // sit silent for minutes. Idle gaps are bounded by read_timeout
+                // (STREAM_IDLE); the total deadline only caps a runaway call.
+                .timeout(Duration::from_secs(60 * 60))
                 .read_timeout(STREAM_IDLE)
                 .build()
                 .context("vertex http client")?,
@@ -1228,6 +1256,7 @@ fn apply_chunk(data: &str, acc: &mut ChunkAcc<'_, '_>) -> Result<()> {
                         name,
                         args,
                         thought_signature,
+                        restored: false,
                     });
                 } else if let Some(sig) = sig {
                     if let Some(last) = acc.calls.last_mut().filter(|c| c.thought_signature.is_empty()) {
@@ -1473,12 +1502,14 @@ mod tests {
                         name: "read".into(),
                         args: json!({"path": "a.rs"}),
                         thought_signature: "sig-a".into(),
+                        restored: false,
                     },
                     Call {
                         id: "2".into(),
                         name: "bash".into(),
                         args: json!({"cmd": "ls"}),
                         thought_signature: "sig-b".into(),
+                        restored: false,
                     },
                 ],
             },
@@ -1487,12 +1518,14 @@ mod tests {
                 name: "read".into(),
                 content: "file".into(),
                 is_error: false,
+                restored: false,
             }),
             Entry::Tool(ToolResult {
                 id: "2".into(),
                 name: "bash".into(),
                 content: "ok".into(),
                 is_error: false,
+                restored: false,
             }),
         ];
         let body = build_body("gemini-4-argon", "", &entries, &[], "low");
@@ -1504,6 +1537,38 @@ mod tests {
         assert_eq!(responses.len(), 2);
         assert_eq!(responses[0]["functionResponse"]["name"], "read");
         assert_eq!(responses[1]["functionResponse"]["name"], "bash");
+    }
+
+    #[test]
+    fn restored_write_stub_is_a_note_not_a_function_call() {
+        let entries = vec![
+            Entry::Assistant {
+                text: String::new(),
+                thinking: String::new(),
+                calls: vec![Call {
+                    id: "w1".into(),
+                    name: "write".into(),
+                    args: json!({"path": "src/ui.rs"}),
+                    thought_signature: String::new(),
+                    restored: true,
+                }],
+            },
+            Entry::Tool(ToolResult {
+                id: "w1".into(),
+                name: "write".into(),
+                content: "wrote 100 bytes".into(),
+                is_error: false,
+                restored: true,
+            }),
+        ];
+        let body = build_body("gemini-4-argon", "", &entries, &[], "low");
+        let contents = body["contents"].as_array().unwrap();
+        assert_eq!(contents.len(), 1, "stub must not demand a functionResponse");
+        let parts = contents[0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        let note = parts[0]["text"].as_str().unwrap();
+        assert!(note.contains("write src/ui.rs"), "{note}");
+        assert!(parts[0].get("functionCall").is_none());
     }
 
     #[test]

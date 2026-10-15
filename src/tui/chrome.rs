@@ -1501,13 +1501,15 @@ pub(super) fn composer_view(atoms: &[ComposerAtom], cursor: usize, max: usize) -
     }
 }
 
+pub(super) type ChipHit = (Rect, usize, bool);
+
 pub(super) fn composer(
     buf: &mut Buffer,
     area: Rect,
     atoms: &[ComposerAtom],
     cursor: usize,
     working: bool,
-) -> ((u16, u16), Vec<(Rect, usize, bool)>) {
+) -> ((u16, u16), Vec<ChipHit>) {
     let border = if working { tool_col() } else { muted() };
     Block::new().border(border).render(buf, area);
     let inner = Block::inner(area);

@@ -193,7 +193,15 @@ fn to_input(e: &Entry) -> Vec<WireInput> {
                     content: WireContent::Text(text.clone()),
                 });
             }
-            for c in calls {
+            let (stubs, live): (Vec<&Call>, Vec<&Call>) =
+                calls.iter().partition(|c| c.restored);
+            if !stubs.is_empty() {
+                out.push(WireInput::Message {
+                    role: "assistant",
+                    content: WireContent::Text(Call::restored_note(&stubs)),
+                });
+            }
+            for c in live {
                 out.push(WireInput::FunctionCall {
                     kind: "function_call",
                     call_id: c.id.clone(),
@@ -203,11 +211,16 @@ fn to_input(e: &Entry) -> Vec<WireInput> {
             }
             out
         }
-        Entry::Tool(t) => vec![WireInput::FunctionCallOutput {
-            kind: "function_call_output",
-            call_id: t.id.clone(),
-            output: t.content.clone(),
-        }],
+        Entry::Tool(t) => {
+            if t.restored {
+                return Vec::new();
+            }
+            vec![WireInput::FunctionCallOutput {
+                kind: "function_call_output",
+                call_id: t.id.clone(),
+                output: t.content.clone(),
+            }]
+        }
     }
 }
 
