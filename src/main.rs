@@ -1082,17 +1082,47 @@ fn rates_for(model: &str) -> Rates {
     // Gemini 4 Argon is not in the catalog yet. Vertex list price, per 1M
     // tokens: $2.50 / $0.25 / $15 up to 200k prompt tokens, then $4.50 / $0.45
     // / $27 for the whole request.
+    if m.contains("argon") || m.contains("gemini-4") {
+        return Rates {
+            input_per_m: 2.50,
+            cache_read_per_m: 0.25,
+            output_per_m: 15.0,
+            tiers: &[Tier {
+                input_tokens_above: 200_000,
+                input_per_m: 4.50,
+                cache_read_per_m: 0.45,
+                output_per_m: 27.0,
+            }],
+            window: 1_000_000,
+        };
+    }
+    // Public Gemini API prices from pi's google catalog (USD / 1M).
+    if m.contains("2.5-flash") {
+        return gemini_rates(0.30, 0.03, 2.50);
+    }
+    if m.contains("2.5-pro") || m.contains("2.5") {
+        return gemini_rates(1.25, 0.125, 10.0);
+    }
+    if m.contains("3.1-pro") || m.contains("3-pro") {
+        return gemini_rates(2.0, 0.2, 12.0);
+    }
+    if m.contains("3.5-flash") || m.contains("3.6-flash") || m.contains("3.7") || m.contains("3.8")
+    {
+        return gemini_rates(1.50, 0.15, 9.0);
+    }
+    if m.contains("flash") {
+        return gemini_rates(0.50, 0.05, 3.0);
+    }
+    gemini_rates(2.0, 0.2, 12.0)
+}
+
+fn gemini_rates(input_per_m: f64, cache_read_per_m: f64, output_per_m: f64) -> Rates {
     Rates {
-        input_per_m: 2.50,
-        cache_read_per_m: 0.25,
-        output_per_m: 15.0,
-        tiers: &[Tier {
-            input_tokens_above: 200_000,
-            input_per_m: 4.50,
-            cache_read_per_m: 0.45,
-            output_per_m: 27.0,
-        }],
-        window: 1_000_000,
+        input_per_m,
+        cache_read_per_m,
+        output_per_m,
+        tiers: &[],
+        window: 1_048_576,
     }
 }
 
@@ -2154,7 +2184,7 @@ struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     session: Option<PathBuf>,
     /// Attach an image, audio, video, PDF, or text file (repeatable, headless).
-    /// Gemini 4 Argon on Vertex reads all of these. xAI still only sends images.
+    /// Vertex reads all of these. xAI still only sends images.
     #[arg(long = "image", visible_alias = "file", global = true, value_name = "PATH")]
     images: Vec<PathBuf>,
     #[command(subcommand)]
@@ -2163,10 +2193,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Sign in to xAI. Vertex uses gcloud Application Default Credentials, not this command.
-    Login,
-    /// Delete stored xAI tokens.
-    Logout,
+    /// Sign in. `fun login` is xAI. Vertex uses Application Default Credentials, not this command.
+    Login {
+        #[arg(value_name = "PROVIDER")]
+        provider: Option<String>,
+    },
+    /// Delete stored tokens. `fun logout` deletes the xAI token file.
+    Logout {
+        #[arg(value_name = "PROVIDER")]
+        provider: Option<String>,
+    },
     /// List sessions for this workspace
     ListSessions,
     /// One-shot prompt (any other first word is treated as the prompt)
@@ -2174,12 +2210,18 @@ enum Command {
     Prompt(Vec<String>),
 }
 
-async fn login_cmd() -> Result<()> {
-    grok_login().await
+async fn login_cmd(provider: Option<&str>) -> Result<()> {
+    match provider.unwrap_or("xai").trim().to_ascii_lowercase().as_str() {
+        "" | "xai" | "grok" => grok_login().await,
+        other => bail!("unknown provider {other} (try xai). Vertex uses gcloud application-default login."),
+    }
 }
 
-async fn logout_cmd() -> Result<()> {
-    grok_logout().await
+async fn logout_cmd(provider: Option<&str>) -> Result<()> {
+    match provider.unwrap_or("xai").trim().to_ascii_lowercase().as_str() {
+        "" | "xai" | "grok" => grok_logout().await,
+        other => bail!("unknown provider {other} (try xai)"),
+    }
 }
 
 async fn open_provider(model: &str) -> Result<(Provider, String)> {
@@ -2234,8 +2276,8 @@ async fn main() -> Result<()> {
         provider_grok::set_auth_path(path);
     }
     match &cli.command {
-        Some(Command::Login) => return login_cmd().await,
-        Some(Command::Logout) => return logout_cmd().await,
+        Some(Command::Login { provider }) => return login_cmd(provider.as_deref()).await,
+        Some(Command::Logout { provider }) => return logout_cmd(provider.as_deref()).await,
         Some(Command::ListSessions) => {
             list_sessions(&workspace(&cli)?)?;
             return Ok(());

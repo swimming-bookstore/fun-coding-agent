@@ -25,5 +25,6 @@ for chat completions and maps “not logged in” to `fun login`.
 and `GOOGLE_CLOUD_LOCATION`). There is no Fun-side Vertex login. The same
 project and location can be set as `google_cloud_project` and
 `google_cloud_location` in `~/.config/fun/config.json`; environment variables
-win. A Gemini model id selects Vertex. Click the model name in the TUI, or set
-`FUN_CODING_AGENT_MODEL=gemini-4-argon`.
+win. A Gemini model id, or a `vertex/` / `google/` prefix, uses Vertex.
+Click the model name in the TUI (the popup shows the provider),
+or set `FUN_CODING_AGENT_MODEL=vertex/gemini-2.5-pro`.

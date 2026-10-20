@@ -39,22 +39,76 @@ pub struct Call {
 }
 
 impl Call {
-    pub fn restored_note(calls: &[&Call]) -> String {
-        let bits: Vec<String> = calls
-            .iter()
-            .map(|c| {
-                c.args
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .map(|p| format!("{} {p}", c.name))
-                    .unwrap_or_else(|| c.name.clone())
-            })
-            .collect();
+    /// Context-prune reminder. Successful writes/edits are omitted on purpose:
+    /// a path stub is not proof the file still exists, and saying "applied" makes
+    /// a later review keep or delete work it has not read. Only a failed or
+    /// missing result is worth a note, so the next turn does not treat a miss
+    /// as already on disk.
+    pub fn restored_note(calls: &[&Call], results: &[ToolResult]) -> String {
+        let mut failed = Vec::new();
+        let mut unknown = Vec::new();
+        for c in calls {
+            let label = c
+                .args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|p| format!("{} {p}", c.name))
+                .unwrap_or_else(|| c.name.clone());
+            match tool_outcome(c, results) {
+                ToolOutcome::Ok => {}
+                ToolOutcome::Failed => failed.push(label),
+                ToolOutcome::Unknown => {
+                    if let Some(err) = c
+                        .args
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
+                        failed.push(format!("{label} ({err})"));
+                    } else {
+                        unknown.push(label);
+                    }
+                }
+            }
+        }
+        let mut parts = Vec::new();
+        if !failed.is_empty() {
+            parts.push(format!(
+                "{} failed — not on disk; read the file and retry",
+                failed.join(", ")
+            ));
+        }
+        if !unknown.is_empty() {
+            parts.push(format!(
+                "{} outcome unknown — read the file before repeating",
+                unknown.join(", ")
+            ));
+        }
+        if parts.is_empty() {
+            return String::new();
+        }
         format!(
-            "(earlier {} already applied; file is on disk — read it, do not repeat this call)",
-            bits.join(", ")
+            "(earlier tool call compacted from context: {}.)",
+            parts.join("; ")
         )
+    }
+}
+
+enum ToolOutcome {
+    Ok,
+    Failed,
+    Unknown,
+}
+
+fn tool_outcome(c: &Call, results: &[ToolResult]) -> ToolOutcome {
+    if c.id.is_empty() {
+        return ToolOutcome::Unknown;
+    }
+    match results.iter().find(|t| t.id == c.id && t.name == c.name) {
+        Some(t) if t.is_error => ToolOutcome::Failed,
+        Some(_) => ToolOutcome::Ok,
+        None => ToolOutcome::Unknown,
     }
 }
 
@@ -1098,6 +1152,66 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fun-sess-{}", uuid::Uuid::new_v4().simple()));
         let _ = fs::create_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn restored_note_does_not_claim_a_failed_edit_applied() {
+        let ok = Call {
+            id: "1".into(),
+            name: "edit".into(),
+            args: serde_json::json!({"path": "/tmp/ok.rs"}),
+            thought_signature: String::new(),
+            restored: true,
+        };
+        let bad = Call {
+            id: "2".into(),
+            name: "edit".into(),
+            args: serde_json::json!({"path": "/tmp/missing.rs"}),
+            thought_signature: String::new(),
+            restored: true,
+        };
+        let unknown = Call {
+            id: "3".into(),
+            name: "write".into(),
+            args: serde_json::json!({"path": "/tmp/gone.rs"}),
+            thought_signature: String::new(),
+            restored: true,
+        };
+        let results = vec![
+            ToolResult {
+                id: "1".into(),
+                name: "edit".into(),
+                content: "applied".into(),
+                is_error: false,
+                restored: true,
+            },
+            ToolResult {
+                id: "2".into(),
+                name: "edit".into(),
+                content: "old string not found".into(),
+                is_error: true,
+                restored: true,
+            },
+        ];
+        let note = Call::restored_note(&[&ok, &bad, &unknown], &results);
+        assert!(!note.contains("/tmp/ok.rs"));
+        assert!(!note.contains("applied"));
+        assert!(!note.contains("do not repeat"));
+        assert!(note.contains("edit /tmp/missing.rs failed — not on disk; read the file and retry"));
+        assert!(note.contains("write /tmp/gone.rs outcome unknown — read the file before repeating"));
+        assert!(!note.contains("Do not repeat a call that applied"));
+        assert!(!note.contains("already applied"));
+        assert!(!note.contains("file is on disk"));
+        let buried = Call {
+            id: "4".into(),
+            name: "edit".into(),
+            args: serde_json::json!({"path": "/tmp/ui.rs", "error": "`old` must appear exactly once"}),
+            thought_signature: String::new(),
+            restored: true,
+        };
+        let buried_note = Call::restored_note(&[&buried], &[]);
+        assert!(buried_note.contains("edit /tmp/ui.rs (`old` must appear exactly once) failed — not on disk"));
+        assert!(!buried_note.contains("do not repeat"));
     }
 
     #[test]

@@ -4,7 +4,7 @@ These variables are read at process start.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `FUN_CODING_AGENT_MODEL` | `grok-4.7` | Model id. A `gemini` or `argon` id uses Vertex. Click the model name in the TUI to switch. |
+| `FUN_CODING_AGENT_MODEL` | `grok-4.7` | Model id. `vertex/…`, `google/…`, and a bare `gemini-*` id use Vertex. The TUI popup shows the provider. |
 | `FUN_CODING_AGENT_EFFORT` | `medium` | Reasoning effort for real completes. `low` / `minimal` → low; `high` / `xhigh` / `x-high` → high; anything else → medium. **Prune calls always use `low`**, regardless of this. On Vertex, Gemini 2.5 maps this to a thinking budget. Gemini 3 and Gemini 4 map it to a thinking level. Argon rejects `MINIMAL` and `thinkingBudget`. |
 | `FUN_CODING_AGENT_CONFIG` | `~/.config/fun/config.json` | Config path. |
 | `PROVIDER_GROK_AUTH` | `~/.local/share/fun/auth.json` | xAI token file. Wins over `"auth"` in config. |
@@ -20,6 +20,7 @@ Example:
 ```sh
 FUN_CODING_AGENT_EFFORT=low fun
 FUN_CODING_AGENT_MODEL=grok-4.7 fun --new "quick pass"
+FUN_CODING_AGENT_MODEL=vertex/gemini-2.5-pro fun
 FUN_CODING_AGENT_MODEL=gemini-4-argon fun
 ```
 

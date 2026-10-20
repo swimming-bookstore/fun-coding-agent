@@ -46,7 +46,9 @@ keeps the compiled defaults. Fun does not write this file for you.
 
 | Key | Meaning |
 | --- | --- |
-| `auth` | Token file. A leading `~` is expanded. `PROVIDER_GROK_AUTH` still wins. |
+| `auth` | xAI token file. A leading `~` is expanded. `PROVIDER_GROK_AUTH` still wins. |
+| `google_cloud_project` | Vertex project. `GOOGLE_CLOUD_PROJECT` still wins. |
+| `google_cloud_location` | Vertex region, or `global`. |
 | `home` | Preferred trunk name when git has none yet (`master` / `main` / `dev` are also probed). |
 | `colors` | Palette. Any omitted color keeps its default hex. |
 | `actions` | Replace the default chips. Omit the key to keep defaults. An empty array draws no chips. |

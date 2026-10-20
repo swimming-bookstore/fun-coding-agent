@@ -8,7 +8,7 @@
 //! | `GOOGLE_CLOUD_PROJECT` / `GCLOUD_PROJECT` | Project id. Config, then ADC `quota_project_id`, are fallbacks. |
 //! | `GOOGLE_CLOUD_LOCATION` | Region, or `global`. Config is the fallback. Default `global` when both are unset. |
 //! | `GOOGLE_APPLICATION_CREDENTIALS` | Service-account JSON. Else `~/.config/gcloud/application_default_credentials.json`. |
-//! | `FUN_CODING_AGENT_MODEL` | Starting model. `gemini-*` uses Vertex. Default `grok-4.7`. |
+//! | `FUN_CODING_AGENT_MODEL` | Starting model. `vertex/…`, `google/…`, and a bare `gemini-*` id use Vertex. Default `grok-4.7`. |
 
 use crate::provider::{CompleteReq, StreamSink};
 use crate::session::{Call, Entry, Image, ToolResult};
@@ -810,14 +810,18 @@ fn is_restore_stub(c: &Call) -> bool {
     c.restored
 }
 
-fn push_model(out: &mut Vec<Value>, text: &str, calls: &[Call]) {
+fn push_model(out: &mut Vec<Value>, text: &str, calls: &[Call], following: &[Entry]) {
     let mut parts = Vec::new();
     if !text.is_empty() {
         parts.push(json!({ "text": text }));
     }
     let (stubs, live): (Vec<&Call>, Vec<&Call>) = calls.iter().partition(|c| is_restore_stub(c));
     if !stubs.is_empty() {
-        parts.push(json!({ "text": Call::restored_note(&stubs) }));
+        let results = tool_results(following);
+        let note = Call::restored_note(&stubs, &results);
+        if !note.is_empty() {
+            parts.push(json!({ "text": note }));
+        }
     }
     for c in live {
         let mut function_call = serde_json::Map::new();
@@ -834,6 +838,17 @@ fn push_model(out: &mut Vec<Value>, text: &str, calls: &[Call]) {
         return;
     }
     out.push(json!({ "role": "model", "parts": parts }));
+}
+
+fn tool_results(following: &[Entry]) -> Vec<ToolResult> {
+    let mut out = Vec::new();
+    for e in following {
+        match e {
+            Entry::Tool(t) => out.push(t.clone()),
+            Entry::User { .. } | Entry::Assistant { .. } => break,
+        }
+    }
+    out
 }
 
 fn push_tool_turn(out: &mut Vec<Value>, tools: &[&ToolResult]) {
@@ -856,7 +871,7 @@ fn contents(entries: &[Entry]) -> Vec<Value> {
                 i += 1;
             }
             Entry::Assistant { text, calls, .. } => {
-                push_model(&mut out, text, calls);
+                push_model(&mut out, text, calls, &entries[i + 1..]);
                 let expected = calls.iter().filter(|c| !is_restore_stub(c)).count();
                 i += 1;
                 if expected == 0 {
@@ -897,7 +912,7 @@ fn contents(entries: &[Entry]) -> Vec<Value> {
     out
 }
 
-fn build_body(model: &str, system: &str, entries: &[Entry], tools: &[Tool], effort: &str) -> Value {
+pub fn build_body(model: &str, system: &str, entries: &[Entry], tools: &[Tool], effort: &str) -> Value {
     let mut body = Map::new();
     body.insert("contents".into(), Value::Array(contents(entries)));
     if !system.is_empty() {
@@ -964,20 +979,18 @@ impl Vertex {
         Ok((client, default_model()))
     }
 
-    pub async fn complete(
-        &self,
-        req: CompleteReq<'_>,
-        on_delta: impl FnMut(&str),
-        on_think: impl FnMut(&str),
-    ) -> Result<crate::grok::Reply> {
-        self.complete_with_effort(req, &self.effort.clone(), on_delta, on_think)
-            .await
+    pub fn http(&self) -> &reqwest::Client {
+        &self.http
     }
 
-    pub async fn complete_with_effort(
+    pub async fn stream_url(
         &self,
-        req: CompleteReq<'_>,
-        effort: &str,
+        url: &str,
+        body: &Value,
+        label: &str,
+        bearer: Option<&str>,
+        api_key: Option<&str>,
+        req: &CompleteReq<'_>,
         mut on_delta: impl FnMut(&str),
         mut on_think: impl FnMut(&str),
     ) -> Result<crate::grok::Reply> {
@@ -990,7 +1003,7 @@ impl Vertex {
                 on_delta: &mut on_delta,
                 on_think: &mut on_think,
             };
-            match self.stream_once(&req, effort, &mut sink).await {
+            match stream_at(&self.http, url, body, label, bearer, api_key, req, &mut sink).await {
                 Ok(r) => return Ok(r),
                 Err(e) if is_abort(&e) => return Err(e),
                 Err(e) => {
@@ -1008,107 +1021,137 @@ impl Vertex {
         }
     }
 
-    async fn stream_once(
+    pub async fn complete(
         &self,
-        req: &CompleteReq<'_>,
+        req: CompleteReq<'_>,
+        on_delta: impl FnMut(&str),
+        on_think: impl FnMut(&str),
+    ) -> Result<crate::grok::Reply> {
+        self.complete_with_effort(req, &self.effort.clone(), on_delta, on_think)
+            .await
+    }
+
+    pub async fn complete_with_effort(
+        &self,
+        req: CompleteReq<'_>,
         effort: &str,
-        sink: &mut StreamSink<'_>,
+        on_delta: impl FnMut(&str),
+        on_think: impl FnMut(&str),
     ) -> Result<crate::grok::Reply> {
         let cred = resolve_credential(&self.http, &self.token_cache).await?;
         let url = endpoint(&cred, req.model);
         let body = build_body(req.model, req.system, req.entries, req.tools, effort);
-        let mut http = self
-            .http
-            .post(&url)
-            .header("Accept", "text/event-stream")
-            .header("Content-Type", "application/json");
-        http = http.bearer_auth(match &cred {
-            Credential::AccessToken { token, .. } => token,
-        });
-        let send = http.json(&body).send();
-        let mut resp = tokio::select! {
-            r = send => r.context("vertex request")?,
-            _ = req.abort.wait() => return Err(aborted()),
+        let token = match &cred {
+            Credential::AccessToken { token, .. } => token.clone(),
         };
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            bail!("vertex {status}: {text}");
-        }
-        let mut buf = String::new();
-        let mut text = String::new();
-        let mut thinking = String::new();
-        let mut calls: Vec<Call> = Vec::new();
-        let mut finish = String::new();
-        let mut input_tokens = 0u64;
-        let mut output_tokens = 0u64;
-        let mut cached_tokens = 0u64;
-        let mut reasoning_tokens = 0u64;
-        let mut call_n = 0u64;
-        let mut pending_sig = String::new();
-        let started = {
-            let mut acc = ChunkAcc {
-                text: &mut text,
-                thinking: &mut thinking,
-                calls: &mut calls,
-                finish: &mut finish,
-                input_tokens: &mut input_tokens,
-                output_tokens: &mut output_tokens,
-                cached_tokens: &mut cached_tokens,
-                reasoning_tokens: &mut reasoning_tokens,
-                call_n: &mut call_n,
-                pending_sig: &mut pending_sig,
-                sink,
-            };
-            let mut apply = |data: &str| -> Result<()> {
-                for obj in split_json_objects(data) {
-                    if obj.is_empty() || obj == "[DONE]" {
-                        continue;
-                    }
-                    apply_chunk(obj, &mut acc)?;
-                }
-                Ok(())
-            };
-            loop {
-                let chunk = tokio::select! {
-                    c = resp.chunk() => c,
-                    _ = req.abort.wait() => return Err(aborted()),
-                };
-                let Some(chunk) = chunk.context("vertex stream")? else {
-                    break;
-                };
-                buf.push_str(&String::from_utf8_lossy(&chunk));
-                // Vertex streamGenerateContent?alt=sse is newline-delimited JSON
-                // (one object per line), not SSE blocks separated by blank lines.
-                while let Some(idx) = buf.find('\n') {
-                    let line = buf[..idx].trim().trim_end_matches('\r').to_string();
-                    buf.drain(..idx + 1);
-                    if line.is_empty() {
-                        continue;
-                    }
-                    apply(&line_payload(&line))?;
-                }
-            }
-            if !buf.trim().is_empty() {
-                apply(&line_payload(buf.trim()))?;
-            }
-            *acc.sink.started
-        };
-        if finish.is_empty() && text.is_empty() && calls.is_empty() && !started {
-            bail!("vertex stream ended without a finish reason");
-        }
-        let truncated = finish.eq_ignore_ascii_case("MAX_TOKENS");
-        Ok(crate::grok::Reply {
-            text,
-            thinking,
-            calls,
-            truncated,
-            input_tokens,
-            output_tokens,
-            cached_tokens,
-            reasoning_tokens,
-        })
+        self.stream_url(&url, &body, "vertex", Some(&token), None, &req, on_delta, on_think)
+            .await
     }
+}
+
+async fn stream_at(
+    http: &reqwest::Client,
+    url: &str,
+    body: &Value,
+    label: &str,
+    bearer: Option<&str>,
+    api_key: Option<&str>,
+    req: &CompleteReq<'_>,
+    sink: &mut StreamSink<'_>,
+) -> Result<crate::grok::Reply> {
+    let mut builder = http
+        .post(url)
+        .header("Accept", "text/event-stream")
+        .header("Content-Type", "application/json");
+    if let Some(token) = bearer {
+        builder = builder.bearer_auth(token);
+    }
+    if let Some(key) = api_key {
+        builder = builder.header("x-goog-api-key", key);
+    }
+    let send = builder.json(body).send();
+    let mut resp = tokio::select! {
+        r = send => r.with_context(|| format!("{label} request"))?,
+        _ = req.abort.wait() => return Err(aborted()),
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        bail!("{label} {status}: {text}");
+    }
+    let mut buf = String::new();
+    let mut text = String::new();
+    let mut thinking = String::new();
+    let mut calls: Vec<Call> = Vec::new();
+    let mut finish = String::new();
+    let mut input_tokens = 0u64;
+    let mut output_tokens = 0u64;
+    let mut cached_tokens = 0u64;
+    let mut reasoning_tokens = 0u64;
+    let mut call_n = 0u64;
+    let mut pending_sig = String::new();
+    let started = {
+        let mut acc = ChunkAcc {
+            text: &mut text,
+            thinking: &mut thinking,
+            calls: &mut calls,
+            finish: &mut finish,
+            input_tokens: &mut input_tokens,
+            output_tokens: &mut output_tokens,
+            cached_tokens: &mut cached_tokens,
+            reasoning_tokens: &mut reasoning_tokens,
+            call_n: &mut call_n,
+            pending_sig: &mut pending_sig,
+            sink,
+        };
+        let mut apply = |data: &str| -> Result<()> {
+            for obj in split_json_objects(data) {
+                if obj.is_empty() || obj == "[DONE]" {
+                    continue;
+                }
+                apply_chunk(obj, &mut acc)?;
+            }
+            Ok(())
+        };
+        loop {
+            let chunk = tokio::select! {
+                c = resp.chunk() => c,
+                _ = req.abort.wait() => return Err(aborted()),
+            };
+            let Some(chunk) = chunk.with_context(|| format!("{label} stream"))? else {
+                break;
+            };
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+            // streamGenerateContent?alt=sse is newline-delimited JSON
+            // (one object per line), not SSE blocks separated by blank lines.
+            while let Some(idx) = buf.find('\n') {
+                let line = buf[..idx].trim().trim_end_matches('\r').to_string();
+                buf.drain(..idx + 1);
+                if line.is_empty() {
+                    continue;
+                }
+                apply(&line_payload(&line))?;
+            }
+        }
+        if !buf.trim().is_empty() {
+            apply(&line_payload(buf.trim()))?;
+        }
+        *acc.sink.started
+    };
+    if finish.is_empty() && text.is_empty() && calls.is_empty() && !started {
+        bail!("{label} stream ended without a finish reason");
+    }
+    let truncated = finish.eq_ignore_ascii_case("MAX_TOKENS");
+    Ok(crate::grok::Reply {
+        text,
+        thinking,
+        calls,
+        truncated,
+        input_tokens,
+        output_tokens,
+        cached_tokens,
+        reasoning_tokens,
+    })
 }
 
 fn line_payload(line: &str) -> String {
@@ -1193,6 +1236,8 @@ struct ChunkAcc<'sink, 'acc> {
 
 fn apply_chunk(data: &str, acc: &mut ChunkAcc<'_, '_>) -> Result<()> {
     let v: Value = serde_json::from_str(data).with_context(|| format!("vertex chunk: {data}"))?;
+    // generateContent may wrap the payload in `response`. Either shape is fine.
+    let v = v.get("response").cloned().unwrap_or(v);
     if let Some(err) = v.get("error") {
         let msg = err
             .get("message")
@@ -1302,6 +1347,7 @@ fn is_transient(err: &anyhow::Error) -> bool {
         return false;
     }
     if let Some(rest) = msg.strip_prefix("vertex ")
+        .or_else(|| msg.strip_prefix("gemini "))
         && let Some(code) = rest.split(':').next()
     {
         let code = code.trim();
