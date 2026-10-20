@@ -179,7 +179,7 @@ pub struct Reply {
     pub reasoning_tokens: u64,
 }
 
-fn to_input(e: &Entry) -> Vec<WireInput> {
+fn to_input(e: &Entry, following: &[Entry]) -> Vec<WireInput> {
     match e {
         Entry::User { text, images } => vec![WireInput::Message {
             role: "user",
@@ -196,10 +196,13 @@ fn to_input(e: &Entry) -> Vec<WireInput> {
             let (stubs, live): (Vec<&Call>, Vec<&Call>) =
                 calls.iter().partition(|c| c.restored);
             if !stubs.is_empty() {
-                out.push(WireInput::Message {
-                    role: "assistant",
-                    content: WireContent::Text(Call::restored_note(&stubs)),
-                });
+                let note = Call::restored_note(&stubs, &tool_results(following));
+                if !note.is_empty() {
+                    out.push(WireInput::Message {
+                        role: "assistant",
+                        content: WireContent::Text(note),
+                    });
+                }
             }
             for c in live {
                 out.push(WireInput::FunctionCall {
@@ -222,6 +225,17 @@ fn to_input(e: &Entry) -> Vec<WireInput> {
             }]
         }
     }
+}
+
+fn tool_results(following: &[Entry]) -> Vec<crate::session::ToolResult> {
+    let mut out = Vec::new();
+    for e in following {
+        match e {
+            Entry::Tool(t) => out.push(t.clone()),
+            Entry::User { .. } | Entry::Assistant { .. } => break,
+        }
+    }
+    out
 }
 
 fn user_content(text: &str, images: &[crate::session::Image]) -> WireContent {
@@ -375,7 +389,12 @@ impl Grok {
         sink: &mut StreamSink<'_>,
     ) -> Result<Reply> {
         let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
-        let input: Vec<WireInput> = req.entries.iter().flat_map(to_input).collect();
+        let input: Vec<WireInput> = req
+            .entries
+            .iter()
+            .enumerate()
+            .flat_map(|(i, e)| to_input(e, &req.entries[i + 1..]))
+            .collect();
         let defs: Vec<WireTool> = req.tools.iter().map(tool_def).collect();
         let body = WireRequest {
             model: req.model,
@@ -868,23 +887,27 @@ mod tests {
                 kind: "image".into(),
             }],
         };
-        let wire = to_input(&entry);
+        let wire = to_input(&entry, &[]);
         let json = serde_json::to_value(&wire).unwrap();
         let content = &json[0]["content"];
         assert_eq!(content[0]["type"], "input_text");
         assert_eq!(content[0]["text"], "what is this");
         assert_eq!(content[1]["type"], "input_image");
         assert_eq!(content[1]["image_url"], "data:image/png;base64,AAAA");
-        let plain = to_input(&Entry::User {
-            text: "hi".into(),
-            images: Vec::new(),
-        });
+        let plain = to_input(
+            &Entry::User {
+                text: "hi".into(),
+                images: Vec::new(),
+            },
+            &[],
+        );
         let plain_json = serde_json::to_value(&plain).unwrap();
         assert_eq!(plain_json[0]["content"], "hi");
 
-        let mixed = to_input(&Entry::User {
-            text: String::new(),
-            images: vec![
+        let mixed = to_input(
+            &Entry::User {
+                text: String::new(),
+                images: vec![
                 Image {
                     media: "txt".into(),
                     data: "aGVsbG8=".into(),
@@ -898,7 +921,9 @@ mod tests {
                     kind: "pdf".into(),
                 },
             ],
-        });
+        },
+        &[],
+    );
         let mixed_json = serde_json::to_value(&mixed).unwrap();
         let mcontent = &mixed_json[0]["content"];
         assert_eq!(mcontent[0]["type"], "input_text");

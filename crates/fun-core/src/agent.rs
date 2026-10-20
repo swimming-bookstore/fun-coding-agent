@@ -37,7 +37,7 @@ Drop only the candidate ids you name (tool pairs are filled in). Do not treat a 
 Prefer dead-end tool noise (failed bash, superseded dumps) and fat write/edit bodies a restore stub can replace.\n\
 Drop: repeated or superseded tool output, dead-end commands, old plans, chatter, old tool-less conclusions that later user lines replaced, and write/edit calls whose full file body is no longer needed.\n\
 Do not drop user goals, later constraints, or the previous turn’s latest read — the agent will otherwise redo or delete finished work.\n\
-Dropped latest writes/edits still reach the next payload as compact path stubs, so a later review can see that the file exists.\n\
+A dropped write/edit is not proof the file exists. Only a failed or unverified attempt comes back, as a compact note that says failed or unknown — do not treat that as applied. A successful body is omitted; read the file before reviewing or deleting it.\n\
 Keep: every user message, the previous turn’s conclusion, remaining errors, and anything the live messages still need.\n\
 If nothing should go, return {\"drop\":[]}. No tools. No extra text.";
 
@@ -326,11 +326,12 @@ async fn agent_loop(a: &mut Agent) -> Result<()> {
         let system = a.system();
         let abort = a.mailbox.abort.clone();
         let model_entries = a.session.model_entries();
+        let wire = crate::provider::wire_model(&a.model).to_string();
         let reply = match a
             .provider
             .complete(
                 CompleteReq {
-                    model: &a.model,
+                    model: &wire,
                     system: &system,
                     entries: &model_entries,
                     tools: &a.tools,
@@ -569,11 +570,12 @@ async fn run_prune(a: &mut Agent) -> Result<(Vec<usize>, Vec<usize>)> {
         "Workspace: {}\nDrop only candidate ids that no longer matter given the live messages.\n\n{listing}",
         a.workspace.display()
     );
+    let wire = crate::provider::wire_model(&a.model).to_string();
     let reply = a
         .provider
         .complete_with_effort(
             CompleteReq {
-                model: &a.model,
+                model: &wire,
                 system: PRUNE_SYSTEM,
                 entries: &[Entry::User {
                     text: prompt,
@@ -838,6 +840,14 @@ mod tests {
         let e = aborted().context("during complete");
         assert!(is_abort(&e));
         assert!(!is_abort(&anyhow::anyhow!("aborted")));
+    }
+
+    #[test]
+    fn prune_prompt_does_not_treat_a_stub_as_the_file() {
+        assert!(!PRUNE_SYSTEM.contains("can see that the file exists"));
+        assert!(PRUNE_SYSTEM.contains("not proof the file exists"));
+        assert!(PRUNE_SYSTEM.contains("do not treat that as applied"));
+        assert!(PRUNE_SYSTEM.contains("read the file before reviewing or deleting it"));
     }
 
     #[test]

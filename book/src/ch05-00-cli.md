@@ -15,7 +15,7 @@ it.
 | `--dir DIR` | Workspace root. Created if missing, then canonicalized. Tools and session lookup use this path. |
 | `--new` | Create a session instead of opening the latest jsonl for this workspace. |
 | `--session PATH` | Load that jsonl. Error if the file is missing. |
-| `--image PATH` / `--file PATH` | Attach a file to a headless prompt. Repeatable. Images work on every provider. Audio, video, PDF, and plain text are sent when the provider is Vertex (Gemini 4 Argon). |
+| `--image PATH` / `--file PATH` | Attach a file to a headless prompt. Repeatable. Images work on every provider. Audio, video, PDF, and plain text are sent on Vertex. |
 
 `--new` and `--session` together: `--session` wins if the file exists;
 you do not create a second file by accident.

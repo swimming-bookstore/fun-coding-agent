@@ -1,7 +1,8 @@
 # Login
 
-Two providers can sign in. The model id picks the provider. Click the model
-name at the bottom right of the TUI and choose a model. `fun login` is xAI only.
+Two sign-in paths, four providers. The model id picks the provider. Click the model
+name at the bottom right of the TUI. Each row shows the provider, then the model.
+`fun login` is xAI. Vertex has no Fun login.
 
 ## xAI Grok
 

@@ -44,7 +44,7 @@ Tools run with an abort flag. Esc, interrupt, and adopt set it.
 | `read` / `write` / `edit` | 30s | Checked around the work; an Esc mid-read should not still write |
 | `bash` | 30s default, max 600s | Process group killed, then reaped |
 
-After **200** tool rounds Fun stops and records skipped tool results so
+After **200** tool rounds, Fun stops and records skipped tool results so
 the transcript stays paired. You will see
 `(stopped after too many tool rounds)`.
 

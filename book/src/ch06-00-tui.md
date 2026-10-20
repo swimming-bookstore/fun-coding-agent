@@ -36,6 +36,7 @@ error color.
 
 **Status** is workspace path, git branch (if any), last usage
 (input / output / cached / reasoning tokens), model id, and effort.
+Click the model id to open the picker. Each row is `provider` then the model id.
 
 A dim prune line looks like:
 

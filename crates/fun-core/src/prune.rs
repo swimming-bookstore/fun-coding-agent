@@ -353,10 +353,16 @@ fn mutation_path(c: &Call) -> Option<&str> {
     call_path(c, "write").or_else(|| call_path(c, "edit"))
 }
 
-fn compact_call(c: &Call) -> Call {
+fn compact_call_with(c: &Call, result: Option<&ToolResult>) -> Call {
     let mut args = serde_json::Map::new();
     if let Some(path) = c.args.get("path").and_then(|v| v.as_str()) {
         args.insert("path".into(), Value::String(path.to_string()));
+    }
+    if let Some(t) = result.filter(|t| t.is_error) {
+        let msg = clip_entry(&t.content, 160);
+        if !msg.is_empty() {
+            args.insert("error".into(), Value::String(msg.to_string()));
+        }
     }
     Call {
         id: c.id.clone(),
@@ -367,7 +373,7 @@ fn compact_call(c: &Call) -> Call {
     }
 }
 
-fn compact_restored(e: &Entry, keep_ids: &HashSet<String>) -> Entry {
+fn compact_restored(e: &Entry, keep_ids: &HashSet<String>, results: &[ToolResult]) -> Entry {
     match e {
         Entry::Assistant { text, calls, .. } => Entry::Assistant {
             text: clip_entry(text, 200).to_string(),
@@ -375,7 +381,10 @@ fn compact_restored(e: &Entry, keep_ids: &HashSet<String>) -> Entry {
             calls: calls
                 .iter()
                 .filter(|c| keep_ids.contains(&c.id))
-                .map(compact_call)
+                .map(|c| {
+                    let result = results.iter().find(|t| t.id == c.id && t.name == c.name);
+                    compact_call_with(c, result)
+                })
                 .collect(),
         },
         Entry::Tool(t) => Entry::Tool(ToolResult {
@@ -389,20 +398,26 @@ fn compact_restored(e: &Entry, keep_ids: &HashSet<String>) -> Entry {
     }
 }
 
-/// Latest successful write/edit per path, even if prune hid the fat call.
-/// Payload gets a compact stub (path only) so a later review still sees that
-/// work and does not delete it as "dead code".
+/// Latest write/edit attempt per path, success or failure, even if prune hid
+/// the fat call. The payload keeps a compact stub (path, plus error text on
+/// failure). Providers turn that into a note only when the attempt failed or
+/// its result is missing — a silent success is not proof the file exists.
 pub fn prune_restored(entries: &[Entry], hidden: &BTreeSet<usize>) -> HashMap<usize, Entry> {
     let latest = latest_mutations(entries, entries.len());
     let keep_ids: HashSet<String> = latest.iter().map(|(_, _, id)| id.clone()).collect();
     let mut out = HashMap::new();
-    for (asst, tool, _) in latest {
-        for idx in [asst, tool] {
+    for (asst, tool, id) in &latest {
+        let result = entries.get(*tool).and_then(|e| match e {
+            Entry::Tool(t) if t.id == *id => Some(t.clone()),
+            _ => None,
+        });
+        let results = result.into_iter().collect::<Vec<_>>();
+        for idx in [*asst, *tool] {
             if hidden.contains(&idx)
                 && !is_prune_keep(&entries[idx])
                 && let Some(e) = entries.get(idx)
             {
-                out.insert(idx, compact_restored(e, &keep_ids));
+                out.insert(idx, compact_restored(e, &keep_ids, &results));
             }
         }
     }
@@ -441,8 +456,10 @@ fn latest_mutations(entries: &[Entry], until: usize) -> Vec<(usize, usize, Strin
                 }
             }
             Entry::Tool(t)
-                if !t.is_error && !t.id.is_empty() && (t.name == "write" || t.name == "edit") =>
+                if !t.id.is_empty() && (t.name == "write" || t.name == "edit") =>
             {
+                // Latest attempt per path, success or failure. A failed edit
+                // must come back as a stub or the next turn thinks it landed.
                 if let Some(path) = path_by_id.get(&t.id) {
                     let asst = (0..i)
                         .rev()
@@ -906,6 +923,54 @@ mod tests {
             is_error: false,
             restored: false,
         })
+    }
+
+    fn tool_err(id: &str, name: &str, content: &str) -> Entry {
+        Entry::Tool(ToolResult {
+            id: id.into(),
+            name: name.into(),
+            content: content.into(),
+            is_error: true,
+            restored: false,
+        })
+    }
+
+    #[test]
+    fn model_entries_restores_failed_edit_with_error() {
+        let entries = vec![
+            user("strip the page"),
+            Entry::Assistant {
+                text: String::new(),
+                thinking: String::new(),
+                calls: vec![Call {
+                    id: "e1".into(),
+                    name: "edit".into(),
+                    args: serde_json::json!({"path": "src/ui.rs", "old": "header", "new": ""}),
+                    ..Call::default()
+                }],
+            },
+            tool_err("e1", "edit", "`old` must appear exactly once (found 0)"),
+            user("still broken"),
+        ];
+        let hidden = BTreeSet::from([1, 2]);
+        let out = payload_from_hidden(&entries, &hidden);
+        let calls = out.iter().find_map(|e| match e {
+            Entry::Assistant { calls, .. } if calls.iter().any(|c| c.name == "edit") => Some(calls),
+            _ => None,
+        });
+        let calls = calls.expect("failed edit stub");
+        assert!(calls[0].restored);
+        assert_eq!(calls[0].args["path"], "src/ui.rs");
+        assert!(calls[0].args.get("old").is_none());
+        assert!(
+            calls[0].args["error"]
+                .as_str()
+                .unwrap()
+                .contains("exactly once")
+        );
+        let note = Call::restored_note(&[&calls[0]], &[]);
+        assert!(note.contains("failed — not on disk"));
+        assert!(!note.contains("do not repeat"));
     }
 
     #[test]

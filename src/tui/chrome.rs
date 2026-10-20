@@ -529,19 +529,22 @@ pub(super) fn paint_model_picker(buf: &mut Buffer, screen: Rect, current: &str) 
     let choices = fun_core::provider::model_catalog();
     let title = "model";
     let hint = "click a model · Esc close";
-    let rows: Vec<String> = choices
+    let current_key = model_key(current);
+    let rows: Vec<(String, String)> = choices
         .iter()
         .map(|c| {
-            let on = if c.id == current.trim() { ">" } else { " " };
-            format!("{on} {}", c.id)
+            let key = format!("{}/{}", c.provider.label(), c.id);
+            let on = if key == current_key { ">" } else { " " };
+            let line = format!("{on} {:<8} {}", c.provider.label(), c.id);
+            (line, key)
         })
         .collect();
     let inner_w = width(title)
         .max(width(hint))
-        .max(rows.iter().map(|s| width(s)).max().unwrap_or(24))
+        .max(rows.iter().map(|(s, _)| width(s)).max().unwrap_or(24))
         .saturating_add(2)
         .min(screen.width.saturating_sub(4) as usize)
-        .max(28);
+        .max(36);
     let w = (inner_w as u16).saturating_add(4).min(screen.width).max(20);
     let h = ((rows.len() as u16).saturating_add(4))
         .min(screen.height.saturating_sub(2).max(6))
@@ -564,21 +567,18 @@ pub(super) fn paint_model_picker(buf: &mut Buffer, screen: Rect, current: &str) 
     }
     let clip = inner.width.saturating_sub(1).max(1) as usize;
     let mut hits = Vec::new();
-    for (row, (line, choice)) in rows.iter().zip(choices.iter()).enumerate() {
+    for (row, (line, key)) in rows.iter().enumerate() {
         if row as u16 >= inner.height.saturating_sub(1) {
             break;
         }
-        let style = if choice.id == current.trim() {
+        let style = if key == &current_key {
             pal_col(pal().text).bold()
         } else {
             pal_col(pal().text)
         };
         let y = inner.y.saturating_add(row as u16);
         buf.write(inner, inner.x, y, &clip_width(line, clip), style);
-        hits.push((
-            Rect::new(inner.x, y, inner.width, 1),
-            choice.id.to_string(),
-        ));
+        hits.push((Rect::new(inner.x, y, inner.width, 1), key.clone()));
     }
     if inner.height > 1 {
         buf.write(
@@ -590,6 +590,24 @@ pub(super) fn paint_model_picker(buf: &mut Buffer, screen: Rect, current: &str) 
         );
     }
     hits
+}
+
+fn model_key(current: &str) -> String {
+    let current = current.trim();
+    if let Some((provider, id)) = current.split_once('/') {
+        let provider = provider.trim();
+        let id = id.trim();
+        if !provider.is_empty() && !id.is_empty() {
+            let label = match provider {
+                "google-vertex" | "vertex" | "google" => "vertex",
+                "xai" | "grok" => "xai",
+                other => other,
+            };
+            return format!("{label}/{id}");
+        }
+    }
+    let provider = fun_core::provider::backend_for(current).label();
+    format!("{provider}/{current}")
 }
 
 pub(super) fn next_prune_scroll(scroll: usize, delta: i32, max: usize) -> usize {

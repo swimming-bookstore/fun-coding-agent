@@ -4,11 +4,12 @@ Keep means “never hide this row.” Restore means “this row is still
 hidden, but send a tiny reminder so a later review does not treat
 finished work as dead.”
 
-Latest successful writes and edits per path are droppable. Hiding the
-fat body is the point — a 4k `write` of `login.rs` should not stay on
-the wire forever. Disk stays hidden. On the **next** payload, those
-rows come back as compact stubs (path only) so “final code review /
-cut dead code” still sees that the file exists.
+Latest writes and edits per path are droppable, including a failed
+attempt. Hiding the fat body is the point — a 4k `write` of `login.rs`
+should not stay on the wire forever. Disk stays hidden. On the **next**
+payload, those rows come back as compact stubs (path only) so “final
+code review / cut dead code” still sees that the file exists. A failed
+edit’s stub says it failed, so the next turn does not skip the retry.
 
 Without this, the review only had the user line plus the live tail and
 deleted finished work as leftover.
@@ -23,8 +24,8 @@ test dump                    (gone)
 
 | Rule | Detail |
 | --- | --- |
-| What | Latest successful write or edit per path, plus the assistant call that issued it |
-| Stub | `{"path":"…","restored":true}` — no file body. Assistant text clipped, thinking dropped |
+| What | Latest write or edit per path, success or failure, plus the assistant call that issued it |
+| Stub | `{"path":"…","restored":true}` — no file body. A failed attempt also keeps a short `error`. Assistant text clipped, thinking dropped |
 | Cap | 40 paths. Bash dumps never come back |
 | Disk / TUI | Still hidden. The full row is what you see when you scroll |
 
