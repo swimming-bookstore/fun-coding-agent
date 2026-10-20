@@ -17,7 +17,9 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Pin the image. ubuntu-latest moved to Ubuntu 26 on 2026-10-19 and the
+    # Pages deploy that followed hung until GitHub aborted it.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: peaceiris/actions-mdbook@v2
@@ -34,8 +36,10 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: build
+    timeout-minutes: 20
     steps:
       - id: deployment
         uses: actions/deploy-pages@v5
+        timeout-minutes: 15
