@@ -26,6 +26,8 @@ them. The prune line stores that index in `at`. Older files omitted it
 and recorded the prune before the line was stored, so load shifts the
 note onto the following user entry. A prune with nothing after it stays
 at the end. Opening the session also notes `(resumed …, N entries, M pruned from context)`.
+Reopen paints the tool rows as well as the messages. A drop note under a
+user line does not replace the tools from the turn before it.
 
 Headless logs skip prune events. Inspect is TUI-only. To debug a
 headless run, open the jsonl and look for `"type":"prune"` or reopen
