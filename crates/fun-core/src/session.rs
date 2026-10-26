@@ -706,6 +706,8 @@ pub struct Session {
     pub ledger: Vec<PruneTurn>,
     /// Workspace for a session that has not been written yet.
     pending_cwd: Option<PathBuf>,
+    /// Workspace this session belongs to, kept after the header is written.
+    workspace: PathBuf,
 }
 
 #[derive(Clone)]
@@ -737,6 +739,7 @@ impl Session {
             prune_notes: Vec::new(),
             ledger: Vec::new(),
             pending_cwd: Some(workspace.to_path_buf()),
+            workspace: workspace.to_path_buf(),
         })
     }
 
@@ -760,6 +763,17 @@ impl Session {
     /// True when nothing was said. A header-only file still counts as empty.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Start a new chat in the same workspace. The current file is already on
+    /// disk once it has entries, so this only swaps the in-memory transcript.
+    /// An empty current session is discarded instead of leaving a blank file.
+    pub fn fork(&mut self) -> Result<PathBuf> {
+        let previous = self.path.clone();
+        self.discard_if_empty()?;
+        let fresh = Self::create(&self.workspace)?;
+        *self = fresh;
+        Ok(previous)
     }
 
     /// Drop a session that never got a message, including one created before this rule.
@@ -803,6 +817,7 @@ impl Session {
         let mut restored = BTreeSet::new();
         let mut prune_notes = Vec::new();
         let mut ledger = Vec::new();
+        let mut workspace = PathBuf::new();
         for line in text.lines() {
             if line.trim().is_empty() {
                 continue;
@@ -811,7 +826,13 @@ impl Session {
                 continue;
             };
             match v.get("type").and_then(|t| t.as_str()) {
-                Some("header") => {}
+                Some("header") => {
+                    if let Ok(h) = serde_json::from_value::<DiskHeader>(v)
+                        && !h.cwd.is_empty()
+                    {
+                        workspace = PathBuf::from(h.cwd);
+                    }
+                }
                 Some("usage") => {
                     if let Ok(u) = serde_json::from_value::<DiskUsage>(v) {
                         usage = u.usage;
@@ -875,6 +896,7 @@ impl Session {
             prune_notes,
             ledger,
             pending_cwd: None,
+            workspace,
         })
     }
 
@@ -1227,6 +1249,7 @@ mod tests {
             prune_notes: Vec::new(),
             ledger: Vec::new(),
             pending_cwd: None,
+            workspace: PathBuf::new(),
         };
         assert!(
             s.add(Entry::User {
@@ -1342,6 +1365,7 @@ mod tests {
             prune_notes: Vec::new(),
             ledger: Vec::new(),
             pending_cwd: None,
+            workspace: PathBuf::new(),
         };
         s.add(Entry::User {
             text: "see this".into(),
@@ -1435,6 +1459,7 @@ mod tests {
             prune_notes: Vec::new(),
             ledger: Vec::new(),
             pending_cwd: None,
+            workspace: PathBuf::new(),
         };
         assert!(s.add(user("one")).is_ok());
         assert!(s.add(assistant_call("c1", "bash")).is_ok());
@@ -1470,6 +1495,7 @@ mod tests {
             prune_notes: Vec::new(),
             ledger: Vec::new(),
             pending_cwd: None,
+            workspace: PathBuf::new(),
         };
         assert!(s.add(user("make okta")).is_ok());
         assert!(s.add(assistant_write("w1", "src/login.rs", "okta")).is_ok());
@@ -1531,6 +1557,33 @@ mod tests {
             prune_inspect_ids(&loaded.entries, loaded.prune_notes[0].1.iter().copied()).len(),
             2
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fork_keeps_the_previous_file_and_starts_empty() {
+        let dir = tmp();
+        let mut s = Session::create(&dir).expect("create");
+        s.add(Entry::User {
+            text: "old task".into(),
+            images: Vec::new(),
+        })
+        .expect("add");
+        let previous = s.path.clone();
+        let saved = s.fork().expect("fork");
+        assert_eq!(saved, previous);
+        assert!(previous.exists(), "previous session stays on disk");
+        assert!(s.entries.is_empty());
+        assert_ne!(s.path, previous);
+        assert!(!s.path.exists(), "new chat is not written until the next message");
+        s.add(Entry::User {
+            text: "new task".into(),
+            images: Vec::new(),
+        })
+        .expect("add new");
+        let old = Session::load(previous).expect("reload old");
+        assert_eq!(old.entries.len(), 1);
+        assert!(s.path.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -11,9 +11,11 @@ then **idle**.
 
 Fun aborts the in-flight stream and any tool that has not finished,
 writes skipped tool results so the transcript stays paired, and injects
-your text as a user message. The agent loop restarts from the top
-(including a possible prune, because the last entry is now that user
-line).
+your text as a user message. If the context is fat, that
+line may start a new chat first: the previous session stays saved, the
+screen clears, and only this line is sent. If it stays, old noise may be
+hidden from the next send; the screen is not cleared. The rest of the
+queue stays.
 
 From the composer: **Ctrl+Enter**.
 
@@ -65,7 +67,7 @@ snapshot.
 
 ## Abort versus interrupt
 
-**Esc** aborts without sending text. The transcript gets `(aborted)`.
+**Esc** aborts without sending text. `(aborted)` is painted on its own line.
 The composer is unchanged. Pending interrupt / steer / idle items are
 discarded.
 

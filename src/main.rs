@@ -739,6 +739,7 @@ fn paint(ui: &mut Ui, line: &LogLine) -> Result<()> {
         LogLine::Dim(t) => ui.note(t),
         LogLine::Tools { runs } => ui.tools(runs.clone()),
         LogLine::Usage(_) => Ok(()),
+        LogLine::NewChat { .. } => Ok(()),
         LogLine::Pruned { .. } => Ok(()),
     }
 }
@@ -753,6 +754,23 @@ fn apply_log(
         LogLine::Usage(usage) => {
             status.usage = usage;
             refresh_bar(ui, status)
+        }
+        LogLine::NewChat { previous, user } => {
+            ui.clear_transcript()?;
+            // The composer painted this line before the decision call, and the
+            // wipe erased it. prompt_user stores the turn without a User log,
+            // so paint the message here, then the saved-path hint under it.
+            // An empty line still redraws so the new-message hint comes back.
+            if user.trim().is_empty() {
+                ui.redraw_transcript()?;
+            } else {
+                ui.user(&user)?;
+            }
+            ui.note(&format!(
+                "(new chat — previous session saved to {})",
+                previous.display()
+            ))?;
+            Ok(())
         }
         LogLine::Pruned { n: _, lines } => {
             status.pending_inspect = Some(lines);

@@ -89,7 +89,7 @@ Nothing is running. The composer is a normal prompt.
 | --- | --- |
 | Enter | Queue the composer for after this turn |
 | Ctrl+Enter | Interrupt: stop tools and the stream, inject the text and images, restart |
-| Esc | Abort. Tools stop. Composer stays. Transcript gets `(aborted)` |
+| Esc | Abort. Tools stop. Composer stays. Transcript gets `(aborted)` on its own line |
 
 Abort and interrupt both set an abort flag the tools poll. Bash is
 killed. `read` / `write` / `edit` stop at their next check. Skipped

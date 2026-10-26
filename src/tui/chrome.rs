@@ -43,33 +43,23 @@ pub(super) fn status_rows(
     width: u16,
 ) -> Vec<Vec<(String, Style)>> {
     let inner = width.saturating_sub(2).max(1) as usize;
-    let mut ident: Vec<(String, Style)> = Vec::new();
-    let mut stats: Vec<(String, Style)> = Vec::new();
-    let mut right: Vec<(String, Style)> = Vec::new();
-    let push = |out: &mut Vec<(String, Style)>, text: &str, style: Style| {
-        if !text.is_empty() {
-            out.push((text.to_string(), style));
-        }
-    };
+    let mut words: Vec<(String, Style)> = Vec::new();
     let push_item = |out: &mut Vec<(String, Style)>, text: &str, style: Style| {
         if text.is_empty() {
             return;
         }
-        if !out.is_empty() {
-            push(out, "  ", muted());
-        }
-        push(out, text, style);
+        out.push((text.to_string(), style));
     };
     if working {
         push_item(
-            &mut ident,
+            &mut words,
             &format!("{} working", SPINNER[spinner % SPINNER.len()]),
             tool_col(),
         );
     }
-    push_item(&mut ident, &bar.workspace, accent().bold());
+    push_item(&mut words, &bar.workspace, accent().bold());
     if let Some(branch) = &bar.branch {
-        push_item(&mut ident, branch, user_col());
+        push_item(&mut words, branch, user_col());
     }
     let add_stat =
         |out: &mut Vec<(String, Style)>, label: &str, value: &str, color: fun_core::config::Rgb| {
@@ -78,120 +68,48 @@ pub(super) fn status_rows(
             }
             push_item(out, &format!("{label} {value}"), pal_col(color));
         };
-    add_stat(&mut stats, "input tokens", &bar.input, pal().text);
-    add_stat(&mut stats, "output tokens", &bar.output, pal().ok);
-    add_stat(&mut stats, "reasoning tokens", &bar.reasoning, pal().agent);
-    add_stat(&mut stats, "cache hit", &bar.cache_hit, pal().tool);
-    push_item(&mut stats, &bar.cost, user_col());
-    push_item(&mut stats, &bar.context, muted());
-
-    push_item(&mut right, bar.model.trim(), agent_col());
-    push_item(&mut right, bar.effort.trim(), muted());
+    add_stat(&mut words, "input tokens", &bar.input, pal().text);
+    add_stat(&mut words, "output tokens", &bar.output, pal().ok);
+    add_stat(&mut words, "reasoning tokens", &bar.reasoning, pal().agent);
+    add_stat(&mut words, "cache hit", &bar.cache_hit, pal().tool);
+    push_item(&mut words, &bar.cost, user_col());
+    push_item(&mut words, &bar.context, muted());
+    push_item(&mut words, bar.model.trim(), agent_col());
+    push_item(&mut words, bar.effort.trim(), muted());
     if scroll > 0 {
-        push_item(&mut right, &format!("+{scroll}"), accent());
+        push_item(&mut words, &format!("+{scroll}"), accent());
     }
-
-    let ident_w = segs_width(&ident);
-    let stats_w = segs_width(&stats);
-    let right_w = segs_width(&right);
-    let gap = |a: usize, b: usize| -> usize { if a > 0 && b > 0 { 2 } else { 0 } };
-    let one = ident_w + gap(ident_w, stats_w) + stats_w + gap(ident_w + stats_w, right_w) + right_w;
-    if one <= inner {
-        let mut line = ident;
-        if !line.is_empty() && !stats.is_empty() {
-            push(&mut line, "  ", muted());
-        }
-        line.extend(stats);
-        return vec![align_right(line, right, inner)];
-    }
-    let mut left = ident;
-    if !left.is_empty() && !stats.is_empty() {
-        push(&mut left, "  ", muted());
-    }
-    left.extend(stats);
-    wrap_status(left, right, inner)
+    pack_words(words, inner)
 }
 
-pub(super) fn segs_width(segs: &[(String, Style)]) -> usize {
-    segs.iter().map(|(t, _)| width(t)).sum()
-}
-
-pub(super) fn align_right(
-    mut left: Vec<(String, Style)>,
-    right: Vec<(String, Style)>,
-    inner: usize,
-) -> Vec<(String, Style)> {
-    let left_w = segs_width(&left);
-    let right_w = segs_width(&right);
-    if right_w == 0 {
-        return left;
-    }
-    let gap = inner.saturating_sub(left_w.saturating_add(right_w));
-    if gap > 0 {
-        left.push((" ".repeat(gap), muted()));
-    }
-    left.extend(right);
-    left
-}
-
-pub(super) fn wrap_status(
-    left: Vec<(String, Style)>,
-    right: Vec<(String, Style)>,
-    inner: usize,
-) -> Vec<Vec<(String, Style)>> {
+/// Lay words left to right. A word that does not fit starts the next row
+/// instead of painting over the word already there.
+pub(super) fn pack_words(words: Vec<(String, Style)>, inner: usize) -> Vec<Vec<(String, Style)>> {
     let mut rows: Vec<Vec<(String, Style)>> = Vec::new();
     let mut cur: Vec<(String, Style)> = Vec::new();
     let mut used = 0usize;
-    let push_seg = |rows: &mut Vec<Vec<(String, Style)>>,
-                    cur: &mut Vec<(String, Style)>,
-                    used: &mut usize,
-                    text: String,
-                    style: Style| {
+    for (text, style) in words {
         let w = width(&text);
-        if w == 0 || inner == 0 {
-            return;
+        if w == 0 {
+            continue;
         }
-        if *used == 0 && text.trim().is_empty() {
-            return;
-        }
-        if *used > 0 && used.saturating_add(w) > inner {
-            rows.push(std::mem::take(cur));
-            *used = 0;
-            if text.trim().is_empty() {
-                return;
-            }
-        }
-        if w > inner && cur.is_empty() {
-            cur.push((clip_width(&text, inner), style));
-            rows.push(std::mem::take(cur));
-            *used = 0;
-            return;
-        }
-        cur.push((text, style));
-        *used = used.saturating_add(w);
-    };
-    for (text, style) in left {
-        push_seg(&mut rows, &mut cur, &mut used, text, style);
-    }
-    let right_w = segs_width(&right);
-    if !right.is_empty() {
-        if !cur.is_empty() {
+        let gap = if cur.is_empty() { 0 } else { 2 };
+        if used > 0 && used.saturating_add(gap).saturating_add(w) > inner {
             rows.push(std::mem::take(&mut cur));
             used = 0;
         }
-        if right_w <= inner {
-            if right_w < inner {
-                cur.push((" ".repeat(inner - right_w), muted()));
-            }
-            cur.extend(right);
-        } else {
-            for (text, style) in right {
-                push_seg(&mut rows, &mut cur, &mut used, text, style);
-            }
-            if used > 0 && used < inner {
-                cur.insert(0, (" ".repeat(inner - used), muted()));
-            }
+        if used == 0 && w > inner && inner > 0 {
+            cur.push((clip_width(&text, inner), style));
+            rows.push(std::mem::take(&mut cur));
+            used = 0;
+            continue;
         }
+        if !cur.is_empty() {
+            cur.push(("  ".into(), muted()));
+            used += 2;
+        }
+        cur.push((text, style));
+        used = used.saturating_add(w);
     }
     if !cur.is_empty() {
         rows.push(cur);
@@ -431,18 +349,25 @@ pub(super) fn paint_action_bar(
     }
     let y = area.y;
     let gap = 1u16;
-    let mut chips: Vec<(String, ActionHit, ActionColor, u16)> = Vec::new();
+    // Right-aligned, last chip flush with the row. Shrink from the left
+    // so a narrow row still keeps the commit shortcut.
+    let mut chips: Vec<(String, ActionHit, ActionColor, u16)> = items
+        .into_iter()
+        .map(|(label, hit, color)| {
+            let w = (width(&label) as u16).min(area.width).max(1);
+            (label, hit, color, w)
+        })
+        .collect();
     let mut total = 0u16;
-    for (label, hit, color) in items {
-        let w = (width(&label) as u16).min(area.width).max(1);
-        if total > 0 {
+    for (i, chip) in chips.iter().enumerate() {
+        if i > 0 {
             total = total.saturating_add(gap);
         }
-        if total.saturating_add(w) > area.width {
-            break;
-        }
-        total = total.saturating_add(w);
-        chips.push((label, hit, color, w));
+        total = total.saturating_add(chip.3);
+    }
+    while chips.len() > 1 && total > area.width {
+        let dropped = chips.remove(0).3;
+        total = total.saturating_sub(dropped).saturating_sub(gap);
     }
     if chips.is_empty() {
         return Vec::new();

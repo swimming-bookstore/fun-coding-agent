@@ -891,6 +891,33 @@ impl Ui {
         self.note_inspect(text, None)
     }
 
+    /// Wipe the transcript. The composer queue is not part of the transcript.
+    ///
+    /// Does not redraw. A mid-session new chat paints the opening line and
+    /// the saved-path hint next; an empty wipe must call `redraw_transcript`
+    /// or the new-message hint never comes back.
+    pub fn clear_transcript(&mut self) -> Result<()> {
+        self.items.clear();
+        self.rows.clear();
+        self.partial.clear();
+        self.clear_think();
+        self.select = None;
+        self.select_held = false;
+        self.hover_url = None;
+        self.follow = true;
+        self.scroll = 0;
+        self.body_start = 0;
+        self.item_rows.clear();
+        self.prune = None;
+        self.prune_scroll = 0;
+        Ok(())
+    }
+
+    /// Paint the current transcript, including the empty-body hint.
+    pub fn redraw_transcript(&mut self) -> Result<()> {
+        self.redraw()
+    }
+
     pub fn note_inspect(&mut self, text: &str, inspect: Option<Vec<String>>) -> Result<()> {
         self.push_plain(Item::Note {
             text: sanitize(text),
@@ -1738,6 +1765,7 @@ mod tests {
         assert_eq!(pull.y, area.y);
         assert_eq!(push.y, area.y);
         assert!(push.x >= pull.right());
+        assert!(push.right() <= area.right());
         assert_eq!(push.right(), area.right());
         assert_eq!(pull.width as usize, width("[ checkout and pull master ]"));
         assert_eq!(push.width as usize, width("[ commit to feat and push ]"));
@@ -1761,6 +1789,105 @@ mod tests {
             no_git[0].0.width as usize,
             width("[ commit to master and push ]")
         );
+        // A row too narrow for both keeps the commit shortcut, flush right.
+        let narrow = Rect::new(0, 3, 36, 1);
+        let kept = paint_action_bar(&mut Buffer::new(40, 8), narrow, Some("master"), Some("feat"));
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].1, ActionHit { index: 1 });
+        assert_eq!(kept[0].0.right(), narrow.right());
+        assert_eq!(kept[0].0.y, narrow.y);
+    }
+
+    fn row_text(buf: &Buffer, y: u16) -> String {
+        (0..buf.width)
+            .map(|x| buf.get(x, y).ch)
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    #[test]
+    fn new_chat_paints_message_then_hint() {
+        let lines = layout_items(
+            &[
+                Item::User("fix the login form".into()),
+                Item::Note {
+                    text: "(new chat — previous session saved to /tmp/old.jsonl)".into(),
+                    inspect: None,
+                },
+            ],
+            80,
+        )
+        .0
+        .into_iter()
+        .map(|l| line_text(&l))
+        .collect::<Vec<_>>();
+        assert!(
+            lines.iter().any(|l| l.contains("fix the login form")),
+            "{lines:?}"
+        );
+        let msg = lines
+            .iter()
+            .position(|l| l.contains("fix the login form"))
+            .unwrap();
+        let hint = lines
+            .iter()
+            .position(|l| l.contains("new chat — previous session saved"))
+            .unwrap();
+        assert!(hint > msg, "hint must sit under the message: {lines:?}");
+        let empty = wrap_body(&[], "", false, 40);
+        let hint_line = line_text(&empty[0]);
+        assert!(
+            hint_line.contains("ask anything about this workspace"),
+            "{hint_line}"
+        );
+    }
+
+    #[test]
+    fn shortcut_buttons_sit_above_composer_flush_right() {
+        set_actions(Action::defaults());
+        set_git(true);
+        set_origin(true);
+        let mut buf = Buffer::new(80, 24);
+        let area = buf.area();
+        let bar = Bar {
+            pull: Some("master".into()),
+            branch: Some("feat".into()),
+            ..Bar::default()
+        };
+        let atoms: Vec<ComposerAtom> = Vec::new();
+        let status_wanted = status_rows(&bar, false, 0, 0, area.width)
+            .len()
+            .clamp(1, 4) as u16;
+        let composer_wanted = composer_wanted_height(&atoms, area.width);
+        let (composer_h, status_h) = chrome_heights(area.height, status_wanted, composer_wanted);
+        let room = area
+            .height
+            .saturating_sub(composer_h.saturating_add(status_h));
+        assert!(action_bar_height(area.width, bar.pull.as_deref(), bar.branch.as_deref(), room) > 0);
+        let mut constraints = vec![Constraint::Fill, Constraint::Length(1)];
+        if composer_h > 0 {
+            constraints.push(Constraint::Length(composer_h));
+        }
+        if status_h > 0 {
+            constraints.push(Constraint::Length(status_h));
+        }
+        let parts = split(area, &constraints);
+        let hits = paint_action_bar(&mut buf, parts[1], bar.pull.as_deref(), bar.branch.as_deref());
+        let (cursor, _) = composer(&mut buf, parts[2], &atoms, 0, false);
+        assert_eq!(hits.len(), 2, "both shortcut buttons");
+        let pull = hits[0].0;
+        let push = hits[1].0;
+        assert_eq!(pull.y, parts[1].y);
+        assert_eq!(push.y, parts[1].y);
+        assert_eq!(parts[1].bottom(), parts[2].y, "chips sit on the row above the composer");
+        assert!(push.x >= pull.right());
+        assert_eq!(push.right(), parts[1].right());
+        assert!(pull.x > parts[1].x, "the pair is flush right, not flush left");
+        assert!(row_text(&buf, pull.y).contains("[ checkout and pull master ]"));
+        assert!(row_text(&buf, push.y).contains("[ commit to feat and push ]"));
+        assert!(cursor.1 >= parts[2].y && cursor.1 < parts[2].bottom());
+        assert!(row_text(&buf, parts[2].y + 1).contains('›'));
     }
 
     #[test]

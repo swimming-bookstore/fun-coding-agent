@@ -9,7 +9,7 @@ while reading a session file.
 
 | Module | Role |
 | --- | --- |
-| `agent` | Loop, [mailbox](ch12-01-mailbox.md), `maybe_prune`, logging |
+| `agent` | Loop, [mailbox](ch12-01-mailbox.md), new-chat then stay-prune, logging |
 | `tool` | `read` / `write` / `edit` / `bash`, abort, timeouts |
 | `session` | jsonl, usage, hidden set, ledger load/save |
 | `prune` | Buckets, listing, apply, restore stubs |

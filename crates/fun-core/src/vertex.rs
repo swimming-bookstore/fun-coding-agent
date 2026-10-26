@@ -781,6 +781,29 @@ fn parts_for_user(text: &str, images: &[Image]) -> Vec<Value> {
     parts
 }
 
+/// Path-only reminder for a successful stub. Not a function call, and not a
+/// claim that the file still matches what was written.
+fn stub_path_note(calls: &[&Call]) -> String {
+    let labels: Vec<String> = calls
+        .iter()
+        .map(|c| {
+            c.args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|p| format!("{} {p}", c.name))
+                .unwrap_or_else(|| c.name.clone())
+        })
+        .collect();
+    if labels.is_empty() {
+        return String::new();
+    }
+    format!(
+        "(earlier {} compacted from context — path only; read the file before repeating or deleting.)",
+        labels.join(", ")
+    )
+}
+
 fn function_response_part(t: &ToolResult) -> Value {
     let response = if t.is_error {
         json!({ "error": t.content })
@@ -812,13 +835,21 @@ fn is_restore_stub(c: &Call) -> bool {
 
 fn push_model(out: &mut Vec<Value>, text: &str, calls: &[Call], following: &[Entry]) {
     let mut parts = Vec::new();
+    let text = if calls.is_empty() {
+        replay_text(text)
+    } else {
+        text.to_string()
+    };
     if !text.is_empty() {
         parts.push(json!({ "text": text }));
     }
     let (stubs, live): (Vec<&Call>, Vec<&Call>) = calls.iter().partition(|c| is_restore_stub(c));
     if !stubs.is_empty() {
         let results = tool_results(following);
-        let note = Call::restored_note(&stubs, &results);
+        let mut note = Call::restored_note(&stubs, &results);
+        if note.is_empty() {
+            note = stub_path_note(&stubs);
+        }
         if !note.is_empty() {
             parts.push(json!({ "text": note }));
         }
@@ -838,6 +869,22 @@ fn push_model(out: &mut Vec<Value>, text: &str, calls: &[Call], following: &[Ent
         return;
     }
     out.push(json!({ "role": "model", "parts": parts }));
+}
+
+/// Same clip as the Grok wire: a long tool-less plan must not be replayed in full.
+fn replay_text(text: &str) -> String {
+    const MAX: usize = 1200;
+    const HEAD: usize = 700;
+    const TAIL: usize = 400;
+    if text.len() <= MAX {
+        return text.to_string();
+    }
+    let head = crate::tool::clip_utf8(text, HEAD);
+    let mut tail_at = text.len().saturating_sub(TAIL);
+    while tail_at < text.len() && !text.is_char_boundary(tail_at) {
+        tail_at += 1;
+    }
+    format!("{head}\n…(monologue clipped)…\n{}", &text[tail_at..])
 }
 
 fn tool_results(following: &[Entry]) -> Vec<ToolResult> {

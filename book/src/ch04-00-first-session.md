@@ -58,7 +58,7 @@ You do not have to wait for the spinner to finish.
 | --- | --- |
 | Enter | Queue this composer text for **after** the turn |
 | Ctrl+Enter | **Interrupt**: stop tools, inject the text and any attached images, restart the loop |
-| Esc | **Abort**: stop without sending text. Transcript gets `(aborted)` |
+| Esc | **Abort**: stop without sending text. `(aborted)` is its own line |
 
 The composer stays editable the whole time. See
 [Queue, steer, interrupt](ch06-02-queue.md) for the third kind (steer)

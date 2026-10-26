@@ -42,13 +42,20 @@ Entries you care about as a reader:
 
 ## Resume
 
-On resume, Fun reloads entries, hidden ids, and the keep/drop ledger.
-User messages are always sent again, even if an older prune line listed
-them. The TUI notes:
+On resume, Fun reloads the file, including any older prune ledger.
+New turns do not hide messages. When the context is fat, the next user
+line may start a **new chat** instead: the previous file stays where it
+is, the screen clears, and only that line is sent. See
+[New chat, not a hidden transcript](ch15-00-pruning.md).
+
+The TUI notes a resumed file:
 
 ```text
 (resumed …, N entries, M pruned from context)
 ```
+
+`M` is history from an older hide. A chat started by the new-chat
+decision has no such line until you resume something that still has one.
 
 `--session PATH` opens a specific file (error if missing). `--new`
 creates a new id in the same workspace folder. The file is not written
