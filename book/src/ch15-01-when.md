@@ -12,8 +12,8 @@ next user message moves the live tail.
 1. You send, or a queued line is taken
 2. Gate                transcript non-empty? fat? not already tried this live tail?
 3. New chat?           low effort, no tools — or skip and stay
-4. If new              save previous session, clear the screen, send this line alone
-5. If stay             prune: hide named candidates, then append the user line
+4. Paint the user line before the decision. If new, that copy is dropped, the screen clears, then the same line is reprinted with the saved-path hint under it
+5. If stay             prune: hide named candidates
 6. Complete            tools on, slim payload if a stay hid something
 ```
 
@@ -28,7 +28,6 @@ All of these must hold or Fun does not call the model:
 | Check | Rule |
 | --- | --- |
 | There is a previous chat | An empty transcript is already a new chat. |
-| Explicit request | A short line that asks for a new chat, a new session, or to start over forks immediately. It does not wait for a fat payload and it is not sent to the coding model. |
 | Context is fat | Last *real* input tokens ≥ **20 000** **or** remaining visible chars ≥ **32 000**, and at least **two** older messages could have been candidates. |
 | Once per live tail | After a stay (or a failed decision), Fun will not ask again until the next user message moves the live tail. |
 

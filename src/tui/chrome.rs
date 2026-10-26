@@ -1313,6 +1313,26 @@ pub(super) fn body(
         for span in &line.spans {
             cx = buf.write(area, cx, y, &span.text, span.style);
         }
+        // Clear only the unused tail. `blank` leaves a width-0 continuation
+        // alone, so a wide glyph that spills into the gutter is not erased.
+        while cx < area.right() {
+            buf.blank(cx, y);
+            cx = cx.saturating_add(1);
+        }
+    }
+    // Rows the new transcript does not cover still hold the previous paint.
+    // `blank` rather than `put(' ')`: a space on a continuation cell erases
+    // the wide glyph in the cell before it.
+    for i in wrapped.len().saturating_sub(start).min(h)..h {
+        let y = area.y.saturating_add(i as u16);
+        if y >= area.bottom() {
+            break;
+        }
+        let mut cx = area.x;
+        while cx < area.right() {
+            buf.blank(cx, y);
+            cx = cx.saturating_add(1);
+        }
     }
     (scroll, start)
 }

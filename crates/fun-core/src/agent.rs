@@ -46,11 +46,11 @@ impl UserTurn {
 }
 const NEW_CHAT_SYSTEM: &str = "\
 You decide whether the next user message continues this chat or starts a different task. Reply with JSON only: {\"new\":true} or {\"new\":false}.\n\
-{\"new\":true} saves this chat and sends only the new message. {\"new\":false} stays and then prunes old noise.\n\
-The queued send after this decision is the new user message itself. Do not drop or rewrite it.\n\
-true: a different task, a new bug, a new project, or a request that does not need this transcript.\n\
+{\"new\":true} saves this chat and sends only the new message. {\"new\":false} stays in this chat. This request does not hide or prune anything.\n\
+The queued send after this decision is the new user message itself. Do not rewrite it.\n\
+true: a different task, a new bug, a new project, or the user asking to start a new chat, a new session, or over.\n\
 false: a follow-up, a correction, a tighter constraint, or an answer to the assistant. Also false when the new line would be wrong without the recent transcript.\n\
-Same words as the transcript are not enough to stay. If it is a new task, true.\n\
+A mention of this feature is not itself a request to leave. Same words as the transcript are not enough to stay. If it is a new task, true.\n\
 No tools. Put the JSON in the reply itself, not only in thinking. No extra text.";
 
 const PRUNE_SYSTEM: &str = "\
@@ -294,6 +294,10 @@ pub async fn prompt(a: &mut Agent, text: String) -> Result<()> {
 
 pub async fn prompt_user(a: &mut Agent, turn: UserTurn) -> Result<()> {
     a.mailbox.clear_cancel();
+    // Same immediate paint as a queued consume: the line is on screen
+    // before the new-chat / prune decision. maybe_new_chat reprints it
+    // only when a new chat clears the transcript.
+    a.emit(LogLine::User(turn.display()));
     maybe_new_chat(a, &turn).await?;
     a.session.add(Entry::User {
         text: turn.text,
@@ -595,6 +599,12 @@ impl RepeatGuard {
 
 fn finish_repeat(a: &mut Agent, repeat: &RepeatGuard) {
     a.mailbox.clear_abort();
+    let already = a.session.entries.last().is_some_and(|e| {
+        matches!(e, Entry::Assistant { text, .. } if text.contains("stopped: model output was repeating"))
+    });
+    if already {
+        return;
+    }
     a.emit(LogLine::End);
     a.emit(LogLine::Text(LOOP_NOTE.into()));
     let text = format!("{}{LOOP_NOTE}", repeat.text());
@@ -769,16 +779,26 @@ fn word_overlap(a: &[String], b: &[String]) -> usize {
 
 async fn inject_interrupt_new(a: &mut Agent) -> Result<bool> {
     let text = a.mailbox.take_interrupt();
+    // Show the consumed line before the new-chat / prune decision.
+    if let Some(turn) = text.as_ref() {
+        a.emit(LogLine::User(turn.display()));
+    }
     inject_user_new(a, text).await
 }
 
 async fn inject_steer_new(a: &mut Agent) -> Result<bool> {
     let text = a.mailbox.take_steer();
+    if let Some(turn) = text.as_ref() {
+        a.emit(LogLine::User(turn.display()));
+    }
     inject_user_new(a, text).await
 }
 
 async fn inject_idle_new(a: &mut Agent) -> Result<bool> {
     let text = a.mailbox.take_idle();
+    if let Some(turn) = text.as_ref() {
+        a.emit(LogLine::User(turn.display()));
+    }
     inject_user_new(a, text).await
 }
 
@@ -786,7 +806,7 @@ fn inject_user(a: &mut Agent, turn: Option<UserTurn>) -> Result<bool> {
     let Some(turn) = turn else {
         return Ok(false);
     };
-    a.emit(LogLine::User(turn.display()));
+    // The caller painted this line. A new chat reprints it after the clear.
     a.session.add(Entry::User {
         text: turn.text,
         images: turn.images,
@@ -799,6 +819,8 @@ async fn inject_user_new(a: &mut Agent, turn: Option<UserTurn>) -> Result<bool> 
         return Ok(false);
     };
     // Same gate as a composer send. The queue itself is not dropped.
+    // The caller already painted the line. A new chat clears and reprints
+    // it; a stay prints the prune note under the line already shown.
     maybe_new_chat(a, &turn).await?;
     inject_user(a, Some(turn))
 }
@@ -806,67 +828,58 @@ async fn inject_user_new(a: &mut Agent, turn: Option<UserTurn>) -> Result<bool> 
 /// Decide before the user line is stored. A new chat saves the previous
 /// session and sends only this turn. Stay then prunes old noise from the
 /// next send. Either way the queue is left alone.
+///
+/// The caller already emitted the user line. A stay appends the prune note
+/// under it. A new chat clears the screen and reprints that same line.
 async fn maybe_new_chat(a: &mut Agent, turn: &UserTurn) -> Result<()> {
-    if a.session.entries.is_empty() {
-        return Ok(());
-    }
-    // "new chat" is a request, not a follow-up. Do not wait until the
-    // payload is fat, and do not send it to the coding model to greet.
-    if wants_new_chat(&turn.text) {
-        return start_new_chat(a, turn);
-    }
-    if a.session.should_prune().is_none() {
+    if a.session.entries.is_empty() || a.session.should_prune().is_none() {
         return Ok(());
     }
     let live_from = a.session.prune_view().live_from();
     if a.prune_stuck == Some(live_from) {
         return Ok(());
     }
+    let mut after = Vec::new();
+    let mut fresh = false;
     match ask_new_chat(a, turn).await {
         Ok(false) => {
-            prune_if_staying(a).await?;
+            if let Some(note) = prune_if_staying(a).await? {
+                after.push(note);
+            }
             a.prune_stuck = Some(live_from);
         }
-        Ok(true) => start_new_chat(a, turn)?,
+        Ok(true) => {
+            start_new_chat(a)?;
+            fresh = true;
+        }
         Err(e) if is_abort(&e) => return Err(e),
         Err(e) => {
-            a.emit(LogLine::Dim(format!("(new chat skipped: {e})")));
-            prune_if_staying(a).await?;
+            after.push(format!("(new chat skipped: {e})"));
+            if let Some(note) = prune_if_staying(a).await? {
+                after.push(note);
+            }
             a.prune_stuck = Some(live_from);
         }
+    }
+    // A new chat wiped the line that was painted up front. Reprint it so
+    // the saved-path hint sits under that message, not under the old chat.
+    if fresh {
+        a.emit(LogLine::User(turn.display()));
+    }
+    for note in after {
+        a.emit(LogLine::Dim(note));
     }
     Ok(())
 }
 
-fn start_new_chat(a: &mut Agent, turn: &UserTurn) -> Result<()> {
+fn start_new_chat(a: &mut Agent) -> Result<()> {
     let previous = a.session.fork()?;
     a.prune_stuck = None;
     a.emit(LogLine::NewChat {
         previous,
-        user: turn.display(),
+        user: String::new(),
     });
     Ok(())
-}
-
-/// The user asked to start over. Not a model decision: a short session never
-/// reaches the fat gate, so this has to fork on the words themselves.
-///
-/// A long message that merely mentions the feature ("the new chat gate is
-/// broken") is a task in this chat, not a request to leave it.
-fn wants_new_chat(text: &str) -> bool {
-    let t = text.trim().to_ascii_lowercase();
-    if t.is_empty() || t.len() > 80 || t.matches('\n').count() > 2 {
-        return false;
-    }
-    const PHRASES: &[&str] = &[
-        "new chat",
-        "new session",
-        "fresh chat",
-        "start over",
-        "start a new chat",
-        "start new chat",
-    ];
-    PHRASES.iter().any(|p| t.contains(p))
 }
 
 async fn ask_new_chat(a: &mut Agent, turn: &UserTurn) -> Result<bool> {
@@ -920,15 +933,16 @@ fn task_brief(entries: &[Entry]) -> String {
 }
 
 /// Stay path only. Hide named candidates from the next send. The new user
-/// line is not stored yet, so it cannot be dropped. The screen is not cleared.
-async fn prune_if_staying(a: &mut Agent) -> Result<()> {
+/// line is not stored yet, so it cannot be dropped. The note is not emitted
+/// here: the caller paints the user line first, then the drop line under it.
+async fn prune_if_staying(a: &mut Agent) -> Result<Option<String>> {
     if a.session.should_prune().is_none() {
-        return Ok(());
+        return Ok(None);
     }
     let view = a.session.prune_view();
     let (candidates, listing) = view.listing();
     if candidates.len() < 2 {
-        return Ok(());
+        return Ok(None);
     }
     let prompt = format!(
         "Workspace: {}\nHide old noise. The new user message is not listed and must stay.\n\n{listing}\n",
@@ -948,8 +962,7 @@ async fn prune_if_staying(a: &mut Agent) -> Result<()> {
         }
         Err(e) if is_abort(&e) => return Err(e),
         Err(e) => {
-            a.emit(LogLine::Dim(format!("(prune skipped: {e})")));
-            return Ok(());
+            return Ok(Some(format!("(prune skipped: {e})")));
         }
     };
     let drop = crate::prune::parse_drop_ids(&reply, &candidates);
@@ -977,8 +990,7 @@ async fn prune_if_staying(a: &mut Agent) -> Result<()> {
         )
     };
     a.emit(LogLine::Pruned { n, lines });
-    a.emit(LogLine::Dim(note));
-    Ok(())
+    Ok(Some(note))
 }
 
 async fn decision_call(
@@ -1270,25 +1282,22 @@ mod tests {
     }
 
     #[test]
-    fn explicit_new_chat_forks_without_waiting_for_a_fat_session() {
-        assert!(wants_new_chat("i need new chat"));
-        assert!(wants_new_chat("say hi with a new chat"));
-        assert!(wants_new_chat("  NEW SESSION please "));
-        assert!(wants_new_chat("start over"));
-        assert!(!wants_new_chat("hi"));
-        assert!(!wants_new_chat(
-            "the new chat gate is broken, fix the session fork and explain why a short transcript stayed"
-        ));
-        assert!(!wants_new_chat(""));
+    fn new_chat_prompt_keeps_the_queue() {
+        assert!(NEW_CHAT_SYSTEM.contains("does not hide or prune"));
+        assert!(!NEW_CHAT_SYSTEM.contains("stays and then prunes"));
+        assert!(NEW_CHAT_SYSTEM.contains("Do not rewrite it"));
+        assert!(NEW_CHAT_SYSTEM.contains("different task"));
+        assert!(NEW_CHAT_SYSTEM.contains("not enough to stay"));
+        assert!(NEW_CHAT_SYSTEM.contains("asking to start a new chat"));
+        assert!(NEW_CHAT_SYSTEM.contains("not only in thinking"));
     }
 
     #[test]
-    fn new_chat_prompt_keeps_the_queue() {
-        assert!(NEW_CHAT_SYSTEM.contains("stays and then prunes"));
-        assert!(NEW_CHAT_SYSTEM.contains("Do not drop or rewrite it"));
-        assert!(NEW_CHAT_SYSTEM.contains("different task"));
-        assert!(NEW_CHAT_SYSTEM.contains("not enough to stay"));
-        assert!(NEW_CHAT_SYSTEM.contains("not only in thinking"));
+    fn new_chat_and_prune_are_separate_requests() {
+        assert!(!NEW_CHAT_SYSTEM.contains("\"drop\""));
+        assert!(!PRUNE_SYSTEM.contains("\"new\""));
+        assert!(NEW_CHAT_SYSTEM.contains("does not hide or prune"));
+        assert!(PRUNE_SYSTEM.contains("{\"drop\":[ids]}"));
     }
 
     #[test]

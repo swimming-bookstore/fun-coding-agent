@@ -11,7 +11,7 @@ Fun started a new chat or hid old messages instead.
 | Minimum candidates | 2 |
 | Listing cap | ~80k characters |
 | Decision effort | `low`, no tools |
-| New-chat reply | `{"new":true}` or `{"new":false}` — anything else stays |
+| New-chat reply | `{"new":true}` or `{"new":false}` — a missing or unparseable answer starts a new chat |
 | Stay reply | `{"drop":[ids]}` — only candidate ids hide |
 | How often | Once per user message, before that message is stored |
 | Queue | Interrupt, steer, and idle stay queued. They are not dropped. |
@@ -19,7 +19,7 @@ Fun started a new chat or hid old messages instead.
 | Tool round cap (agent) | 200 |
 
 ```text
-new chat  = save previous session, clear the screen, paint this user line, then the saved-path hint under it, send only it
+new chat  = save previous session, clear the screen, paint this user line, then the saved-path hint under it, send only it. The line may already be on screen; the clear drops that copy and the next user line reprints it with the hint.
 stay      = hide named candidates, then send last keep ∪ later messages − drops
 ```
 

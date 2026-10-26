@@ -312,6 +312,10 @@ pub struct Ui {
     ask: Option<AskDialog>,
     prune: Option<Vec<String>>,
     prune_scroll: usize,
+    /// Saved path from a new-chat clear, painted under the next user line.
+    pending_new_chat: Option<String>,
+    /// Drop listing waiting for the drop note, so the note stays clickable.
+    pending_inspect: Option<Vec<String>>,
     model_picker: bool,
     model_hits: Vec<(Rect, String)>,
     model_hit: Option<(u16, u16, u16, u16)>,
@@ -366,6 +370,8 @@ impl Ui {
             ask: None,
             prune: None,
             prune_scroll: 0,
+            pending_new_chat: None,
+            pending_inspect: None,
             model_picker: false,
             model_hits: Vec::new(),
             model_hit: None,
@@ -893,9 +899,29 @@ impl Ui {
 
     /// Wipe the transcript. The composer queue is not part of the transcript.
     ///
-    /// Does not redraw. A mid-session new chat paints the opening line and
-    /// the saved-path hint next; an empty wipe must call `redraw_transcript`
-    /// or the new-message hint never comes back.
+    /// Does not redraw. The next `User` log is the opening line; the saved-path
+    /// hint is a note under it. This wipe must not drop `pending_new_chat`:
+    /// the caller stores that path before the clear, and the next user line
+    /// consumes it. An empty wipe must call `redraw_transcript` or the
+    /// new-message hint never comes back.
+    /// Drop the user line painted before a new-chat decision, plus anything
+    /// the model streamed under it while that decision ran. Stops at the
+    /// previous user line so the rest of the old chat stays until the wipe.
+    /// A stay never calls this: the prune note is appended under the line.
+    pub fn transcript_len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn drop_trailing_user(&mut self) {
+        let Some(start) = self.items.iter().rposition(|item| matches!(item, Item::User(_))) else {
+            return;
+        };
+        self.items.truncate(start);
+        self.rows.clear();
+        self.partial.clear();
+        self.clear_think();
+    }
+
     pub fn clear_transcript(&mut self) -> Result<()> {
         self.items.clear();
         self.rows.clear();
@@ -910,7 +936,26 @@ impl Ui {
         self.item_rows.clear();
         self.prune = None;
         self.prune_scroll = 0;
+        // The saved path is stored before this wipe and consumed by the next
+        // user line. Dropping it here is what made the hint disappear.
         Ok(())
+    }
+
+    /// Path saved by a new-chat clear. Consumed by the next user line.
+    pub fn take_new_chat(&mut self) -> Option<String> {
+        self.pending_new_chat.take()
+    }
+
+    pub fn hold_new_chat_opt(&mut self, path: Option<String>) {
+        self.pending_new_chat = path;
+    }
+
+    pub fn take_inspect(&mut self) -> Option<Vec<String>> {
+        self.pending_inspect.take()
+    }
+
+    pub fn hold_inspect(&mut self, lines: Option<Vec<String>>) {
+        self.pending_inspect = lines;
     }
 
     /// Paint the current transcript, including the empty-body hint.
@@ -1354,6 +1399,11 @@ mod tests {
         assert!(http_url("https://example.com/a").is_some());
         assert!(http_url("javascript:alert(1)").is_none());
         assert!(http_url("file:///etc/passwd").is_none());
+        assert!(http_url("https://example.com/%0aopen%20-a%20Calculator").is_none());
+        assert!(http_url("https://example.com/%00").is_none());
+        assert!(http_url("https://example.com/a\"b").is_none());
+        assert!(http_url("https://example.com/a%20b").is_some());
+        assert!(http_url("https://example.com/%E4%BD%A0").is_some());
     }
 
     #[test]
@@ -1681,6 +1731,62 @@ mod tests {
     }
 
     #[test]
+    fn body_blanks_rows_the_new_transcript_does_not_cover() {
+        let mut buf = Buffer::new(40, 8);
+        let area = Rect::new(0, 0, 40, 6);
+        let old = vec![Line::plain("old transcript still on screen", Style::new())];
+        body(&mut buf, area, &old, "", false, true, 0);
+        let fresh = vec![Line::plain("you", Style::new())];
+        body(&mut buf, area, &fresh, "", false, true, 0);
+        let row = |y: u16| row_text(&buf, y);
+        assert!(row(0).contains("you"), "{}", row(0));
+        assert!(
+            !row(1).contains("old transcript"),
+            "leftover row: {}",
+            row(1)
+        );
+        // A wide glyph must survive the clear. Blanking the row first erases
+        // the cell the glyph spills into. Blanking the tail must also skip
+        // that continuation cell: put() treats it as overwriting the glyph.
+        let wide = vec![Line::plain("你", Style::new())];
+        body(&mut buf, area, &wide, "", false, true, 0);
+        assert!(
+            row_text(&buf, 0).contains('你'),
+            "wide glyph wiped: {}",
+            row_text(&buf, 0)
+        );
+        let edge = Rect::new(0, 0, 3, 1);
+        let mut edge_buf = Buffer::new(3, 1);
+        body(
+            &mut edge_buf,
+            edge,
+            &[Line::plain("你", Style::new())],
+            "",
+            false,
+            true,
+            0,
+        );
+        assert_eq!(edge_buf.get(1, 0).ch, '你', "edge glyph wiped");
+        assert_eq!(edge_buf.get(2, 0).width, 0);
+        // A wide glyph that spills into the gutter (the cell before the text
+        // column) must survive a shorter repaint. put(' ') on that cell would
+        // erase it; blank() must not.
+        let mut gutter = Buffer::new(4, 2);
+        gutter.put(0, 0, '你', Style::new());
+        body(
+            &mut gutter,
+            Rect::new(0, 0, 4, 2),
+            &[Line::plain("x", Style::new())],
+            "",
+            false,
+            true,
+            0,
+        );
+        assert_eq!(gutter.get(0, 0).ch, '你', "gutter glyph wiped");
+        assert_eq!(gutter.get(1, 0).width, 0);
+    }
+
+    #[test]
     fn body_window_follows_bottom() {
         assert_eq!(body_window(20, 10, true, 0), (0, 10));
         assert_eq!(body_window(20, 10, true, 3), (0, 10));
@@ -1841,6 +1947,68 @@ mod tests {
             hint_line.contains("ask anything about this workspace"),
             "{hint_line}"
         );
+    }
+
+    #[test]
+    fn new_chat_screen_shows_message_then_hint_not_old_rows() {
+        let mut buf = Buffer::new(72, 8);
+        let area = Rect::new(0, 0, 72, 6);
+        let old = vec![Line::plain(
+            "(dropped 38 messages from context, restored 5)",
+            Style::new(),
+        )];
+        body(&mut buf, area, &old, "", false, true, 0);
+        let (rows, _) = layout_items(
+            &[
+                Item::User("why is the login form broken".into()),
+                Item::Note {
+                    text: "(new chat — previous session saved to /tmp/old.jsonl)".into(),
+                    inspect: None,
+                },
+            ],
+            70,
+        );
+        body(&mut buf, area, &rows, "", false, true, 0);
+        let painted = (0..6).map(|y| row_text(&buf, y)).collect::<Vec<_>>();
+        let msg = painted
+            .iter()
+            .position(|l| l.contains("why is the login form broken"))
+            .expect("opening line missing");
+        let hint = painted
+            .iter()
+            .position(|l| l.contains("new chat — previous session saved"))
+            .expect("saved-path hint missing");
+        assert!(hint > msg, "hint above the message: {painted:?}");
+        assert!(
+            painted.iter().all(|l| !l.contains("dropped 38")),
+            "old drop note still on screen: {painted:?}"
+        );
+    }
+
+    #[test]
+    fn stay_screen_shows_message_then_drop_note() {
+        let (rows, _) = layout_items(
+            &[
+                Item::User("and the order seems switched".into()),
+                Item::Note {
+                    text: "(dropped 38 messages from context, restored 5)".into(),
+                    inspect: Some(vec!["[3] assistant dump".into()]),
+                },
+            ],
+            80,
+        );
+        let mut buf = Buffer::new(80, 8);
+        body(&mut buf, Rect::new(0, 0, 80, 6), &rows, "", false, true, 0);
+        let painted = (0..6).map(|y| row_text(&buf, y)).collect::<Vec<_>>();
+        let msg = painted
+            .iter()
+            .position(|l| l.contains("and the order seems switched"))
+            .expect("user line missing");
+        let note = painted
+            .iter()
+            .position(|l| l.contains("dropped 38 messages from context"))
+            .expect("drop note missing");
+        assert!(note > msg, "drop note above the message: {painted:?}");
     }
 
     #[test]

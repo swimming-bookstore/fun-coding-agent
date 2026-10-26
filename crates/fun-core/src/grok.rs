@@ -447,11 +447,11 @@ impl Grok {
                 .await
                 .map_err(auth_err)?;
             if refreshed == token {
-                bail!(
-                    "grok {}: {}",
-                    resp.status(),
-                    resp.text().await.unwrap_or_default()
-                );
+                let status = resp.status();
+                // Drain so the connection can be reused. Do not format the
+                // body: a 401 response can echo the bearer.
+                let _ = resp.text().await;
+                bail!("grok {status}: unauthorized");
             }
             token = refreshed;
             let retry = self
@@ -469,7 +469,9 @@ impl Grok {
         }
         let status = resp.status();
         if !status.is_success() {
-            bail!("grok {}: {}", status, resp.text().await.unwrap_or_default());
+            // Drain so the connection can be reused. Do not format the body.
+            let _ = resp.text().await;
+            bail!("grok {status}");
         }
         let mut buf = String::new();
         let mut text = String::new();

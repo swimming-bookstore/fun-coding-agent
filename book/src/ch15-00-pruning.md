@@ -27,9 +27,8 @@ fat context + new user line
 ```
 
 This is not a composer command. It runs when a user turn starts and the
-live payload is fat. A short line that asks for a new chat forks even when
-the session is still small, so that request is not answered as a greeting.
-Details: [When it runs](ch15-01-when.md).
+live payload is fat. Whether that line is a new chat is the model's
+decision, not a phrase match. Details: [When it runs](ch15-01-when.md).
 
 ## What the model is asked
 
@@ -48,13 +47,13 @@ continues with the unpruned payload. The turn still happens.
 
 `false` means the new line continues the current task: a follow-up, a
 correction, a tighter constraint, or an answer to the assistant. `true`
-means a different task. The call sees the user lines and the latest
-conclusion, not the prune listing, so old tool dumps cannot talk it into
-staying.
+means a different task, including an explicit request to start over. The
+call sees the user lines and the latest conclusion, not the prune listing,
+so old tool dumps cannot talk it into staying.
 
 ## What you see
 
-A new chat clears the transcript, paints the line that opened it, then the hint under that line:
+A new chat drops the line painted before the decision, clears the transcript, then reprints that line with the hint under it:
 
 ```text
 you
@@ -63,7 +62,7 @@ the message that started this chat
 (new chat — previous session saved to ~/.local/share/fun/sessions/…/….jsonl)
 ```
 
-A stay leaves the transcript and adds a dim drop line:
+A stay leaves the transcript. The new line is painted, then the dim drop line under it:
 
 | Line | Meaning |
 | --- | --- |

@@ -6,6 +6,8 @@ use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use crate::prune::{
@@ -666,12 +668,32 @@ fn append_json(path: &Path, value: &impl Serialize) -> Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).context("session dir")?;
     }
-    fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .and_then(|mut f| f.write_all(line.as_bytes()))
+    let mut opts = fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    opts.open(path)
+        .and_then(|mut f| {
+            restrict_private(&f)?;
+            f.write_all(line.as_bytes())
+        })
         .with_context(|| format!("write session {}", path.display()))
+}
+
+/// `OpenOptions::mode` only applies when the file is created. Restrict an
+/// existing session too, so a file left at 0644 by an older build is not
+/// left readable after the next append.
+fn restrict_private(file: &fs::File) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+    }
+    Ok(())
 }
 
 fn write_header(path: &Path, workspace: &Path, id: &str) -> Result<()> {
@@ -685,11 +707,17 @@ fn write_header(path: &Path, workspace: &Path, id: &str) -> Result<()> {
         cwd: workspace.display().to_string(),
         created_at: now_ms(),
     };
-    fs::write(
-        path,
-        serde_json::to_string(&header).context("encode session header")? + "\n",
-    )
-    .with_context(|| format!("write session {}", path.display()))
+    let body = serde_json::to_string(&header).context("encode session header")? + "\n";
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    opts.open(path)
+        .and_then(|mut f| {
+            restrict_private(&f)?;
+            f.write_all(body.as_bytes())
+        })
+        .with_context(|| format!("write session {}", path.display()))
 }
 
 #[derive(Clone)]
