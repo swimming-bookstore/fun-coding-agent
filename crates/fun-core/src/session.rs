@@ -613,6 +613,11 @@ struct DiskPrune {
     /// Hidden write/edit ids currently restored as compact stubs.
     #[serde(default)]
     restored: Vec<usize>,
+    /// Transcript index the drop note belongs under. Older files omit this.
+    /// Those pruned before the triggering user line was stored, so the note
+    /// index is one user line early. Load shifts those onto the next user line.
+    #[serde(default)]
+    at: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -804,6 +809,34 @@ impl Session {
         Ok(previous)
     }
 
+    /// The triggering line was stored so a stay could index the drop note
+    /// under it. A new chat must not leave that line in the previous file.
+    pub fn strip_last_user(&mut self) -> Result<()> {
+        if !matches!(self.entries.last(), Some(Entry::User { .. })) {
+            return Ok(());
+        }
+        self.entries.pop();
+        if !self.path.exists() {
+            return Ok(());
+        }
+        let text = fs::read_to_string(&self.path)?;
+        let mut kept: Vec<&str> = text.lines().collect();
+        if let Some(i) = kept.iter().rposition(|l| {
+            serde_json::from_str::<Value>(l)
+                .ok()
+                .and_then(|v| v.get("kind").and_then(|k| k.as_str()).map(|k| k == "user"))
+                .unwrap_or(false)
+        }) {
+            kept.remove(i);
+        }
+        let mut out = kept.join("\n");
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        fs::write(&self.path, out)?;
+        Ok(())
+    }
+
     /// Drop a session that never got a message, including one created before this rule.
     ///
     /// A missing file is already discarded. Only a non-empty transcript is kept.
@@ -834,6 +867,41 @@ impl Session {
         fs::remove_file(&self.path)
             .with_context(|| format!("remove empty session {}", self.path.display()))?;
         Ok(true)
+    }
+
+    /// Index of the user line a prune note belongs under.
+    ///
+    /// Older files wrote the prune before the triggering user line was stored,
+    /// so a note recorded at `seen` sits under the previous reply. The following
+    /// user entry is that trigger. A prune with nothing after it stays at `seen`.
+    fn note_under_trigger(file: &str, seen: usize) -> Option<usize> {
+        let mut entries = 0usize;
+        let mut past = false;
+        for line in file.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            let kind = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if matches!(kind, "header" | "usage" | "compact") {
+                continue;
+            }
+            if kind == "prune" {
+                if !past && entries == seen {
+                    past = true;
+                }
+                continue;
+            }
+            if past {
+                let user = v.get("kind").and_then(|k| k.as_str()) == Some("user")
+                    || v.get("role").and_then(|k| k.as_str()) == Some("user");
+                return user.then_some(seen);
+            }
+            entries += 1;
+        }
+        None
     }
 
     pub fn load(path: PathBuf) -> Result<Self> {
@@ -876,7 +944,19 @@ impl Session {
                             next.difference(&hidden).copied().collect()
                         };
                         if !added.is_empty() {
-                            prune_notes.push((entries.len(), added.clone()));
+                            // The drop note belongs under the user line that
+                            // triggered the prune. New files store that index
+                            // in `at` (one past the entries that existed when
+                            // the prune ran, which is that line). Older files
+                            // omit `at` and recorded the note on the previous
+                            // turn; shift it onto the following user line.
+                            let at = if let Some(at) = p.at {
+                                at
+                            } else {
+                                Self::note_under_trigger(&text, entries.len())
+                                    .unwrap_or(entries.len())
+                            };
+                            prune_notes.push((at, added.clone()));
                         }
                         restored = p.restored.into_iter().collect();
                         let keep = if p.keep.is_empty() {
@@ -1100,11 +1180,15 @@ impl Session {
                         .filter(|i| !hidden.contains(i))
                         .collect(),
                     restored: restored.iter().copied().collect(),
+                    // The triggering user line is already stored, so this index
+                    // is that line. Replay paints the note after it.
+                    at: Some(self.entries.len().saturating_sub(1)),
                 },
             )?;
         }
         if dropped > 0 {
-            self.prune_notes.push((self.entries.len(), added.clone()));
+            self.prune_notes
+                .push((self.entries.len().saturating_sub(1), added.clone()));
         }
         self.ledger.push(record_turn(
             self.entries.len(),
@@ -1500,7 +1584,7 @@ mod tests {
             assert!(loaded.hidden.contains(&1));
             assert!(loaded.hidden.contains(&2));
             assert!(!loaded.hidden.contains(&0));
-            assert_eq!(loaded.prune_notes, vec![(3, vec![1, 2])]);
+            assert_eq!(loaded.prune_notes, vec![(2, vec![1, 2])]);
             assert!(loaded.restored.is_empty());
             assert_eq!(loaded.ledger.len(), 1);
             assert_eq!(loaded.ledger[0].drop, vec![1, 2]);
@@ -1585,6 +1669,24 @@ mod tests {
             prune_inspect_ids(&loaded.entries, loaded.prune_notes[0].1.iter().copied()).len(),
             2
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_shifts_old_prune_note_under_the_triggering_user_line() {
+        let dir = tmp();
+        let path = dir.join("old-order.jsonl");
+        let header = r#"{"type":"header","version":1,"id":"x","cwd":"/tmp","createdAt":1}"#;
+        let reply = r#"{"kind":"assistant","text":"done","thinking":"","calls":[]}"#;
+        let prune = r#"{"type":"prune","hidden":[0],"dropped":1,"added":[0]}"#;
+        let trigger = r#"{"kind":"user","text":"is the cover the same size?"}"#;
+        fs::write(
+            &path,
+            format!("{header}\n{reply}\n{prune}\n{trigger}\n"),
+        )
+        .unwrap();
+        let loaded = Session::load(path).expect("load");
+        assert_eq!(loaded.prune_notes, vec![(1, vec![0])]);
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -43,6 +43,13 @@ impl UserTurn {
     pub fn display(&self) -> String {
         crate::session::user_display(&self.text, &self.images)
     }
+
+    /// Text as painted and as stored. `user_display` trims; a raw store keeps
+    /// the edge whitespace, so a reopened session reprints a different line
+    /// and the drop note lands under the reply instead of under this line.
+    pub fn stored_text(&self) -> String {
+        self.text.trim().to_string()
+    }
 }
 const NEW_CHAT_SYSTEM: &str = "\
 You decide whether the next user message continues this chat or starts a different task. Reply with JSON only: {\"new\":true} or {\"new\":false}.\n\
@@ -296,13 +303,10 @@ pub async fn prompt_user(a: &mut Agent, turn: UserTurn) -> Result<()> {
     a.mailbox.clear_cancel();
     // Same immediate paint as a queued consume: the line is on screen
     // before the new-chat / prune decision. maybe_new_chat reprints it
-    // only when a new chat clears the transcript.
+    // only when a new chat clears the transcript. A stay stores the line
+    // before the prune note so reopen can hang the note under it.
     a.emit(LogLine::User(turn.display()));
     maybe_new_chat(a, &turn).await?;
-    a.session.add(Entry::User {
-        text: turn.text,
-        images: turn.images,
-    })?;
     let result = match agent_loop(a).await {
         Err(e) if is_abort(&e) => Ok(()),
         other => other,
@@ -807,8 +811,9 @@ fn inject_user(a: &mut Agent, turn: Option<UserTurn>) -> Result<bool> {
         return Ok(false);
     };
     // The caller painted this line. A new chat reprints it after the clear.
+    // Store the trimmed display text so a reopen reprints the same line.
     a.session.add(Entry::User {
-        text: turn.text,
+        text: turn.stored_text(),
         images: turn.images,
     })?;
     Ok(true)
@@ -820,9 +825,9 @@ async fn inject_user_new(a: &mut Agent, turn: Option<UserTurn>) -> Result<bool> 
     };
     // Same gate as a composer send. The queue itself is not dropped.
     // The caller already painted the line. A new chat clears and reprints
-    // it; a stay prints the prune note under the line already shown.
+    // it; a stay stores the line, then prints the prune note under it.
     maybe_new_chat(a, &turn).await?;
-    inject_user(a, Some(turn))
+    Ok(true)
 }
 
 /// Decide before the user line is stored. A new chat saves the previous
@@ -833,16 +838,21 @@ async fn inject_user_new(a: &mut Agent, turn: Option<UserTurn>) -> Result<bool> 
 /// under it. A new chat clears the screen and reprints that same line.
 async fn maybe_new_chat(a: &mut Agent, turn: &UserTurn) -> Result<()> {
     if a.session.entries.is_empty() || a.session.should_prune().is_none() {
+        inject_user(a, Some(turn.clone()))?;
         return Ok(());
     }
     let live_from = a.session.prune_view().live_from();
     if a.prune_stuck == Some(live_from) {
+        inject_user(a, Some(turn.clone()))?;
         return Ok(());
     }
     let mut after = Vec::new();
     let mut fresh = false;
     match ask_new_chat(a, turn).await {
         Ok(false) => {
+            // Store before the prune record so the drop note's index is this
+            // line. Replay paints notes at that index under the message.
+            inject_user(a, Some(turn.clone()))?;
             if let Some(note) = prune_if_staying(a).await? {
                 after.push(note);
             }
@@ -855,6 +865,7 @@ async fn maybe_new_chat(a: &mut Agent, turn: &UserTurn) -> Result<()> {
         Err(e) if is_abort(&e) => return Err(e),
         Err(e) => {
             after.push(format!("(new chat skipped: {e})"));
+            inject_user(a, Some(turn.clone()))?;
             if let Some(note) = prune_if_staying(a).await? {
                 after.push(note);
             }
@@ -863,8 +874,10 @@ async fn maybe_new_chat(a: &mut Agent, turn: &UserTurn) -> Result<()> {
     }
     // A new chat wiped the line that was painted up front. Reprint it so
     // the saved-path hint sits under that message, not under the old chat.
+    // The line was not stored in the previous file.
     if fresh {
         a.emit(LogLine::User(turn.display()));
+        inject_user(a, Some(turn.clone()))?;
     }
     for note in after {
         a.emit(LogLine::Dim(note));
@@ -1202,6 +1215,14 @@ pub fn print_log(line: &LogLine) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stored_text_strips_the_edge_so_replay_matches_the_paint() {
+        let turn = UserTurn::text("  strip the edge  \n");
+        assert_eq!(turn.display(), "strip the edge");
+        assert_eq!(turn.stored_text(), turn.display());
+        assert_ne!(turn.stored_text(), turn.text);
+    }
 
     #[test]
     fn interrupt_then_steer_then_idle() {

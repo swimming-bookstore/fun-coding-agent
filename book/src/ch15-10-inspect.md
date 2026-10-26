@@ -21,9 +21,11 @@ Nothing auto-opens. After a prune, Fun emits the inspect data and then
 the dim line. You click it if you care.
 
 On resume, hidden ids and the ledger reload from jsonl. User ids are
-stripped. Drop lines are replayed in place from notes stored at
-`(entries.len() at that moment, added ids)`. Opening the session also
-notes `(resumed …, N entries, M pruned from context)`.
+stripped. Drop lines are replayed under the user message that triggered
+them. The prune line stores that index in `at`. Older files omitted it
+and recorded the prune before the line was stored, so load shifts the
+note onto the following user entry. A prune with nothing after it stays
+at the end. Opening the session also notes `(resumed …, N entries, M pruned from context)`.
 
 Headless logs skip prune events. Inspect is TUI-only. To debug a
 headless run, open the jsonl and look for `"type":"prune"` or reopen

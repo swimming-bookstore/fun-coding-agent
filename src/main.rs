@@ -1715,11 +1715,17 @@ fn replay(ui: &mut Ui, session: &Session) -> Result<()> {
     };
     let mut notes = session.prune_notes.iter().peekable();
     for (i, e) in session.entries.iter().enumerate() {
+        // A prune recorded at this index belongs under this entry. Paint it
+        // after the entry so the drop note sits under the user line that
+        // triggered it, not under the previous reply.
         match e {
             Entry::User { text, images } => {
                 flush(ui, &mut runs)?;
                 pending.clear();
-                paint(ui, &LogLine::User(user_display(text, images)))?;
+                // Live paint uses user_display, which trims. Replay must strip the
+                // same edge or a stored line with trailing space reprints long and
+                // the drop note no longer sits under that line.
+                paint(ui, &LogLine::User(user_display(text.trim(), images)))?;
             }
             Entry::Assistant {
                 text,
@@ -1745,32 +1751,51 @@ fn replay(ui: &mut Ui, session: &Session) -> Result<()> {
                 runs.push(tool_ok(&t.name, &args));
             }
         }
-        while notes.peek().is_some_and(|(at, _)| *at == i + 1) {
-            let (_, ids) = notes.next().expect("peeked");
-            flush(ui, &mut runs)?;
-            let n = ids.len();
-            let restored: Vec<usize> = ids
-                .iter()
-                .copied()
-                .filter(|i| session.restored.contains(i))
-                .collect();
-            let r = restored.len();
-            let text = if r == 0 {
-                format!("(dropped {n} messages from context)")
-            } else {
-                format!("(dropped {n} messages from context, restored {r})")
-            };
-            ui.note_inspect(
-                &text,
-                Some(fun_core::session::prune_inspect_note(
-                    &session.entries,
-                    ids.iter().copied(),
-                    restored,
-                )),
-            )?;
+        while notes.peek().is_some_and(|(at, _)| *at == i) {
+            paint_prune_note(ui, session, &mut runs, notes.next().expect("peeked"))?;
         }
     }
+    while notes.peek().is_some() {
+        paint_prune_note(ui, session, &mut runs, notes.next().expect("peeked"))?;
+    }
     flush(ui, &mut runs)
+}
+
+fn paint_prune_note(
+    ui: &mut Ui,
+    session: &Session,
+    runs: &mut Vec<ToolRun>,
+    note: &(usize, Vec<usize>),
+) -> Result<()> {
+    let ids = &note.1;
+    if !runs.is_empty() {
+        paint(
+            ui,
+            &LogLine::Tools {
+                runs: std::mem::take(runs),
+            },
+        )?;
+    }
+    let n = ids.len();
+    let restored: Vec<usize> = ids
+        .iter()
+        .copied()
+        .filter(|i| session.restored.contains(i))
+        .collect();
+    let r = restored.len();
+    let text = if r == 0 {
+        format!("(dropped {n} messages from context)")
+    } else {
+        format!("(dropped {n} messages from context, restored {r})")
+    };
+    ui.note_inspect(
+        &text,
+        Some(fun_core::session::prune_inspect_note(
+            &session.entries,
+            ids.iter().copied(),
+            restored,
+        )),
+    )
 }
 
 fn b64(data: &[u8]) -> String {
