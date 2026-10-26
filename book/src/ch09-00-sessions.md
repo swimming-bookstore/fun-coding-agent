@@ -42,11 +42,7 @@ Entries you care about as a reader:
 
 ## Resume
 
-On resume, Fun reloads the file, including any older prune ledger.
-New turns do not hide messages. When the context is fat, the next user
-line may start a **new chat** instead: the previous file stays where it
-is, the screen clears, and only that line is sent. See
-[New chat, not a hidden transcript](ch15-00-pruning.md).
+On resume, Fun reloads that file and paints the transcript.
 
 The TUI notes a resumed file:
 
@@ -54,8 +50,9 @@ The TUI notes a resumed file:
 (resumed …, N entries, M pruned from context)
 ```
 
-`M` is history from an older hide. A chat started by the new-chat
-decision has no such line until you resume something that still has one.
+`N` is how many chat entries are in the file. `M` is how many of them
+were already hidden from context. A file with nothing hidden omits that
+count.
 
 `--session PATH` opens a specific file (error if missing). `--new`
 creates a new id in the same workspace folder. The file is not written
