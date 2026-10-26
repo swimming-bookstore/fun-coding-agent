@@ -11,11 +11,20 @@ then **idle**.
 
 Fun aborts the in-flight stream and any tool that has not finished,
 writes skipped tool results so the transcript stays paired, and injects
-your text as a user message. If the context is fat, that
-line may start a new chat first: the previous session stays saved, the
-screen clears, and only this line is sent. If it stays, old noise may be
-hidden from the next send; the screen is not cleared. The rest of the
-queue stays.
+your text as a user message.
+
+That line is a new user turn, so the same gate as a composer send runs
+before it is stored:
+
+- **New chat.** The previous session file stays where it is. The screen
+  clears. Only this line is sent.
+- **Stay.** The screen stays. Old noise may be hidden from the next
+  send. The transcript on screen is not deleted.
+
+Either way, steer and idle items already queued are left alone. A short
+line that asks for a new chat forks even when the session is still
+small. Otherwise the fork only happens when the live payload is fat.
+See [New chat, or prune](ch15-00-pruning.md).
 
 From the composer: **Ctrl+Enter**.
 
