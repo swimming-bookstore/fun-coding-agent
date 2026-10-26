@@ -842,6 +842,8 @@ fn shown_for(
             }]
         }
         LogLine::Text(t) => vec![Shown::Md(t.clone())],
+        // Live turns paint Tools in apply_log after this returns empty.
+        // Replay must not use paint() for tool rows — see replay().
         LogLine::Delta(_) | LogLine::Think(_) | LogLine::End | LogLine::Tools { .. } | LogLine::Usage(_) => {
             Vec::new()
         }
@@ -1699,12 +1701,9 @@ fn replay(ui: &mut Ui, session: &Session) -> Result<()> {
         if runs.is_empty() {
             return Ok(());
         }
-        paint(
-            ui,
-            &LogLine::Tools {
-                runs: std::mem::take(runs),
-            },
-        )
+        // paint() does not draw Tools. Replay must call ui.tools or every
+        // tool row vanishes on reopen.
+        ui.tools(std::mem::take(runs))
     };
     let take_args = |pending: &mut Vec<Call>, id: &str| {
         if let Some(i) = pending.iter().position(|c| c.id == id) {
@@ -1769,12 +1768,7 @@ fn paint_prune_note(
 ) -> Result<()> {
     let ids = &note.1;
     if !runs.is_empty() {
-        paint(
-            ui,
-            &LogLine::Tools {
-                runs: std::mem::take(runs),
-            },
-        )?;
+        ui.tools(std::mem::take(runs))?;
     }
     let n = ids.len();
     let restored: Vec<usize> = ids
@@ -2617,6 +2611,24 @@ mod tests {
             }
             other => panic!("opening line then hint, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn shown_for_does_not_draw_tool_rows() {
+        // Replay used to send Tools through paint(). That returns nothing
+        // here, so every tool row vanished on reopen. Replay calls ui.tools.
+        let mut hold = None;
+        let mut inspect = None;
+        let mut opened = false;
+        let shown = shown_for(
+            &LogLine::Tools {
+                runs: vec![tool_ok("bash", &empty_args())],
+            },
+            &mut inspect,
+            &mut hold,
+            &mut opened,
+        );
+        assert!(shown.is_empty());
     }
 
     #[test]
