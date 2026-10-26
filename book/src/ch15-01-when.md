@@ -1,50 +1,47 @@
 # When it runs
 
-Prune runs **once per user turn**, inside the agent loop, **before the
-first model call of that turn**. The last session entry must be the
-user message you just sent (or an interrupt/steer/idle that was just
-injected as a user line).
+The decision runs **once per user message**, before that message is
+stored. That includes a composer send and a queued interrupt, steer, or
+idle line that is about to become a user entry.
 
-After tools, Fun does not prune again. This turn’s tool results are
-already in the live tail, so a mid-turn pass could only nibble leftover
-old messages — and it would race the work you are looking at.
+It does not run in the middle of a tool round. This turn’s tools are
+already the live task. After a stay, Fun will not ask again until the
+next user message moves the live tail.
 
 ```text
-1. You send            user line appended
-2. Gate                fat? ≥ 2 droppable? not already tried this live tail?
-3. Prune call          low effort, no tools, listing only — or skip quietly
-4. First reply         real complete with tools, on the slim payload
-5. Tool rounds         no prune until the next user message
+1. You send, or a queued line is taken
+2. Gate                transcript non-empty? fat? not already tried this live tail?
+3. New chat?           low effort, no tools — or skip and stay
+4. Paint the user line before the decision. If new, that copy is dropped, the screen clears, then the same line is reprinted with the saved-path hint under it
+5. If stay             prune: hide named candidates
+6. Complete            tools on, slim payload if a stay hid something
 ```
 
-There is no spinner. An abort during prune is treated like an abort of
-the real turn: no partial ledger write you have to unwind.
+An abort during either call is an abort of the turn. No new file is
+started, no partial ledger line is written, and the queue is left as it
+was.
 
 ## Gate
 
-All of these must hold or Fun does not call Grok for prune:
+All of these must hold or Fun does not call the model:
 
 | Check | Rule |
 | --- | --- |
-| Start of a user turn | Last entry is `User`. Otherwise return. |
-| Room to drop | At least **two** candidates. One lonely dump is not worth a round trip. |
-| Context is fat | Last *real* input tokens ≥ **20 000** **or** remaining visible chars ≥ **32 000** (Fun estimates ~4 chars per token). |
-| Once per live tail | After any attempt, Fun will not try again until the next user message (the live tail index moves). |
+| There is a previous chat | An empty transcript is already a new chat. |
+| Context is fat | Last *real* input tokens ≥ **20 000** **or** remaining visible chars ≥ **32 000**, and at least **two** older messages could have been candidates. |
+| Once per live tail | After a stay (or a failed decision), Fun will not ask again until the next user message moves the live tail. |
 
-Prune-turn tokens add to lifetime usage on the status line. They do
-**not** become `last_input_tokens`. After a successful hide, Fun sets
-that counter to **0** so the next real turn measures the slim payload
-instead of thinking the context is still huge.
+A small session never reaches the fat gate. Decision and prune tokens
+add to lifetime usage. They do **not** become `last_input_tokens`.
+After a successful hide, Fun sets that counter to **0** so the next real
+turn measures the slim payload.
 
-If the prune model errors, Fun continues with the unpruned payload.
-The turn still happens.
+If the new-chat call errors, Fun stays and still tries to prune. If the
+prune call errors, the turn continues with the unpruned payload.
 
-## Why “once per live tail”
+## Why the queue stays
 
-Without that latch, a failed prune (model returns nothing useful, or
-every named id was locked) would retry on every tool follow-up and
-burn the same listing. The latch is the live-from index. A new user
-line moves it.
-
-A small session never reaches the fat gate. The only UI when prune
-does run is the dim line in [Context pruning](ch15-00-pruning.md).
+The useful part of the queue is that interrupt, steer, and idle still
+send, in that order. Neither a new chat nor a prune discards them or
+rewrites them. Prune can only hide messages already in the transcript.
+The line being judged is not stored yet, so it cannot be a drop id.

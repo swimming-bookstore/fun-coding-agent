@@ -29,7 +29,7 @@ pub(super) fn next_http_url(s: &str) -> Option<(usize, usize, &str)> {
         };
         let mut end = i + prefix;
         for c in s[end..].chars() {
-            if c.is_whitespace() || matches!(c, '<' | '>' | '"' | '\'') {
+            if c.is_whitespace() || matches!(c, '<' | '>' | '"' | '\'' | '\\') {
                 break;
             }
             end += c.len_utf8();
@@ -60,10 +60,51 @@ pub(super) fn http_url(url: &str) -> Option<&str> {
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         return None;
     }
-    if url.bytes().any(|b| b < b' ' || b == b'\x7f') {
+    if url.bytes().any(|b| {
+        b.is_ascii_control() || matches!(b, b' ' | b'"' | b'\'' | b'\\' | b'<' | b'>')
+    }) {
+        return None;
+    }
+    // Percent-encoding is fine (`%20`, non-ASCII paths). A decoded control
+    // or newline is not: that is how a click becomes a second command.
+    if percent_decodes_to_control(url) {
         return None;
     }
     Some(url)
+}
+
+fn percent_decodes_to_control(url: &str) -> bool {
+    let bytes = url.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'%' || i + 2 >= bytes.len() {
+            i += 1;
+            continue;
+        }
+        let Some(hi) = hex_nibble(bytes[i + 1]) else {
+            i += 1;
+            continue;
+        };
+        let Some(lo) = hex_nibble(bytes[i + 2]) else {
+            i += 1;
+            continue;
+        };
+        let b = (hi << 4) | lo;
+        if b < 0x20 || b == 0x7f {
+            return true;
+        }
+        i += 3;
+    }
+    false
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 pub fn open_url(url: &str) -> bool {

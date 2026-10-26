@@ -730,17 +730,16 @@ fn spawn_events() -> tokio::sync::mpsc::UnboundedReceiver<CEvent> {
 }
 
 fn paint(ui: &mut Ui, line: &LogLine) -> Result<()> {
-    match line {
-        LogLine::Delta(t) => ui.delta(t),
-        LogLine::Think(t) => ui.think(t),
-        LogLine::End => ui.end_stream(),
-        LogLine::User(t) => ui.user(t),
-        LogLine::Text(t) => ui.markdown(t),
-        LogLine::Dim(t) => ui.note(t),
-        LogLine::Tools { runs } => ui.tools(runs.clone()),
-        LogLine::Usage(_) => Ok(()),
-        LogLine::Pruned { .. } => Ok(()),
-    }
+    let mut hold = ui.take_new_chat();
+    let mut inspect = ui.take_inspect();
+    // opened is per log line, not per paint call. A User that arrives in the
+    // same call as NewChat (replay) still gets the hint. A User painted on an
+    // earlier call, before the decision, does not: that hold is still unset.
+    let mut opened = false;
+    let shown = shown_for(line, &mut inspect, &mut hold, &mut opened);
+    ui.hold_new_chat_opt(hold);
+    ui.hold_inspect(inspect);
+    apply_shown(ui, shown)
 }
 
 fn apply_log(
@@ -749,34 +748,152 @@ fn apply_log(
     pending: &mut Vec<Pending>,
     line: LogLine,
 ) -> Result<()> {
-    match line {
+    match &line {
         LogLine::Usage(usage) => {
-            status.usage = usage;
-            refresh_bar(ui, status)
+            status.usage = *usage;
+            refresh_bar(ui, status)?;
         }
-        LogLine::Pruned { n: _, lines } => {
-            status.pending_inspect = Some(lines);
-            Ok(())
+        _ => {}
+    }
+    // Same painter as replay. Text, Dim, and Tools go through shown_for so a
+    // live turn does not drop the reply or the saved-path hint.
+    let before = ui.transcript_len();
+    paint(ui, &line)?;
+    match &line {
+        LogLine::Delta(t) => ui.delta(t)?,
+        LogLine::Think(t) => ui.think(t)?,
+        LogLine::End => ui.end_stream()?,
+        LogLine::Tools { runs } => ui.tools(runs.clone())?,
+        _ => {}
+    }
+    // A new-chat reprint is the same text. Only the first paint, which grew
+    // the transcript, consumes the queued copy. The reprint must not drop
+    // a later queue item that happens to say the same thing.
+    if let LogLine::User(text) = &line
+        && ui.transcript_len() > before
+        && let Some(i) = pending
+            .iter()
+            .position(|p| p.turn().display() == *text || p.text() == text)
+    {
+        pending.remove(i);
+    }
+    Ok(())
+}
+
+/// What a log line puts on screen, in order. A new chat clears, then the
+/// next user line, then the saved-path hint under that line. A stay paints
+/// the user line, then the drop note. The drop listing is attached to the
+/// note, not painted as its own row.
+///
+/// `opened` is set when this line itself cleared the transcript. The hint
+/// is attached only then, so an early paint of the same message (before the
+/// decision) does not consume the saved path or sit in the chat about to
+/// be wiped.
+fn shown_for(
+    line: &LogLine,
+    inspect: &mut Option<Vec<String>>,
+    new_chat: &mut Option<String>,
+    opened: &mut bool,
+) -> Vec<Shown> {
+    match line {
+        LogLine::NewChat { previous, user } => {
+            *new_chat = Some(previous.display().to_string());
+            *opened = true;
+            let mut out = vec![Shown::Clear];
+            // Replay and any caller that still fills `user` paints the opening
+            // line in this same event. A live turn leaves it empty and reprints
+            // with the next User log, which consumes the held path.
+            if !user.trim().is_empty() {
+                out.push(Shown::User(user.clone()));
+                if let Some(path) = new_chat.take() {
+                    out.push(Shown::Note {
+                        text: format!("(new chat — previous session saved to {path})"),
+                        inspect: None,
+                    });
+                    *opened = false;
+                }
+            }
+            out
+        }
+        LogLine::Pruned { lines, .. } => {
+            *inspect = Some(lines.clone());
+            Vec::new()
+        }
+        LogLine::User(text) => {
+            let mut out = vec![Shown::User(text.clone())];
+            if *opened && let Some(path) = new_chat.take() {
+                out.push(Shown::Note {
+                    text: format!("(new chat — previous session saved to {path})"),
+                    inspect: None,
+                });
+                *opened = false;
+            }
+            out
         }
         LogLine::Dim(text) => {
-            let inspect = if text.contains("dropped ") && text.contains("from context") {
-                status.pending_inspect.take()
+            let attached = if text.contains("dropped ") && text.contains("from context") {
+                inspect.take()
             } else {
                 None
             };
-            ui.note_inspect(&text, inspect)
+            vec![Shown::Note {
+                text: text.clone(),
+                inspect: attached,
+            }]
         }
-        LogLine::User(text) => {
-            if let Some(i) = pending
-                .iter()
-                .position(|p| p.turn().display() == text || p.text() == text)
-            {
-                pending.remove(i);
-            }
-            ui.user(&text)
+        LogLine::Text(t) => vec![Shown::Md(t.clone())],
+        LogLine::Delta(_) | LogLine::Think(_) | LogLine::End | LogLine::Tools { .. } | LogLine::Usage(_) => {
+            Vec::new()
         }
-        other => paint(ui, &other),
     }
+}
+
+fn apply_shown(ui: &mut Ui, shown: Vec<Shown>) -> Result<()> {
+    let mut cleared = false;
+    let mut painted = false;
+    for item in shown {
+        match item {
+            Shown::Clear => {
+                // The line painted before the decision belongs to the old
+                // chat. Drop that trailing copy, then wipe. The saved path
+                // lives in pending_new_chat, not in the transcript, so this
+                // cannot eat the hint.
+                ui.drop_trailing_user();
+                ui.clear_transcript()?;
+                cleared = true;
+                painted = false;
+            }
+            Shown::User(text) => {
+                ui.user(&text)?;
+                painted = true;
+            }
+            Shown::Note { text, inspect } => {
+                ui.note_inspect(&text, inspect)?;
+                painted = true;
+            }
+            Shown::Md(text) => {
+                ui.markdown(&text)?;
+                painted = true;
+            }
+        }
+    }
+    // A clear does not redraw. With nothing after it the empty-body hint
+    // ("ask anything about this workspace") never comes back.
+    if cleared && !painted {
+        ui.redraw_transcript()?;
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+enum Shown {
+    Clear,
+    User(String),
+    Note {
+        text: String,
+        inspect: Option<Vec<String>>,
+    },
+    Md(String),
 }
 
 fn flush_log(
@@ -1177,7 +1294,6 @@ struct Status {
     git_at: Option<Instant>,
     usage: Usage,
     pruned: Vec<String>,
-    pending_inspect: Option<Vec<String>>,
 }
 
 enum Pending {
@@ -1836,7 +1952,6 @@ async fn run_tui(agent: &mut Agent, tx: MailboxTx, log_rx: Receiver<LogLine>) ->
         git_at: Some(Instant::now()),
         usage: agent.session.usage,
         pruned: fun_core::session::prune_inspect(&agent.session.entries, &agent.session.hidden),
-        pending_inspect: None,
     };
     tui::set_git(git_dir(&agent.workspace).is_some());
     tui::set_origin(
@@ -1932,7 +2047,8 @@ async fn run_tui(agent: &mut Agent, tx: MailboxTx, log_rx: Receiver<LogLine>) ->
                         ui.set_queue_edit(None);
                         sync_queue(&mut ui, &pending)?;
                         ui.set_working(true)?;
-                        paint(&mut ui, &LogLine::User(text.clone()))?;
+                        // Not painted yet. A new chat clears the transcript; painting
+                        // now would leave this line in the previous chat.
                         if run_turn(
                             &mut TurnLoop {
                                 tx: &tx,
@@ -1977,7 +2093,8 @@ async fn run_tui(agent: &mut Agent, tx: MailboxTx, log_rx: Receiver<LogLine>) ->
                         sync_queue(&mut ui, &pending)?;
                         paint_composer(&mut ui, &edit)?;
                         ui.set_working(true)?;
-                        paint(&mut ui, &LogLine::User(turn.display()))?;
+                        // Same as AskSubmit: the User log paints this line after the
+                        // new-chat decision, so a clear cannot leave it behind.
                         if run_turn(
                             &mut TurnLoop {
                                 tx: &tx,
@@ -2427,6 +2544,95 @@ mod tests {
     }
 
     #[test]
+    fn new_chat_paints_clear_then_message_then_hint() {
+        let previous = PathBuf::from("/tmp/old.jsonl");
+        let mut hold = None;
+        let mut inspect = None;
+        let mut opened = false;
+        let cleared = shown_for(
+            &LogLine::NewChat {
+                previous: previous.clone(),
+                user: String::new(),
+            },
+            &mut inspect,
+            &mut hold,
+            &mut opened,
+        );
+        assert_eq!(cleared.len(), 1);
+        assert!(matches!(cleared[0], Shown::Clear));
+        assert!(hold.as_deref().unwrap().ends_with("old.jsonl"));
+
+        let opened_line = shown_for(
+            &LogLine::User("why is the login form broken".into()),
+            &mut inspect,
+            &mut hold,
+            &mut opened,
+        );
+        assert!(hold.is_none(), "hint must be consumed by the opening line");
+
+        // An early paint, before the clear, must not eat the saved path.
+        let mut early_hold = Some("/tmp/old.jsonl".into());
+        let mut early_opened = false;
+        let early = shown_for(
+            &LogLine::User("why is the login form broken".into()),
+            &mut inspect,
+            &mut early_hold,
+            &mut early_opened,
+        );
+        assert!(
+            matches!(early.as_slice(), [Shown::User(_)]),
+            "early paint is the message only"
+        );
+        assert!(early_hold.is_some(), "saved path waits for the reprint");
+        match &opened_line[..] {
+            [Shown::User(text), Shown::Note { text: note, inspect: None }] => {
+                assert_eq!(text, "why is the login form broken");
+                assert!(note.contains("new chat — previous session saved"));
+                assert!(note.contains("old.jsonl"), "{note}");
+            }
+            other => panic!("opening line then hint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stay_paints_message_then_drop_note() {
+        let mut hold = None;
+        let mut inspect = None;
+        let mut opened = false;
+        let user = shown_for(
+            &LogLine::User("and the order seems switched".into()),
+            &mut inspect,
+            &mut hold,
+            &mut opened,
+        );
+        assert!(matches!(user.as_slice(), [Shown::User(_)]));
+        let listing = vec!["[3] assistant tool dump".into()];
+        let hidden = shown_for(
+            &LogLine::Pruned {
+                n: 38,
+                lines: listing.clone(),
+            },
+            &mut inspect,
+            &mut hold,
+            &mut opened,
+        );
+        assert!(hidden.is_empty(), "the listing is not its own row");
+        let note = shown_for(
+            &LogLine::Dim("(dropped 38 messages from context, restored 5)".into()),
+            &mut inspect,
+            &mut hold,
+            &mut opened,
+        );
+        match &note[..] {
+            [Shown::Note { text, inspect: Some(lines) }] => {
+                assert!(text.starts_with("(dropped 38"));
+                assert_eq!(lines, &listing);
+            }
+            other => panic!("drop note under the message, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn shift_slot_follows_moved_item() {
         assert_eq!(shift_slot(1, 1, 0), 0);
         assert_eq!(shift_slot(0, 1, 0), 1);
@@ -2501,7 +2707,6 @@ mod tests {
             git_at: None,
             usage: Usage::default(),
             pruned: Vec::new(),
-            pending_inspect: None,
         };
         assert_eq!(
             action_prompt(&KeyAction::Action(1), &on_home).as_deref(),

@@ -50,7 +50,7 @@ The mailbox carries more than text.
 | Flag | Set by | Meaning |
 | --- | --- | --- |
 | **abort** | Interrupt, Esc, adopt | Tools poll it. Bash is killed. `read` / `write` / `edit` stop at their next check. The Grok stream stops. |
-| **cancel** | Esc (`MailboxTx::abort`) | The loop should **exit** this `prompt()`, discard pending items, paint `(aborted)`. |
+| **cancel** | Esc (`MailboxTx::abort`) | The loop should **exit** this `prompt()`, discard pending items, paint `(aborted)` on its own line. |
 
 Interrupt sets **abort** only. The loop injects the text and continues.
 Esc sets **cancel** and **abort**. Adopt sets **abort** and queues the

@@ -11,9 +11,8 @@ then **idle**.
 
 Fun aborts the in-flight stream and any tool that has not finished,
 writes skipped tool results so the transcript stays paired, and injects
-your text as a user message. The agent loop restarts from the top
-(including a possible prune, because the last entry is now that user
-line).
+your text as a user message. Steer and idle items already queued stay
+queued.
 
 From the composer: **Ctrl+Enter**.
 
@@ -65,12 +64,9 @@ snapshot.
 
 ## Abort versus interrupt
 
-**Esc** aborts without sending text. The transcript gets `(aborted)`.
+**Esc** aborts without sending text. `(aborted)` is painted on its own line.
 The composer is unchanged. Pending interrupt / steer / idle items are
 discarded.
 
 Ctrl+C quits the process. It is not an agent abort. The session file
 is already saved; you are only leaving the TUI.
-
-If you abort during prune, Fun treats it like an abort of the real
-turn. You will not get a half-applied drop.

@@ -211,12 +211,43 @@ async fn service_account_token(http: &reqwest::Client, cred: &CredFile) -> Resul
         .as_deref()
         .filter(|s| !s.is_empty())
         .unwrap_or(TOKEN_URL);
+    if !https_google_url(token_uri) {
+        bail!("refusing service-account token_uri (must be https on googleapis.com)");
+    }
     let assertion = sign_jwt(email, token_uri, key)?;
     let body = format!(
         "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion={}",
         urlencoding_encode(&assertion)
     );
     post_token(http, token_uri, &body).await
+}
+
+fn https_google_url(raw: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(raw) else {
+        return false;
+    };
+    // No userinfo (`https://x@host`), no non-default port. Host must be
+    // googleapis.com itself, not a suffix trick and not an empty label.
+    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    if url.port().is_some() {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("googleapis.com") {
+        return true;
+    }
+    let Some(prefix) = host.strip_suffix(".googleapis.com") else {
+        return false;
+    };
+    !prefix.is_empty()
+        && !prefix.contains('.')
+        && prefix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
 async fn post_token(http: &reqwest::Client, url: &str, body: &str) -> Result<String> {
@@ -232,7 +263,9 @@ async fn post_token(http: &reqwest::Client, url: &str, body: &str) -> Result<Str
     let status = resp.status().as_u16();
     let text = resp.text().await.context("token response body")?;
     if !(200..300).contains(&status) {
-        bail!("token endpoint {status}: {text}");
+        // Body is parsed only on success. A failure must not echo it:
+        // token endpoints sometimes repeat the assertion.
+        bail!("token endpoint {status}");
     }
     let v: Value = serde_json::from_str(&text).context("token json")?;
     v.get("access_token")
@@ -312,7 +345,7 @@ fn rsa_sha256(pem: &str, message: &[u8]) -> Result<Vec<u8>> {
     if k < 64 {
         bail!("rsa modulus too small");
     }
-    let em = emsa_pkcs1_sha256(&digest, k);
+    let em = emsa_pkcs1_sha256(&digest, k)?;
     let sig = mod_exp(&em, &d, &n)?;
     if sig.len() > k {
         bail!("rsa signature longer than modulus");
@@ -322,7 +355,7 @@ fn rsa_sha256(pem: &str, message: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn emsa_pkcs1_sha256(digest: &[u8], k: usize) -> Vec<u8> {
+fn emsa_pkcs1_sha256(digest: &[u8], k: usize) -> Result<Vec<u8>> {
     // DigestInfo for SHA-256
     const PREFIX: &[u8] = &[
         0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
@@ -331,14 +364,14 @@ fn emsa_pkcs1_sha256(digest: &[u8], k: usize) -> Vec<u8> {
     let mut t = PREFIX.to_vec();
     t.extend_from_slice(digest);
     if k < t.len() + 11 {
-        return vec![0; k];
+        bail!("rsa modulus too small for SHA-256 DigestInfo");
     }
     let mut em = vec![0xffu8; k];
     em[0] = 0x00;
     em[1] = 0x01;
     em[k - t.len() - 1] = 0x00;
     em[k - t.len()..].copy_from_slice(&t);
-    em
+    Ok(em)
 }
 
 fn pem_body(pem: &str) -> Result<Vec<u8>> {
@@ -781,6 +814,29 @@ fn parts_for_user(text: &str, images: &[Image]) -> Vec<Value> {
     parts
 }
 
+/// Path-only reminder for a successful stub. Not a function call, and not a
+/// claim that the file still matches what was written.
+fn stub_path_note(calls: &[&Call]) -> String {
+    let labels: Vec<String> = calls
+        .iter()
+        .map(|c| {
+            c.args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|p| format!("{} {p}", c.name))
+                .unwrap_or_else(|| c.name.clone())
+        })
+        .collect();
+    if labels.is_empty() {
+        return String::new();
+    }
+    format!(
+        "(earlier {} compacted from context — path only; read the file before repeating or deleting.)",
+        labels.join(", ")
+    )
+}
+
 fn function_response_part(t: &ToolResult) -> Value {
     let response = if t.is_error {
         json!({ "error": t.content })
@@ -812,13 +868,21 @@ fn is_restore_stub(c: &Call) -> bool {
 
 fn push_model(out: &mut Vec<Value>, text: &str, calls: &[Call], following: &[Entry]) {
     let mut parts = Vec::new();
+    let text = if calls.is_empty() {
+        replay_text(text)
+    } else {
+        text.to_string()
+    };
     if !text.is_empty() {
         parts.push(json!({ "text": text }));
     }
     let (stubs, live): (Vec<&Call>, Vec<&Call>) = calls.iter().partition(|c| is_restore_stub(c));
     if !stubs.is_empty() {
         let results = tool_results(following);
-        let note = Call::restored_note(&stubs, &results);
+        let mut note = Call::restored_note(&stubs, &results);
+        if note.is_empty() {
+            note = stub_path_note(&stubs);
+        }
         if !note.is_empty() {
             parts.push(json!({ "text": note }));
         }
@@ -838,6 +902,22 @@ fn push_model(out: &mut Vec<Value>, text: &str, calls: &[Call], following: &[Ent
         return;
     }
     out.push(json!({ "role": "model", "parts": parts }));
+}
+
+/// Same clip as the Grok wire: a long tool-less plan must not be replayed in full.
+fn replay_text(text: &str) -> String {
+    const MAX: usize = 1200;
+    const HEAD: usize = 700;
+    const TAIL: usize = 400;
+    if text.len() <= MAX {
+        return text.to_string();
+    }
+    let head = crate::tool::clip_utf8(text, HEAD);
+    let mut tail_at = text.len().saturating_sub(TAIL);
+    while tail_at < text.len() && !text.is_char_boundary(tail_at) {
+        tail_at += 1;
+    }
+    format!("{head}\n…(monologue clipped)…\n{}", &text[tail_at..])
 }
 
 fn tool_results(following: &[Entry]) -> Vec<ToolResult> {
@@ -1076,8 +1156,10 @@ async fn stream_at(
     };
     let status = resp.status();
     if !status.is_success() {
-        let text = resp.text().await.unwrap_or_default();
-        bail!("{label} {status}: {text}");
+        // Body can contain request echoes or tokens. Drain it so the
+        // connection can be reused, but do not put it in the error.
+        let _ = resp.text().await;
+        bail!("{label} {status}");
     }
     let mut buf = String::new();
     let mut text = String::new();
@@ -1655,6 +1737,26 @@ mod tests {
         let expect = std::fs::read(&sig_path).unwrap();
         assert_eq!(sig, expect);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn token_uri_must_be_google() {
+        assert!(https_google_url("https://oauth2.googleapis.com/token"));
+        assert!(https_google_url(
+            "https://oauth2.googleapis.com/token?foo=1"
+        ));
+        assert!(!https_google_url("http://oauth2.googleapis.com/token"));
+        assert!(!https_google_url("https://evil.example/token"));
+        assert!(!https_google_url("https://googleapis.com.evil/token"));
+        assert!(!https_google_url("https://evil.googleapis.com.evil/token"));
+        assert!(!https_google_url(
+            "https://user@oauth2.googleapis.com/token"
+        ));
+        assert!(!https_google_url(
+            "https://oauth2.googleapis.com:8443/token"
+        ));
+        assert!(!https_google_url("https://.googleapis.com/token"));
+        assert!(!https_google_url("not a url"));
     }
 
     #[test]

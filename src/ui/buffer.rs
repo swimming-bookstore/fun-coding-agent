@@ -71,7 +71,9 @@ impl Buffer {
             && let Some(p) = self.index(x - 1, y)
             && self.cells[p].width == 2
         {
-            self.cells[p] = Cell::default();
+            // A wide glyph owns this cell. Do not erase it to place a
+            // character that would only cover its continuation.
+            return;
         }
         self.cells[i] = Cell {
             ch,
@@ -86,6 +88,24 @@ impl Buffer {
                 width: 0,
                 style,
             };
+        }
+    }
+
+    /// Clear one cell. Unlike `put(' ')`, this does not erase a wide glyph
+    /// whose continuation cell is `x`.
+    pub fn blank(&mut self, x: u16, y: u16) {
+        let Some(i) = self.index(x, y) else {
+            return;
+        };
+        if self.cells[i].width == 0 {
+            return;
+        }
+        let w = self.cells[i].width;
+        self.cells[i] = Cell::default();
+        if w == 2
+            && let Some(n) = self.index(x + 1, y)
+        {
+            self.cells[n] = Cell::default();
         }
     }
 

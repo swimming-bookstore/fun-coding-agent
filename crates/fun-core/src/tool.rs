@@ -346,19 +346,36 @@ pub async fn execute_tool(
     };
     let workspace = workspace.to_path_buf();
     let args = args.clone();
-    let abort_flag = abort.clone();
-    // spawn_blocking cannot be cancelled; the tool itself checks abort
-    // before writing so an Esc mid-read does not still land on disk.
-    let handle = tokio::task::spawn_blocking(move || exec(&workspace, &args, &abort_flag));
-    tokio::select! {
-        r = handle => match r {
-            Ok(Ok(s)) => Ok(s),
-            Ok(Err(e)) => Err(e),
-            Err(e) => Err(anyhow!("tool task: {e}")),
-        },
-        _ = tokio::time::sleep(TOOL_TIMEOUT) => bail!("tool timed out after {}s", TOOL_TIMEOUT.as_secs()),
-        _ = abort.wait() => Err(aborted()),
+    // A private tool abort, not the turn abort. A timeout or Esc sets this
+    // so a write can refuse to land, then we wait out the blocking task
+    // (spawn_blocking cannot be cancelled). The turn abort is left clear:
+    // the caller maps a timeout to its own error and keeps the turn going.
+    let tool_abort = Abort::new();
+    let tool_flag = tool_abort.clone();
+    let user_abort = abort.clone();
+    let mut handle = tokio::task::spawn_blocking(move || exec(&workspace, &args, &tool_flag));
+    let timeout = tokio::time::sleep(TOOL_TIMEOUT);
+    tokio::pin!(timeout);
+    let mut timed_out = false;
+    let result = loop {
+        tokio::select! {
+            r = &mut handle => match r {
+                Ok(inner) => break inner,
+                Err(e) => return Err(anyhow!("tool task: {e}")),
+            },
+            _ = &mut timeout, if !timed_out => {
+                timed_out = true;
+                tool_abort.abort();
+            }
+            _ = user_abort.wait(), if !timed_out => {
+                tool_abort.abort();
+            }
+        }
+    };
+    if timed_out {
+        bail!("tool timed out after {}s", TOOL_TIMEOUT.as_secs());
     }
+    result
 }
 
 fn tool_read() -> Tool {
@@ -403,6 +420,14 @@ fn read_execute(workspace: &Path, raw: &Value, abort: &Abort) -> Result<String> 
     let path = resolve_path(workspace, &a.path)?;
     if path.is_dir() {
         return list_dir(&path);
+    }
+    // Check the name before opening. A refused read must not load the bytes:
+    // anyhow contexts keep the source error, and that source would be the file.
+    if looks_like_credential_file(&path) {
+        bail!(
+            "refusing to read credential file {} — tokens and keys stay on this machine",
+            path.display()
+        );
     }
     let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
     if let Some(desc) = binary_read_summary(&path, &bytes) {
@@ -498,6 +523,63 @@ fn tool_write() -> Tool {
     }
 }
 
+fn looks_like_credential_file(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if name.is_empty() {
+        // Non-UTF-8 file name. Dir components are matched on raw bytes below;
+        // an undecodable file name is not a way past the check.
+        return path.file_name().is_some();
+    }
+    if matches!(
+        name.as_str(),
+        "auth.json"
+            | "credentials.json"
+            | "credentials"
+            | "application_default_credentials.json"
+            | ".netrc"
+            | ".env"
+            | ".npmrc"
+            | ".pypirc"
+            | "id_rsa"
+            | "id_ed25519"
+            | "id_ecdsa"
+            | "id_dsa"
+    ) || name.ends_with(".pem")
+        || name.ends_with(".key")
+        || name.ends_with("_rsa")
+        || name.ends_with(".p12")
+        || name.ends_with(".pfx")
+        || name.contains("service-account")
+        || name.contains("service_account")
+        || name.starts_with(".env.")
+    {
+        return true;
+    }
+    path.components().any(|c| {
+        let s = c.as_os_str();
+        s.to_str().is_some_and(is_credential_dir)
+            || is_credential_dir_bytes(s.as_encoded_bytes())
+    })
+}
+
+fn is_credential_dir(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        ".ssh" | ".gnupg" | ".aws" | ".kube"
+    )
+}
+
+fn is_credential_dir_bytes(raw: &[u8]) -> bool {
+    raw.eq_ignore_ascii_case(b".ssh")
+        || raw.eq_ignore_ascii_case(b".gnupg")
+        || raw.eq_ignore_ascii_case(b".aws")
+        || raw.eq_ignore_ascii_case(b".kube")
+}
+
 fn list_dir(path: &Path) -> Result<String> {
     let mut names = Vec::new();
     for ent in fs::read_dir(path).with_context(|| format!("read {}", path.display()))? {
@@ -527,8 +609,20 @@ fn write_execute(workspace: &Path, raw: &Value, abort: &Abort) -> Result<String>
     }
     let a: Args = Args::deserialize(raw).context("write args")?;
     let path = resolve_path(workspace, &a.path)?;
+    if looks_like_credential_file(&path) {
+        bail!(
+            "refusing to write credential file {} — tokens and keys stay on this machine",
+            path.display()
+        );
+    }
+    if abort.is_set() {
+        return Err(aborted());
+    }
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).with_context(|| format!("mkdir {}", dir.display()))?;
+    }
+    if abort.is_set() {
+        return Err(aborted());
     }
     fs::write(&path, &a.content).with_context(|| format!("write {}", path.display()))?;
     Ok(format!(
@@ -581,6 +675,15 @@ fn edit_execute(workspace: &Path, raw: &Value, abort: &Abort) -> Result<String> 
         bail!("`old` must not be empty");
     }
     let path = resolve_path(workspace, &a.path)?;
+    if looks_like_credential_file(&path) {
+        bail!(
+            "refusing to edit credential file {} — tokens and keys stay on this machine",
+            path.display()
+        );
+    }
+    if abort.is_set() {
+        return Err(aborted());
+    }
     let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     let n = text.matches(&a.old).count();
     if n != 1 {
@@ -690,6 +793,44 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fun-tool-{}", uuid::Uuid::new_v4().simple()));
         let _ = fs::create_dir_all(&dir);
         dir.canonicalize().unwrap_or(dir)
+    }
+
+    #[test]
+    fn refuses_credential_files() {
+        let root = workspace();
+        let auth = root.join("auth.json");
+        assert!(fs::write(&auth, r#"{"access":"secret"}"#).is_ok());
+        let out = read_execute(&root, &json!({"path": "auth.json"}), &Abort::new());
+        let err = out.unwrap_err();
+        assert!(
+            err.to_string().contains("credential"),
+            "{err}"
+        );
+        assert!(
+            !err.to_string().contains("secret"),
+            "refused read must not include file contents"
+        );
+        assert!(
+            write_execute(
+                &root,
+                &json!({"path": "auth.json", "content": "nope"}),
+                &Abort::new()
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read_to_string(&auth).unwrap(), r#"{"access":"secret"}"#);
+        let nested = root.join(".ssh").join("id_ed25519");
+        fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        fs::write(&nested, "key").unwrap();
+        assert!(
+            read_execute(&root, &json!({"path": nested}), &Abort::new()).is_err(),
+            ".ssh keys stay unread"
+        );
+        assert!(
+            read_execute(&root, &json!({"path": "notes.md"}), &Abort::new()).is_err()
+                || !looks_like_credential_file(&root.join("notes.md"))
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

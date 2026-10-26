@@ -187,10 +187,15 @@ fn to_input(e: &Entry, following: &[Entry]) -> Vec<WireInput> {
         }],
         Entry::Assistant { text, calls, .. } => {
             let mut out = Vec::new();
-            if !text.is_empty() {
+            let shown = if calls.is_empty() {
+                replay_text(text)
+            } else {
+                text.clone()
+            };
+            if !shown.is_empty() {
                 out.push(WireInput::Message {
                     role: "assistant",
-                    content: WireContent::Text(text.clone()),
+                    content: WireContent::Text(shown),
                 });
             }
             let (stubs, live): (Vec<&Call>, Vec<&Call>) =
@@ -236,6 +241,26 @@ fn tool_results(following: &[Entry]) -> Vec<crate::session::ToolResult> {
         }
     }
     out
+}
+
+/// A long tool-less monologue is the thing that makes the next turn repeat it.
+/// Keep the head and the tail so a conclusion still travels, and drop the middle.
+fn replay_text(text: &str) -> String {
+    const MAX: usize = 1200;
+    const HEAD: usize = 700;
+    const TAIL: usize = 400;
+    if text.len() <= MAX {
+        return text.to_string();
+    }
+    let head = crate::tool::clip_utf8(text, HEAD);
+    let mut tail_at = text.len().saturating_sub(TAIL);
+    while tail_at < text.len() && !text.is_char_boundary(tail_at) {
+        tail_at += 1;
+    }
+    format!(
+        "{head}\n…(monologue clipped)…\n{}",
+        &text[tail_at..]
+    )
 }
 
 fn user_content(text: &str, images: &[crate::session::Image]) -> WireContent {
@@ -422,11 +447,11 @@ impl Grok {
                 .await
                 .map_err(auth_err)?;
             if refreshed == token {
-                bail!(
-                    "grok {}: {}",
-                    resp.status(),
-                    resp.text().await.unwrap_or_default()
-                );
+                let status = resp.status();
+                // Drain so the connection can be reused. Do not format the
+                // body: a 401 response can echo the bearer.
+                let _ = resp.text().await;
+                bail!("grok {status}: unauthorized");
             }
             token = refreshed;
             let retry = self
@@ -444,7 +469,9 @@ impl Grok {
         }
         let status = resp.status();
         if !status.is_success() {
-            bail!("grok {}: {}", status, resp.text().await.unwrap_or_default());
+            // Drain so the connection can be reused. Do not format the body.
+            let _ = resp.text().await;
+            bail!("grok {status}");
         }
         let mut buf = String::new();
         let mut text = String::new();
@@ -846,6 +873,7 @@ pub async fn logout() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::Call;
 
     fn drain(raw: &str) -> (String, String, Vec<PartialCall>, bool) {
         let mut buf = raw.replace('\r', "");
@@ -930,6 +958,41 @@ mod tests {
         assert_eq!(mcontent[0]["text"], "--- notes.txt ---\nhello");
         assert_eq!(mcontent[1]["type"], "input_text");
         assert_eq!(mcontent[1]["text"], "[pdf spec.pdf]");
+
+        let long = "I'll skip the padding and keep reading. ".repeat(80);
+        let clipped = to_input(
+            &Entry::Assistant {
+                text: long.clone(),
+                thinking: String::new(),
+                calls: Vec::new(),
+            },
+            &[],
+        );
+        let clipped_json = serde_json::to_value(&clipped).unwrap();
+        let shown = clipped_json[0]["content"].as_str().unwrap();
+        assert!(shown.len() < long.len());
+        assert!(shown.contains("monologue clipped"));
+        let with_call = to_input(
+            &Entry::Assistant {
+                text: long,
+                thinking: String::new(),
+                calls: vec![Call {
+                    id: "c1".into(),
+                    name: "bash".into(),
+                    args: serde_json::json!({"cmd": "ls"}),
+                    ..Call::default()
+                }],
+            },
+            &[],
+        );
+        let call_json = serde_json::to_value(&with_call).unwrap();
+        assert!(
+            !call_json[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("monologue clipped"),
+            "a turn that called a tool keeps its text"
+        );
     }
 
     #[test]

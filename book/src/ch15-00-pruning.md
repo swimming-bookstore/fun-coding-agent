@@ -1,89 +1,82 @@
-# Context pruning
+# New chat, or prune
 
 A long coding session fills the model context with file dumps, failed
-commands, and plans that no longer matter. The naive fixes are all
-worse than they look:
+commands, and plans that no longer matter. Dropping those messages on
+every turn was the wrong default: a follow-up still needs the live work,
+and the queue of sends you already typed should not be thrown away.
 
-- **Send everything** until the API errors. You pay for noise, then
-  hit a wall mid-task.
-- **Summarize** the transcript into a new message. A summary invents
-  prose the agent may treat as fact (“tests were fixed”) when they
-  were not.
-- **Drop everything after index N.** That looks cache-friendly. It
-  made Fun forget later user constraints and rebuild from the first
-  prompt.
+Fun asks one question first, only when the payload is fat: **is this new
+user message a new chat?**
 
-Fun does something narrower. It **hides named messages** from the next
-API payload and leaves the transcript on disk and in the TUI intact.
-
-The record of that is a **keep/drop ledger**. Each prune turn appends
-which indexes are **in** (**keep**) and which are **out** (**drop**).
-That in/out score is calculated from **previous keep and drop**, then
-folded: last keep, plus messages after that turn, minus later drops.
-Grok sees previous turns as `## Ledger` so it does not re-score old
-ids. [The keep/drop ledger](ch15-07-ledger.md) is the page for that.
-
-Prune is not a composer command. It runs on its own when a user turn
-starts and the live payload is fat. Details: [When it runs](ch15-01-when.md).
-
-## What a prune turn is
-
-A prune turn is bookkeeping, not a rewrite. Fun builds a listing with
-four buckets (Live, Keep, Candidates, Hidden), asks Grok at **low**
-effort with **no tools**, and expects:
-
-```json
-{ "drop": [3] }
-```
-
-Fun then:
-
-1. Intersects those digits with the **candidate** set.
-2. Pairs tool calls with their results so the wire never has a lone
-   function call.
-3. Refuses Live and Keep ids.
-4. Appends a jsonl record with **keep**, **drop**, and **restored**.
-
-The next send is:
+- **New chat.** The previous session file is already on disk. Fun clears
+  the screen and sends **only** the new user message. Queued sends stay
+  queued; they are not dropped and they are not rewritten.
+- **Stay.** The screen stays. Fun then prunes: named old messages are
+  hidden from the next API send. The transcript on disk and on screen is
+  not deleted. The new user line and the queue are not droppable.
 
 ```text
-last keep  ∪  messages after that turn  −  later drop
-+ every user message
-+ restore stubs for latest hidden writes/edits
+fat context + new user line
+        │
+        ▼
+   different task?  ──yes──►  save previous session, clear the screen,
+        │                     send this line alone
+        no
+        ▼
+   prune old noise from the next send, then complete
 ```
 
-User messages always go. Holes from dropped tool noise are expected:
+This is not a composer command. It runs when a user turn starts and the
+live payload is fat. Whether that line is a new chat is the model's
+decision, not a phrase match. Details: [When it runs](ch15-01-when.md).
 
-```text
-goal → (dropped bash) → later edit → live tail
-```
+## What the model is asked
 
-A low drop id must **not** mean “everything after this index.” Keep
-rules exist because of that. See [Keep](ch15-04-keep.md).
+Two low-effort calls, no tools. The new user message is not in the
+transcript yet.
+
+1. **New chat?** A short task brief plus the new line. Expect `{"new":true}` or
+   `{"new":false}`. Only an explicit `false` stays. A missing or unparseable
+   answer starts a new chat, so a thought-only reply cannot fall through to prune.
+2. **If staying, what to hide?** The same listing. Expect
+   `{"drop":[ids]}`. Only candidate ids hide. See
+   [Applying a drop](ch15-08-apply.md).
+
+A failed new-chat call stays and still tries the prune. A failed prune
+continues with the unpruned payload. The turn still happens.
+
+`false` means the new line continues the current task: a follow-up, a
+correction, a tighter constraint, or an answer to the assistant. `true`
+means a different task, including an explicit request to start over. The
+call sees the user lines and the latest conclusion, not the prune listing,
+so old tool dumps cannot talk it into staying.
 
 ## What you see
 
-One dim line in the transcript:
+A new chat drops the line painted before the decision, clears the transcript, then reprints that line with the hint under it:
+
+```text
+you
+the message that started this chat
+
+(new chat — previous session saved to ~/.local/share/fun/sessions/…/….jsonl)
+```
+
+A stay leaves the transcript. The new line is painted, then the dim drop line under it:
 
 | Line | Meaning |
 | --- | --- |
-| `(dropped N messages from context)` | N ids newly hidden this turn |
-| `(dropped N messages from context, restored R)` | Same, plus R write/edit stubs on the next payload |
+| `(dropped N messages from context)` | N ids newly hidden from the next send |
+| `(dropped N messages from context, restored R)` | Same, plus R write/edit stubs |
 | `(nothing to drop)` | The model returned an empty list (or nothing valid) |
-| `(prune skipped: …)` | Gate failed after Fun had already started talking about it |
+| `(prune skipped: …)` | The hide call failed; the full payload still goes |
+| `(new chat skipped: …)` | The decision call failed; Fun stayed and still tried to prune |
 
-Click a drop line to inspect ids. Restored writes appear once, as stubs.
-The overlay does not open by itself.
+Click a drop line to inspect ids. The overlay does not open by itself.
 
 ## What you do not see
 
-- No spinner. Prune is supposed to feel like a pause before the real
-  complete, not a second agent.
-- No change to the transcript rows. The bash dump is still there when
-  you scroll up.
-- No summary message inserted as a fake user or assistant.
-
-If a later review needs to know that `login.rs` was written, Fun may
-send a **restore stub** (path only) even though the full write is still
-hidden. That is [Restore stubs](ch15-09-restore.md), not a second copy
-of the file on disk.
+- No spinner. Both calls are a pause before the real reply.
+- The queue, steer strip, and interrupt strip do not clear.
+- A new chat does not also prune the previous file. That file is already
+  saved as it was.

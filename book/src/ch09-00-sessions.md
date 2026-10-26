@@ -42,13 +42,17 @@ Entries you care about as a reader:
 
 ## Resume
 
-On resume, Fun reloads entries, hidden ids, and the keep/drop ledger.
-User messages are always sent again, even if an older prune line listed
-them. The TUI notes:
+On resume, Fun reloads that file and paints the transcript.
+
+The TUI notes a resumed file:
 
 ```text
 (resumed …, N entries, M pruned from context)
 ```
+
+`N` is how many chat entries are in the file. `M` is how many of them
+were already hidden from context. A file with nothing hidden omits that
+count.
 
 `--session PATH` opens a specific file (error if missing). `--new`
 creates a new id in the same workspace folder. The file is not written
